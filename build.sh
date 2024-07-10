@@ -353,7 +353,7 @@ function setup_proxygen() {
   PROXYGEN_BUILD_DIR=$DEPS_DIR/proxygen/build/
   if [ ! -d "$PROXYGEN_DIR" ] ; then
     echo -e "${COLOR_GREEN}[ INFO ] Cloning proxygen repo ${COLOR_OFF}"
-    git clone https://github.com/facebook/proxygen.git "$PROXYGEN_DIR"
+    git clone https://github.com/afrind/proxygen.git "$PROXYGEN_DIR"
   fi
   synch_dependency_to_commit "$PROXYGEN_DIR" "$BASE_DIR"/build/deps/github_hashes/facebook/proxygen-rev.txt
   echo -e "${COLOR_GREEN}Building proxygen ${COLOR_OFF}"

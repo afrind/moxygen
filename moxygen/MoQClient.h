@@ -10,14 +10,19 @@
 
 #include <folly/experimental/coro/Promise.h>
 #include <proxygen/lib/http/session/HTTPTransaction.h>
+#include <proxygen/lib/http/webtransport/QuicWebTransport.h>
 #include <proxygen/lib/utils/URL.h>
 
 namespace moxygen {
 
-class MoQClient {
+class MoQClient : public proxygen::QuicWebTransport::Handler {
  public:
-  MoQClient(folly::EventBase* evb, proxygen::URL url)
-      : evb_(evb), url_(std::move(url)) {}
+  enum class TransportType { H3_WEBTRANSPORT, QUIC };
+  MoQClient(
+      folly::EventBase* evb,
+      proxygen::URL url,
+      TransportType ttype = TransportType::H3_WEBTRANSPORT)
+      : evb_(evb), url_(std::move(url)), transportType_(ttype) {}
 
   folly::EventBase* getEventBase() {
     return evb_;
@@ -74,16 +79,33 @@ class MoQClient {
       Role role = Role::PUB_AND_SUB) noexcept;
 
  private:
+  folly::coro::Task<void> setupMoQQuicSession(
+      std::chrono::milliseconds connect_timeout,
+      Role role) noexcept;
+
   void onSessionEnd(folly::Optional<proxygen::HTTPException> ex);
+  void onWebTransportBidiStream(
+      proxygen::HTTPCodec::StreamID,
+      proxygen::WebTransport::BidiStreamHandle handle) noexcept override {
+    onWebTransportBidiStream(std::move(handle));
+  }
+  void onWebTransportUniStream(
+      proxygen::HTTPCodec::StreamID,
+      proxygen::WebTransport::StreamReadHandle* handle) noexcept override {
+    onWebTransportUniStream(handle);
+  }
+
   void onWebTransportBidiStream(
       proxygen::WebTransport::BidiStreamHandle handle);
   void onWebTransportUniStream(
       proxygen::WebTransport::StreamReadHandle* handle);
-  void onDatagram(std::unique_ptr<folly::IOBuf> datagram);
+  void onDatagram(std::unique_ptr<folly::IOBuf>) noexcept override;
 
   folly::EventBase* evb_{nullptr};
   proxygen::URL url_;
   HTTPHandler httpHandler_{*this};
+  TransportType transportType_;
+  std::shared_ptr<proxygen::QuicWebTransport> quicWebTransport_;
 };
 
 } // namespace moxygen
