@@ -173,7 +173,7 @@ void MoQSessionTest::setupMoQSession() {
   clientSession_->start();
   serverSession_->start();
   eventBase_.loopOnce();
-  [](std::shared_ptr<MoQSession> clientSession,
+  auto fn = [](std::shared_ptr<MoQSession> clientSession,
      uint64_t initialMaxSubscribeId) -> folly::coro::Task<void> {
     auto serverSetup = co_await clientSession->setup(ClientSetup{
         .supportedVersions = {kVersionDraftCurrent},
@@ -187,7 +187,8 @@ void MoQSessionTest::setupMoQSession() {
         folly::to_underlying(SetupKey::MAX_SUBSCRIBE_ID));
     EXPECT_EQ(serverSetup.params.at(0).asUint64, initialMaxSubscribeId);
     clientSession->getEventBase()->terminateLoopSoon();
-  }(clientSession_, initialMaxSubscribeId_)
+  };
+  fn(clientSession_, initialMaxSubscribeId_)
                                             .scheduleOn(&eventBase_)
                                             .start();
   this->controlLoop(*serverSession_, serverControl)
