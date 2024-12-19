@@ -10,7 +10,8 @@ add_library(moxygen
     MoQCodec.cpp
     MoQSession.cpp
     MoQServer.cpp
-    MoQClient.cpp)
+    MoQClient.cpp
+    util/QuicConnector.cpp)
 
 target_include_directories(
     moxygen PUBLIC
@@ -26,6 +27,7 @@ target_link_libraries(
     wangle::wangle
     proxygen::proxygen
     proxygen::proxygenhqserver
+    proxygen::quicwebtransport
 )
 
 install(
@@ -40,4 +42,7 @@ add_subdirectory(relay)
 # add_subdirectory(samples/chat)
 add_subdirectory(samples/text-client)
 add_subdirectory(samples/date)
+add_subdirectory(samples/flv_streamer_client)
+add_subdirectory(moq_mi)
+add_subdirectory(flv_parser)
 add_subdirectory(test)

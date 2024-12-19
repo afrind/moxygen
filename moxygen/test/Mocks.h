@@ -2,10 +2,12 @@
 
 #include <folly/portability/GMock.h>
 #include <moxygen/MoQCodec.h>
+#include <moxygen/MoQConsumers.h>
 
 namespace moxygen {
 
-class MockMoQCodecCallback : public MoQCodec::Callback {
+class MockMoQCodecCallback : public MoQControlCodec::ControlCallback,
+                             public MoQObjectStreamCodec::ObjectCallback {
  public:
   ~MockMoQCodecCallback() override = default;
 
@@ -16,26 +18,38 @@ class MockMoQCodecCallback : public MoQCodec::Callback {
   MOCK_METHOD(
       void,
       onObjectPayload,
-      (uint64_t subscribeID,
-       uint64_t trackAlias,
+      (TrackIdentifier trackIdentifier,
        uint64_t groupID,
        uint64_t id,
        std::unique_ptr<folly::IOBuf> payload,
        bool eom));
+  MOCK_METHOD(void, onFetchHeader, (uint64_t subscribeID));
   MOCK_METHOD(void, onSubscribe, (SubscribeRequest subscribeRequest));
-  MOCK_METHOD(
-      void,
-      onSubscribeUpdate,
-      (SubscribeUpdateRequest subscribeUpdate));
+  MOCK_METHOD(void, onSubscribeUpdate, (SubscribeUpdate subscribeUpdate));
   MOCK_METHOD(void, onSubscribeOk, (SubscribeOk subscribeOk));
   MOCK_METHOD(void, onSubscribeError, (SubscribeError subscribeError));
   MOCK_METHOD(void, onSubscribeDone, (SubscribeDone subscribeDone));
   MOCK_METHOD(void, onUnsubscribe, (Unsubscribe unsubscribe));
+  MOCK_METHOD(void, onMaxSubscribeId, (MaxSubscribeId maxSubId));
+  MOCK_METHOD(void, onFetch, (Fetch fetch));
+  MOCK_METHOD(void, onFetchCancel, (FetchCancel fetchCancel));
+  MOCK_METHOD(void, onFetchOk, (FetchOk fetchOk));
+  MOCK_METHOD(void, onFetchError, (FetchError fetchError));
   MOCK_METHOD(void, onAnnounce, (Announce announce));
   MOCK_METHOD(void, onAnnounceOk, (AnnounceOk announceOk));
   MOCK_METHOD(void, onAnnounceError, (AnnounceError announceError));
   MOCK_METHOD(void, onUnannounce, (Unannounce unannounce));
   MOCK_METHOD(void, onAnnounceCancel, (AnnounceCancel announceCancel));
+  MOCK_METHOD(void, onSubscribeAnnounces, (SubscribeAnnounces announce));
+  MOCK_METHOD(void, onSubscribeAnnouncesOk, (SubscribeAnnouncesOk announceOk));
+  MOCK_METHOD(
+      void,
+      onSubscribeAnnouncesError,
+      (SubscribeAnnouncesError announceError));
+  MOCK_METHOD(
+      void,
+      onUnsubscribeAnnounces,
+      (UnsubscribeAnnounces unsubscribeAnnounces));
   MOCK_METHOD(
       void,
       onTrackStatusRequest,
@@ -43,5 +57,105 @@ class MockMoQCodecCallback : public MoQCodec::Callback {
   MOCK_METHOD(void, onTrackStatus, (TrackStatus trackStatus));
   MOCK_METHOD(void, onGoaway, (Goaway goaway));
   MOCK_METHOD(void, onConnectionError, (ErrorCode error));
+};
+
+class MockTrackConsumer : public TrackConsumer {
+ public:
+  MOCK_METHOD(
+      (folly::Expected<std::shared_ptr<SubgroupConsumer>, MoQPublishError>),
+      beginSubgroup,
+      (uint64_t groupID, uint64_t subgroupID, Priority priority),
+      (override));
+
+  MOCK_METHOD(
+      (folly::Expected<folly::SemiFuture<folly::Unit>, MoQPublishError>),
+      awaitStreamCredit,
+      (),
+      (override));
+
+  MOCK_METHOD(
+      (folly::Expected<folly::Unit, MoQPublishError>),
+      objectStream,
+      (const ObjectHeader& header, Payload payload),
+      (override));
+
+  MOCK_METHOD(
+      (folly::Expected<folly::Unit, MoQPublishError>),
+      groupNotExists,
+      (uint64_t groupID, uint64_t subgroupID, Priority priority),
+      (override));
+
+  MOCK_METHOD(
+      (folly::Expected<folly::Unit, MoQPublishError>),
+      datagram,
+      (const ObjectHeader& header, Payload payload),
+      (override));
+
+  MOCK_METHOD(
+      (folly::Expected<folly::Unit, MoQPublishError>),
+      subscribeDone,
+      (SubscribeDone),
+      (override));
+};
+
+class MockFetchConsumer : public FetchConsumer {
+ public:
+  MOCK_METHOD(
+      (folly::Expected<folly::Unit, MoQPublishError>),
+      object,
+      (uint64_t, uint64_t, uint64_t, Payload, bool),
+      (override));
+
+  MOCK_METHOD(
+      (folly::Expected<folly::Unit, MoQPublishError>),
+      objectNotExists,
+      (uint64_t, uint64_t, uint64_t, bool),
+      (override));
+
+  MOCK_METHOD(void, checkpoint, (), (override));
+
+  MOCK_METHOD(
+      (folly::Expected<folly::Unit, MoQPublishError>),
+      beginObject,
+      (uint64_t, uint64_t, uint64_t, uint64_t, Payload),
+      (override));
+
+  MOCK_METHOD(
+      (folly::Expected<ObjectPublishStatus, MoQPublishError>),
+      objectPayload,
+      (Payload, bool),
+      (override));
+
+  MOCK_METHOD(
+      (folly::Expected<folly::Unit, MoQPublishError>),
+      groupNotExists,
+      (uint64_t groupID, uint64_t subgroupID, bool finFetch),
+      (override));
+
+  MOCK_METHOD(
+      (folly::Expected<folly::Unit, MoQPublishError>),
+      endOfGroup,
+      (uint64_t, uint64_t, uint64_t, bool),
+      (override));
+
+  MOCK_METHOD(
+      (folly::Expected<folly::Unit, MoQPublishError>),
+      endOfTrackAndGroup,
+      (uint64_t, uint64_t, uint64_t),
+      (override));
+
+  MOCK_METHOD(
+      (folly::Expected<folly::Unit, MoQPublishError>),
+      endOfFetch,
+      (),
+      (override));
+
+  MOCK_METHOD(void, reset, (ResetStreamErrorCode), (override));
+
+  MOCK_METHOD(
+      (folly::Expected<folly::SemiFuture<folly::Unit>, MoQPublishError>),
+      awaitReadyToConsume,
+      (),
+      (override));
 };
 } // namespace moxygen

@@ -37,10 +37,27 @@ class MoQRelayServer : MoQServer {
       server_.relay_.onAnnounce(std::move(announce), clientSession_);
     }
 
+    void operator()(Unannounce unannounce) const override {
+      XLOG(INFO) << "Unannounce ns=" << unannounce.trackNamespace;
+      server_.relay_.onUnannounce(std::move(unannounce), clientSession_);
+    }
+
+    void operator()(SubscribeAnnounces subscribeAnnounces) const override {
+      XLOG(INFO) << "SubscribeAnnounces ns="
+                 << subscribeAnnounces.trackNamespacePrefix;
+      server_.relay_.onSubscribeAnnounces(
+          std::move(subscribeAnnounces), clientSession_);
+    }
+
+    void operator()(UnsubscribeAnnounces unsubscribeAnnounces) const override {
+      XLOG(INFO) << "UnsubscribeAnnounces ns="
+                 << unsubscribeAnnounces.trackNamespacePrefix;
+      server_.relay_.onUnsubscribeAnnounces(
+          std::move(unsubscribeAnnounces), clientSession_);
+    }
+
     void operator()(SubscribeRequest subscribeReq) const override {
-      XLOG(INFO) << "SubscribeRequest track="
-                 << subscribeReq.fullTrackName.trackNamespace << "/"
-                 << subscribeReq.fullTrackName.trackName;
+      XLOG(INFO) << "SubscribeRequest track=" << subscribeReq.fullTrackName;
       server_.relay_.onSubscribe(std::move(subscribeReq), clientSession_)
           .scheduleOn(clientSession_->getEventBase())
           .start();

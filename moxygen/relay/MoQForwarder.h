@@ -22,6 +22,14 @@ class MoQForwarder {
       folly::Optional<AbsoluteLocation> latest = folly::none)
       : fullTrackName_(std::move(ftn)), latest_(std::move(latest)) {}
 
+  void setGroupOrder(GroupOrder order) {
+    groupOrder_ = order;
+  }
+
+  GroupOrder groupOrder() const {
+    return groupOrder_;
+  }
+
   void setLatest(AbsoluteLocation latest) {
     latest_ = latest;
   }
@@ -36,16 +44,16 @@ class MoQForwarder {
 
   struct Subscriber {
     std::shared_ptr<MoQSession> session;
-    uint64_t subscribeID;
-    uint64_t trackAlias;
+    SubscribeID subscribeID;
+    TrackAlias trackAlias;
     SubscribeRange range;
 
     struct hash {
       std::uint64_t operator()(const Subscriber& subscriber) const {
         return folly::hash::hash_combine(
             subscriber.session.get(),
-            subscriber.subscribeID,
-            subscriber.trackAlias,
+            subscriber.subscribeID.value,
+            subscriber.trackAlias.value,
             subscriber.range.start.group,
             subscriber.range.start.object,
             subscriber.range.end.group,
@@ -71,8 +79,8 @@ class MoQForwarder {
 
   void addSubscriber(
       std::shared_ptr<MoQSession> session,
-      uint64_t subscribeID,
-      uint64_t trackAlias,
+      SubscribeID subscribeID,
+      TrackAlias trackAlias,
       const SubscribeRequest& sub) {
     subscribers_.emplace(Subscriber(
         {std::move(session),
@@ -81,7 +89,7 @@ class MoQForwarder {
          toSubscribeRange(sub, latest_)}));
   }
 
-  bool updateSubscriber(const SubscribeUpdateRequest& subscribeUpdate) {
+  bool updateSubscriber(const SubscribeUpdate& subscribeUpdate) {
     folly::F14NodeSet<Subscriber, Subscriber::hash>::iterator it =
         subscribers_.begin();
     for (; it != subscribers_.end();) {
@@ -96,17 +104,15 @@ class MoQForwarder {
     // Not implemented: Validation about subscriptions
     Subscriber subscriber = *it;
     subscribers_.erase(it);
-    subscriber.range.start.group = subscribeUpdate.startGroup;
-    subscriber.range.start.object = subscribeUpdate.startObject;
-    subscriber.range.end.group = subscribeUpdate.endGroup;
-    subscriber.range.end.object = subscribeUpdate.endObject;
+    subscriber.range.start = subscribeUpdate.start;
+    subscriber.range.end = subscribeUpdate.end;
     subscribers_.emplace(std::move(subscriber));
     return true;
   }
 
   void removeSession(
       const std::shared_ptr<MoQSession>& session,
-      folly::Optional<uint64_t> subID = folly::none) {
+      folly::Optional<SubscribeID> subID = folly::none) {
     // The same session could have multiple subscriptions, remove all of them
     // TODO: This shouldn't need to be a linear search
     for (auto it = subscribers_.begin(); it != subscribers_.end();) {
@@ -132,7 +138,8 @@ class MoQForwarder {
       ObjectHeader objHeader,
       std::unique_ptr<folly::IOBuf> payload,
       uint64_t payloadOffset = 0,
-      bool eom = true) {
+      bool eom = true,
+      bool streamPerObject = false) {
     AbsoluteLocation now{objHeader.group, objHeader.id};
     if (!latest_ || now > *latest_) {
       latest_ = now;
@@ -166,10 +173,18 @@ class MoQForwarder {
              objHeader,
              payloadOffset,
              buf = (payload) ? payload->clone() : nullptr,
-             eom]() mutable {
-              objHeader.subscribeID = subId;
-              objHeader.trackAlias = trackAlias;
-              session->publish(objHeader, payloadOffset, std::move(buf), eom);
+             eom,
+             streamPerObject]() mutable {
+              objHeader.trackIdentifier = trackAlias;
+              if (objHeader.status != ObjectStatus::NORMAL) {
+                session->publishStatus(objHeader, subId);
+              } else if (streamPerObject) {
+                session->publishStreamPerObject(
+                    objHeader, subId, payloadOffset, std::move(buf), eom);
+              } else {
+                session->publish(
+                    objHeader, subId, payloadOffset, std::move(buf), eom);
+              }
             });
         it++;
       }
@@ -187,6 +202,7 @@ class MoQForwarder {
  private:
   FullTrackName fullTrackName_;
   folly::F14NodeSet<Subscriber, Subscriber::hash> subscribers_;
+  GroupOrder groupOrder_{GroupOrder::OldestFirst};
   folly::Optional<AbsoluteLocation> latest_;
   bool finAfterEnd_{true};
 };

@@ -6,45 +6,87 @@
 
 #include "moxygen/test/TestUtils.h"
 
+#include <folly/Random.h>
+#include <folly/io/Cursor.h>
 #include "moxygen/MoQFramer.h"
 
 namespace moxygen::test {
 
-std::unique_ptr<folly::IOBuf> writeAllMessages() {
+std::unique_ptr<folly::IOBuf> writeAllControlMessages(TestControlMessages in) {
   folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
-  auto res = writeClientSetup(
-      writeBuf,
-      ClientSetup(
-          {{1},
-           {
-               {folly::to_underlying(SetupKey::ROLE),
-                "",
-                folly::to_underlying(Role::SUBSCRIBER)},
-               {folly::to_underlying(SetupKey::PATH), "/foo", 0},
-           }}));
-  res = writeServerSetup(
-      writeBuf,
-      ServerSetup(
-          {1,
-           {
-               {folly::to_underlying(SetupKey::ROLE),
-                "",
-                folly::to_underlying(Role::SUBSCRIBER)},
-               {folly::to_underlying(SetupKey::PATH), "/foo", 0},
-           }}));
+  WriteResult res;
+  if (in != TestControlMessages::SERVER) {
+    res = writeClientSetup(
+        writeBuf,
+        ClientSetup(
+            {{1},
+             {
+                 {folly::to_underlying(SetupKey::ROLE),
+                  "",
+                  folly::to_underlying(Role::SUBSCRIBER)},
+                 {folly::to_underlying(SetupKey::PATH), "/foo", 0},
+                 {folly::to_underlying(SetupKey::MAX_SUBSCRIBE_ID), "", 100},
+             }}));
+  }
+  if (in != TestControlMessages::CLIENT) {
+    res = writeServerSetup(
+        writeBuf,
+        ServerSetup(
+            {1,
+             {
+                 {folly::to_underlying(SetupKey::ROLE),
+                  "",
+                  folly::to_underlying(Role::SUBSCRIBER)},
+                 {folly::to_underlying(SetupKey::PATH), "/foo", 0},
+             }}));
+  }
   res = writeSubscribeRequest(
       writeBuf,
       SubscribeRequest(
           {0,
            0,
-           FullTrackName({"hello", "world"}),
+           FullTrackName({TrackNamespace({"hello"}), "world"}),
+           255,
+           GroupOrder::Default,
            LocationType::LatestObject,
            folly::none,
            folly::none,
            {{folly::to_underlying(TrackRequestParamKey::AUTHORIZATION),
-             "binky"}}}));
+             "binky",
+             0},
+            {folly::to_underlying(TrackRequestParamKey::DELIVERY_TIMEOUT),
+             "",
+             1000},
+            {folly::to_underlying(TrackRequestParamKey::MAX_CACHE_DURATION),
+             "",
+             3600000}}}));
+  res = writeSubscribeUpdate(
+      writeBuf,
+      SubscribeUpdate(
+          {0,
+           {1, 2},
+           {3, 4},
+           255,
+           {{folly::to_underlying(TrackRequestParamKey::AUTHORIZATION),
+             "binky",
+             0},
+            {folly::to_underlying(TrackRequestParamKey::DELIVERY_TIMEOUT),
+             "",
+             1000},
+            {folly::to_underlying(TrackRequestParamKey::MAX_CACHE_DURATION),
+             "",
+             3600000}}}));
   res = writeSubscribeOk(
-      writeBuf, SubscribeOk({0, std::chrono::milliseconds(0)}));
+      writeBuf,
+      SubscribeOk(
+          {0,
+           std::chrono::milliseconds(0),
+           GroupOrder::OldestFirst,
+           AbsoluteLocation{2, 5},
+           {{folly::to_underlying(TrackRequestParamKey::MAX_CACHE_DURATION),
+             "",
+             3600000}}}));
+  res = writeMaxSubscribeId(writeBuf, {.subscribeID = 50000});
   res = writeSubscribeError(
       writeBuf, SubscribeError({0, 404, "not found", folly::none}));
   res = writeUnsubscribe(
@@ -66,36 +108,98 @@ std::unique_ptr<folly::IOBuf> writeAllMessages() {
   res = writeAnnounce(
       writeBuf,
       Announce(
-          {"hello",
+          {TrackNamespace({"hello"}),
            {{folly::to_underlying(TrackRequestParamKey::AUTHORIZATION),
-             "binky"}}}));
-  res = writeAnnounceOk(writeBuf, AnnounceOk({"hello"}));
+             "binky",
+             0},
+            {folly::to_underlying(TrackRequestParamKey::DELIVERY_TIMEOUT),
+             "",
+             1000},
+            {folly::to_underlying(TrackRequestParamKey::MAX_CACHE_DURATION),
+             "",
+             3600000}}}));
+  res = writeAnnounceOk(writeBuf, AnnounceOk({TrackNamespace({"hello"})}));
   res = writeAnnounceError(
-      writeBuf, AnnounceError({"hello", 500, "server error"}));
-  res = writeAnnounceCancel(writeBuf, AnnounceCancel({"hello"}));
+      writeBuf,
+      AnnounceError({TrackNamespace({"hello"}), 500, "server error"}));
+  res = writeAnnounceCancel(
+      writeBuf,
+      AnnounceCancel({TrackNamespace({"hello"}), 500, "internal error"}));
   res = writeUnannounce(
       writeBuf,
       Unannounce({
-          "hello",
+          TrackNamespace({"hello"}),
       }));
   res = writeTrackStatusRequest(
-      writeBuf, TrackStatusRequest({FullTrackName({"hello", "world"})}));
+      writeBuf,
+      TrackStatusRequest(
+          {FullTrackName({TrackNamespace({"hello"}), "world"})}));
   res = writeTrackStatus(
       writeBuf,
       TrackStatus(
-          {FullTrackName({"hello", "world"}),
+          {FullTrackName({TrackNamespace({"hello"}), "world"}),
            TrackStatusCode::IN_PROGRESS,
            AbsoluteLocation({19, 77})}));
   res = writeGoaway(writeBuf, Goaway({"new uri"}));
+  res = writeSubscribeAnnounces(
+      writeBuf,
+      SubscribeAnnounces(
+          {TrackNamespace({"hello"}),
+           {{folly::to_underlying(TrackRequestParamKey::AUTHORIZATION),
+             "binky"}}}));
+  res = writeSubscribeAnnouncesOk(
+      writeBuf, SubscribeAnnouncesOk({TrackNamespace({"hello"})}));
+  res = writeSubscribeAnnouncesError(
+      writeBuf,
+      SubscribeAnnouncesError(
+          {TrackNamespace({"hello"}), 500, "server error"}));
+  res = writeUnsubscribeAnnounces(
+      writeBuf, UnsubscribeAnnounces({TrackNamespace({"hello"})}));
+  res = writeFetch(
+      writeBuf,
+      Fetch(
+          {0,
+           FullTrackName({TrackNamespace({"hello"}), "world"}),
+           255,
+           GroupOrder::NewestFirst,
+           AbsoluteLocation({0, 0}),
+           AbsoluteLocation({1, 1}),
+           {TrackRequestParameter(
+               {folly::to_underlying(TrackRequestParamKey::AUTHORIZATION),
+                "binky",
+                0})}}));
+  res = writeFetchCancel(writeBuf, FetchCancel({0}));
+  res = writeFetchOk(
+      writeBuf,
+      FetchOk(
+          {0,
+           GroupOrder::NewestFirst,
+           1,
+           AbsoluteLocation({0, 0}),
+           {TrackRequestParameter(
+               {folly::to_underlying(TrackRequestParamKey::AUTHORIZATION),
+                "binky",
+                0})}}));
+  res = writeFetchError(
+      writeBuf,
+      FetchError(
+          {0,
+           folly::to_underlying(FetchErrorCode::INVALID_RANGE),
+           "Invalid range"}));
 
-  res = writeStreamHeader(
+  return writeBuf.move();
+}
+
+std::unique_ptr<folly::IOBuf> writeAllObjectMessages() {
+  folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
+  auto res = writeStreamHeader(
       writeBuf,
       ObjectHeader({
-          0,
-          1,
+          TrackAlias(1),
           2,
           3,
           4,
+          5,
           ForwardPreference::Track,
           ObjectStatus::NORMAL,
           folly::none,
@@ -103,15 +207,42 @@ std::unique_ptr<folly::IOBuf> writeAllMessages() {
   res = writeObject(
       writeBuf,
       ObjectHeader(
-          {0, 1, 2, 3, 4, ForwardPreference::Track, ObjectStatus::NORMAL, 11}),
+          {TrackAlias(1),
+           2,
+           3,
+           4,
+           5,
+           ForwardPreference::Track,
+           ObjectStatus::NORMAL,
+           11}),
       folly::IOBuf::copyBuffer("hello world"));
   res = writeObject(
       writeBuf,
       ObjectHeader(
-          {0, 1, 2, 3, 4, ForwardPreference::Track, ObjectStatus::NORMAL, 0}),
+          {TrackAlias(1),
+           2,
+           3,
+           4,
+           5,
+           ForwardPreference::Track,
+           ObjectStatus::END_OF_TRACK_AND_GROUP,
+           0}),
       nullptr);
-
   return writeBuf.move();
+}
+
+std::unique_ptr<folly::IOBuf> makeBuf(uint32_t size) {
+  auto out = folly::IOBuf::create(size);
+  out->append(size);
+  // fill with random junk
+  folly::io::RWPrivateCursor cursor(out.get());
+  while (cursor.length() >= 8) {
+    cursor.write<uint64_t>(folly::Random::rand64());
+  }
+  while (cursor.length()) {
+    cursor.write<uint8_t>((uint8_t)folly::Random::rand32());
+  }
+  return out;
 }
 
 } // namespace moxygen::test

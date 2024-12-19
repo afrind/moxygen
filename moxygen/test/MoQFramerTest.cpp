@@ -14,12 +14,12 @@ using namespace moxygen;
 namespace {
 class TestUnderflow : public std::exception {};
 
-FrameType parseFrameType(folly::io::Cursor& cursor) {
+StreamType parseStreamType(folly::io::Cursor& cursor) {
   auto frameType = quic::decodeQuicInteger(cursor);
   if (!frameType) {
     throw std::runtime_error("Failed to decode frame type");
   }
-  return FrameType(frameType->first);
+  return StreamType(frameType->first);
 }
 
 void skip(folly::io::Cursor& cursor, size_t i) {
@@ -29,79 +29,134 @@ void skip(folly::io::Cursor& cursor, size_t i) {
   cursor.skip(i);
 }
 
-void parseAll(folly::io::Cursor& cursor, bool eom) {
-  skip(cursor, 2);
-  auto r1 = parseClientSetup(cursor);
-  EXPECT_TRUE(r1 || (!eom && r1.error() == ErrorCode::PARSE_UNDERFLOW));
-
-  skip(cursor, 2);
-  auto r2 = parseServerSetup(cursor);
-  EXPECT_TRUE(r2 || (!eom && r2.error() == ErrorCode::PARSE_UNDERFLOW));
-
-  skip(cursor, 1);
-  auto r3 = parseSubscribeRequest(cursor);
-  EXPECT_TRUE(r3 || (!eom && r3.error() == ErrorCode::PARSE_UNDERFLOW));
-
-  skip(cursor, 1);
-  auto r4 = parseSubscribeOk(cursor);
-  EXPECT_TRUE(r4 || (!eom && r4.error() == ErrorCode::PARSE_UNDERFLOW));
-
-  skip(cursor, 1);
-  auto r5 = parseSubscribeError(cursor);
-  EXPECT_TRUE(r5 || (!eom && r5.error() == ErrorCode::PARSE_UNDERFLOW));
-
-  skip(cursor, 1);
-  auto r6 = parseUnsubscribe(cursor);
-  EXPECT_TRUE(r6 || (!eom && r6.error() == ErrorCode::PARSE_UNDERFLOW));
-
-  skip(cursor, 1);
-  auto r7 = parseSubscribeDone(cursor);
-  EXPECT_TRUE(r1 || (!eom && r7.error() == ErrorCode::PARSE_UNDERFLOW));
-
-  skip(cursor, 1);
-  auto r8 = parseSubscribeDone(cursor);
-  EXPECT_TRUE(r1 || (!eom && r8.error() == ErrorCode::PARSE_UNDERFLOW));
-
-  skip(cursor, 1);
-  auto r9 = parseAnnounce(cursor);
-  EXPECT_TRUE(r9 || (!eom && r9.error() == ErrorCode::PARSE_UNDERFLOW));
-
-  skip(cursor, 1);
-  auto r10 = parseAnnounceOk(cursor);
-  EXPECT_TRUE(r10 || (!eom && r10.error() == ErrorCode::PARSE_UNDERFLOW));
-
-  skip(cursor, 1);
-  auto r11 = parseAnnounceError(cursor);
-  EXPECT_TRUE(r11 || (!eom && r11.error() == ErrorCode::PARSE_UNDERFLOW));
-
-  skip(cursor, 1);
-  auto r12 = parseAnnounceCancel(cursor);
-  EXPECT_TRUE(r12 || (!eom && r12.error() == ErrorCode::PARSE_UNDERFLOW));
-
-  skip(cursor, 1);
-  auto r13 = parseUnannounce(cursor);
-  EXPECT_TRUE(r13 || (!eom && r13.error() == ErrorCode::PARSE_UNDERFLOW));
-
-  skip(cursor, 1);
-  auto r14a = parseTrackStatusRequest(cursor);
-  EXPECT_TRUE(r14a || (!eom && r14a.error() == ErrorCode::PARSE_UNDERFLOW));
-
-  skip(cursor, 1);
-  auto r14b = parseTrackStatus(cursor);
-  EXPECT_TRUE(r14b || (!eom && r14b.error() == ErrorCode::PARSE_UNDERFLOW));
-
-  skip(cursor, 1);
-  auto r14 = parseGoaway(cursor);
-  EXPECT_TRUE(r14 || (!eom && r14.error() == ErrorCode::PARSE_UNDERFLOW));
-
-  auto res = parseStreamHeader(cursor, FrameType::STREAM_HEADER_TRACK);
-  EXPECT_TRUE(res || (!eom && res.error() == ErrorCode::PARSE_UNDERFLOW));
-  if (!res) {
+template <class T>
+void testUnderflowResult(folly::Expected<T, ErrorCode> result) {
+  EXPECT_TRUE(result || result.error() == ErrorCode::PARSE_UNDERFLOW);
+  if (!result) {
     throw TestUnderflow();
   }
+}
+
+size_t frameLength(folly::io::Cursor& cursor) {
+  auto res = quic::decodeQuicInteger(cursor);
+  if (res && cursor.canAdvance(res->first)) {
+    return res->first;
+  } else {
+    throw TestUnderflow();
+  }
+}
+
+void parseAll(folly::io::Cursor& cursor, bool eom) {
+  skip(cursor, 2);
+  auto r1 = parseClientSetup(cursor, frameLength(cursor));
+  testUnderflowResult(r1);
+
+  skip(cursor, 2);
+  auto r2 = parseServerSetup(cursor, frameLength(cursor));
+  testUnderflowResult(r2);
+
+  skip(cursor, 1);
+  auto r3 = parseSubscribeRequest(cursor, frameLength(cursor));
+  testUnderflowResult(r3);
+
+  skip(cursor, 1);
+  auto r3a = parseSubscribeUpdate(cursor, frameLength(cursor));
+  testUnderflowResult(r3a);
+
+  skip(cursor, 1);
+  auto r4 = parseSubscribeOk(cursor, frameLength(cursor));
+  testUnderflowResult(r4);
+
+  skip(cursor, 1);
+  auto r4a = parseMaxSubscribeId(cursor, frameLength(cursor));
+  testUnderflowResult(r4a);
+
+  skip(cursor, 1);
+  auto r5 = parseSubscribeError(cursor, frameLength(cursor));
+  testUnderflowResult(r5);
+
+  skip(cursor, 1);
+  auto r6 = parseUnsubscribe(cursor, frameLength(cursor));
+  testUnderflowResult(r6);
+
+  skip(cursor, 1);
+  auto r7 = parseSubscribeDone(cursor, frameLength(cursor));
+  testUnderflowResult(r7);
+
+  skip(cursor, 1);
+  auto r8 = parseSubscribeDone(cursor, frameLength(cursor));
+  testUnderflowResult(r8);
+
+  skip(cursor, 1);
+  auto r9 = parseAnnounce(cursor, frameLength(cursor));
+  testUnderflowResult(r9);
+
+  skip(cursor, 1);
+  auto r10 = parseAnnounceOk(cursor, frameLength(cursor));
+  testUnderflowResult(r10);
+
+  skip(cursor, 1);
+  auto r11 = parseAnnounceError(cursor, frameLength(cursor));
+  testUnderflowResult(r11);
+
+  skip(cursor, 1);
+  auto r12 = parseAnnounceCancel(cursor, frameLength(cursor));
+  testUnderflowResult(r12);
+
+  skip(cursor, 1);
+  auto r13 = parseUnannounce(cursor, frameLength(cursor));
+  testUnderflowResult(r13);
+
+  skip(cursor, 1);
+  auto r14a = parseTrackStatusRequest(cursor, frameLength(cursor));
+  testUnderflowResult(r14a);
+
+  skip(cursor, 1);
+  auto r14b = parseTrackStatus(cursor, frameLength(cursor));
+  testUnderflowResult(r14b);
+
+  skip(cursor, 1);
+  auto r14 = parseGoaway(cursor, frameLength(cursor));
+  testUnderflowResult(r14);
+
+  skip(cursor, 1);
+  auto r9a = parseSubscribeAnnounces(cursor, frameLength(cursor));
+  testUnderflowResult(r9a);
+
+  skip(cursor, 1);
+  auto r10a = parseSubscribeAnnouncesOk(cursor, frameLength(cursor));
+  testUnderflowResult(r10a);
+
+  skip(cursor, 1);
+  auto r11a = parseSubscribeAnnouncesError(cursor, frameLength(cursor));
+  testUnderflowResult(r11a);
+
+  skip(cursor, 1);
+  auto r13a = parseUnsubscribeAnnounces(cursor, frameLength(cursor));
+  testUnderflowResult(r13a);
+
+  skip(cursor, 1);
+  auto r16 = parseFetch(cursor, frameLength(cursor));
+  testUnderflowResult(r16);
+
+  skip(cursor, 1);
+  auto r17 = parseFetchCancel(cursor, frameLength(cursor));
+  testUnderflowResult(r17);
+
+  skip(cursor, 1);
+  auto r18 = parseFetchOk(cursor, frameLength(cursor));
+  testUnderflowResult(r18);
+
+  skip(cursor, 1);
+  auto r19 = parseFetchCancel(cursor, frameLength(cursor));
+  testUnderflowResult(r19);
+
+  auto res = parseStreamHeader(cursor, StreamType::STREAM_HEADER_TRACK);
+  testUnderflowResult(res);
+
   auto r15 = parseMultiObjectHeader(
-      cursor, FrameType::STREAM_HEADER_TRACK, res.value());
-  EXPECT_TRUE(r15 || (!eom && r15.error() == ErrorCode::PARSE_UNDERFLOW));
+      cursor, StreamType::STREAM_HEADER_TRACK, res.value());
+  testUnderflowResult(r15);
   skip(cursor, 1);
 }
 } // namespace
@@ -113,68 +168,41 @@ TEST(SerializeAndParse, All) {
 }
 
 TEST(SerializeAndParse, ParseObjectHeader) {
-  // Test OBJECT_STREAM with random payload
+  // Test OBJECT_DATAGRAM with ObjectStatus::OBJECT_NOT_EXIST
   folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
   auto result = writeObject(
       writeBuf,
-      {11, // subscribeID
-       22, // trackAlias
-       33, // group
-       44, // id
-       55, // sendOrder
-       ForwardPreference::Object,
-       ObjectStatus::NORMAL,
-       4},
-      folly::IOBuf::copyBuffer("EFGH"));
-  EXPECT_TRUE(result.hasValue());
-  auto serialized = writeBuf.move();
-  folly::io::Cursor cursor(serialized.get());
-
-  EXPECT_EQ(parseFrameType(cursor), FrameType::OBJECT_STREAM);
-  auto parseResult = parseObjectHeader(cursor, FrameType::OBJECT_STREAM);
-  EXPECT_TRUE(parseResult.hasValue());
-  EXPECT_EQ(parseResult->subscribeID, 11);
-  EXPECT_EQ(parseResult->trackAlias, 22);
-  EXPECT_EQ(parseResult->group, 33);
-  EXPECT_EQ(parseResult->id, 44);
-  EXPECT_EQ(parseResult->sendOrder, 55);
-  EXPECT_EQ(parseResult->status, ObjectStatus::NORMAL);
-
-  // Test OBJECT_DATAGRAM with ObjectStatus::OBJECT_NOT_EXIST
-  writeBuf = folly::IOBufQueue(folly::IOBufQueue::cacheChainLength());
-  result = writeObject(
-      writeBuf,
-      {11, // subscribeID
-       22, // trackAlias
-       33, // group
-       44, // id
-       55, // sendOrder
+      {TrackAlias(22), // trackAlias
+       33,             // group
+       0,              // subgroup
+       44,             // id
+       55,             // priority
        ForwardPreference::Datagram,
        ObjectStatus::OBJECT_NOT_EXIST,
        0},
       nullptr);
   EXPECT_TRUE(result.hasValue());
-  serialized = writeBuf.move();
-  cursor = folly::io::Cursor(serialized.get());
+  auto serialized = writeBuf.move();
+  folly::io::Cursor cursor(serialized.get());
 
-  EXPECT_EQ(parseFrameType(cursor), FrameType::OBJECT_DATAGRAM);
-  parseResult = parseObjectHeader(cursor, FrameType::OBJECT_DATAGRAM);
+  EXPECT_EQ(parseStreamType(cursor), StreamType::OBJECT_DATAGRAM);
+  auto length = cursor.totalLength();
+  auto parseResult = parseObjectHeader(cursor, length);
   EXPECT_TRUE(parseResult.hasValue());
-  EXPECT_EQ(parseResult->subscribeID, 11);
-  EXPECT_EQ(parseResult->trackAlias, 22);
+  EXPECT_EQ(std::get<TrackAlias>(parseResult->trackIdentifier), TrackAlias(22));
   EXPECT_EQ(parseResult->group, 33);
   EXPECT_EQ(parseResult->id, 44);
-  EXPECT_EQ(parseResult->sendOrder, 55);
+  EXPECT_EQ(parseResult->priority, 55);
   EXPECT_EQ(parseResult->status, ObjectStatus::OBJECT_NOT_EXIST);
 }
 
 TEST(SerializeAndParse, ParseStreamHeader) {
   ObjectHeader expectedObjectHeader = {
-      11, // subscribeID
-      22, // trackAlias
-      33, // group
-      44, // id
-      55, // sendOrder
+      TrackAlias(22), // trackAlias
+      33,             // group
+      0,              // subgroup
+      44,             // id
+      55,             // priority
       ForwardPreference::Track,
       ObjectStatus::NORMAL,
       4};
@@ -184,46 +212,80 @@ TEST(SerializeAndParse, ParseStreamHeader) {
   result = writeObject(
       writeBuf, expectedObjectHeader, folly::IOBuf::copyBuffer("EFGH"));
   EXPECT_TRUE(result.hasValue());
-  auto serialized = writeBuf.move();
-  folly::io::Cursor cursor(serialized.get());
-
-  EXPECT_EQ(parseFrameType(cursor), FrameType::STREAM_HEADER_TRACK);
-  auto parseStreamHeaderResult =
-      parseStreamHeader(cursor, FrameType::STREAM_HEADER_TRACK);
-  EXPECT_TRUE(parseStreamHeaderResult.hasValue());
-  auto parseResult = parseMultiObjectHeader(
-      cursor, FrameType::STREAM_HEADER_TRACK, *parseStreamHeaderResult);
-  EXPECT_TRUE(parseResult.hasValue());
-  EXPECT_EQ(parseResult->subscribeID, 11);
-  EXPECT_EQ(parseResult->trackAlias, 22);
-  EXPECT_EQ(parseResult->group, 33);
-  EXPECT_EQ(parseResult->id, 44);
-  EXPECT_EQ(parseResult->sendOrder, 55);
-  EXPECT_EQ(parseResult->status, ObjectStatus::NORMAL);
 
   // Test ObjectStatus::OBJECT_NOT_EXIST
   expectedObjectHeader.status = ObjectStatus::OBJECT_NOT_EXIST;
-  writeBuf = folly::IOBufQueue(folly::IOBufQueue::cacheChainLength());
-  result = writeStreamHeader(writeBuf, expectedObjectHeader);
-  EXPECT_TRUE(result.hasValue());
+  expectedObjectHeader.length = 0;
   result = writeObject(writeBuf, expectedObjectHeader, nullptr);
   EXPECT_TRUE(result.hasValue());
-  serialized = writeBuf.move();
-  cursor = folly::io::Cursor(serialized.get());
 
-  EXPECT_EQ(parseFrameType(cursor), FrameType::STREAM_HEADER_TRACK);
-  parseStreamHeaderResult =
-      parseStreamHeader(cursor, FrameType::STREAM_HEADER_TRACK);
+  auto serialized = writeBuf.move();
+  folly::io::Cursor cursor(serialized.get());
+
+  EXPECT_EQ(parseStreamType(cursor), StreamType::STREAM_HEADER_TRACK);
+  auto parseStreamHeaderResult =
+      parseStreamHeader(cursor, StreamType::STREAM_HEADER_TRACK);
   EXPECT_TRUE(parseStreamHeaderResult.hasValue());
-  parseResult = parseMultiObjectHeader(
-      cursor, FrameType::STREAM_HEADER_TRACK, *parseStreamHeaderResult);
+  auto parseResult = parseMultiObjectHeader(
+      cursor, StreamType::STREAM_HEADER_TRACK, *parseStreamHeaderResult);
   EXPECT_TRUE(parseResult.hasValue());
-  EXPECT_EQ(parseResult->subscribeID, 11);
-  EXPECT_EQ(parseResult->trackAlias, 22);
+  EXPECT_EQ(std::get<TrackAlias>(parseResult->trackIdentifier), TrackAlias(22));
   EXPECT_EQ(parseResult->group, 33);
   EXPECT_EQ(parseResult->id, 44);
-  EXPECT_EQ(parseResult->sendOrder, 55);
+  EXPECT_EQ(parseResult->priority, 55);
   EXPECT_EQ(parseResult->status, ObjectStatus::NORMAL);
+  EXPECT_EQ(*parseResult->length, 4);
+  cursor.skip(*parseResult->length);
+
+  parseResult = parseMultiObjectHeader(
+      cursor, StreamType::STREAM_HEADER_TRACK, *parseStreamHeaderResult);
+  EXPECT_TRUE(parseResult.hasValue());
+  EXPECT_EQ(std::get<TrackAlias>(parseResult->trackIdentifier), TrackAlias(22));
+  EXPECT_EQ(parseResult->group, 33);
+  EXPECT_EQ(parseResult->id, 44);
+  EXPECT_EQ(parseResult->priority, 55);
+  EXPECT_EQ(parseResult->status, ObjectStatus::OBJECT_NOT_EXIST);
+}
+
+TEST(SerializeAndParse, ParseClientSetupForMaxSubscribeId) {
+  // Test different values for MAX_SUBSCRIBE_ID
+  const std::vector<uint64_t> kTestMaxSubscribeIds = {
+      0,
+      quic::kOneByteLimit,
+      quic::kOneByteLimit + 1,
+      quic::kTwoByteLimit,
+      quic::kTwoByteLimit + 1,
+      quic::kFourByteLimit,
+      quic::kFourByteLimit + 1,
+      quic::kEightByteLimit};
+  for (auto maxSubscribeId : kTestMaxSubscribeIds) {
+    auto clientSetup = ClientSetup{
+        .supportedVersions = {kVersionDraftCurrent},
+        .params =
+            {{{.key = folly::to_underlying(SetupKey::MAX_SUBSCRIBE_ID),
+               .asString = "",
+               .asUint64 = maxSubscribeId}}},
+    };
+
+    folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
+    auto result = writeClientSetup(writeBuf, clientSetup);
+    EXPECT_TRUE(result.hasValue())
+        << "Failed to write client setup for maxSubscribeId:" << maxSubscribeId;
+    auto buffer = writeBuf.move();
+    auto cursor = folly::io::Cursor(buffer.get());
+    skip(cursor, 2);
+    auto parseClientSetupResult = parseClientSetup(cursor, frameLength(cursor));
+    EXPECT_TRUE(parseClientSetupResult.hasValue())
+        << "Failed to parse client setup for maxSubscribeId:" << maxSubscribeId;
+    EXPECT_EQ(parseClientSetupResult->supportedVersions.size(), 1);
+    EXPECT_EQ(
+        parseClientSetupResult->supportedVersions[0], kVersionDraftCurrent);
+    EXPECT_EQ(parseClientSetupResult->params.size(), 1);
+    EXPECT_EQ(
+        parseClientSetupResult->params[0].key,
+        folly::to_underlying(SetupKey::MAX_SUBSCRIBE_ID));
+    EXPECT_EQ(parseClientSetupResult->params[0].asUint64, maxSubscribeId);
+  }
 }
 
 TEST(Underflows, All) {

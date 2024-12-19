@@ -17,8 +17,8 @@ Fig2: Relay architecture overview
 ./build.sh
 ```
 
-## Test relay
-- Generate self signed certificate
+## Test preconditions
+- Generate self signed certificate for the server applications
 ```
 cd scripts
 ./create-server-certs.sh
@@ -74,19 +74,29 @@ I0520 13:08:11.351163 7064889 MoQClient.cpp:137] onWebTransportUniStream
 11
 ```
 
-## Test with media client (from MACOS)
+## Test with media client
+- You can use [moq-encoder-player](https://github.com/facebookexperimental/moq-encoder-player) as encoder (publisher), and also as player (consumer)
 
-- Execute (from project root dir)
+- You need to install that website ([moq-encoder-player](https://github.com/facebookexperimental/moq-encoder-player)) in a https server (apache2 recommended)
+   - It will requiere to enable cross origin isolation (see [link](https://stackoverflow.com/questions/76077439/enabling-cross-origin-isolation-on-the-apache2-web-server)) on the player side
+
+- To start the relay you can do (from project root dir)
 ```
 ./_build/bin/moqrelayserver -port 4433 -cert ./certs/certificate.pem -key ./certs/certificate.key -endpoint "/moq" --logging DBG
 ```
+
+## Local test with media client (server running in localhost)
+
+- Execute (from project root dir)
+```
+./_build/bin/moqrelayserver -port 4433 -cert [moq-encoder-player]/certs/certificate.pem -key [moq-encoder-player]/certs/certificate.key -endpoint "/moq" --logging DBG
+```
+
+Note: [moq-encoder-player] indicate the root directory of that project. So you need to use those certs to enable connections from Chrome to localhost
+
 - Start client (MACOS)
-```
-cd scripts
-./macos-start-localhost-test-chrome.sh
-```
-- Run MOQ encoder locally
-   - From chrome started before, run this project [moq-encoder-player](https://github.com/facebookexperimental/moq-encoder-player)
+Run MOQ encoder / player locally
+   - Open a Chrome window and follow the instructions you will find in [moq-encoder-player](https://github.com/facebookexperimental/moq-encoder-player)
 
 
 ## License

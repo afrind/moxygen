@@ -216,7 +216,6 @@ class HostType(object):
                 ostype = "darwin"
             elif is_windows():
                 ostype = "windows"
-                # pyre-fixme[16]: Module `sys` has no attribute `getwindowsversion`.
                 distrovers = str(sys.getwindowsversion().major)
             elif sys.platform.startswith("freebsd"):
                 ostype = "freebsd"
@@ -272,8 +271,10 @@ class HostType(object):
             return "homebrew"
         if self.distro in ("fedora", "centos", "centos_stream", "rocky"):
             return "rpm"
-        if self.distro.startswith(("debian", "ubuntu", "pop!_os")):
+        if self.distro.startswith(("debian", "ubuntu", "pop!_os", "mint")):
             return "deb"
+        if self.distro == "arch":
+            return "pacman-package"
         return None
 
     @staticmethod

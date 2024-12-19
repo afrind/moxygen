@@ -12,54 +12,84 @@ namespace moxygen {
 
 class MoQCodec {
  public:
+  virtual ~MoQCodec() = default;
+
   class Callback {
    public:
     virtual ~Callback() = default;
 
+    virtual void onConnectionError(ErrorCode error) = 0;
+  };
+
+  void setStreamId(uint64_t streamId) {
+    streamId_ = streamId;
+  }
+
+  virtual void onIngress(std::unique_ptr<folly::IOBuf> data, bool eom) = 0;
+
+ protected:
+  void onIngressStart(std::unique_ptr<folly::IOBuf> data);
+  void onIngressEnd(size_t remainingLength, bool eom, Callback* callback);
+
+  uint64_t streamId_{std::numeric_limits<uint64_t>::max()};
+  folly::IOBufQueue ingress_{folly::IOBufQueue::cacheChainLength()};
+
+  folly::Optional<ErrorCode> connError_;
+  ObjectHeader curObjectHeader_;
+};
+
+class MoQControlCodec : public MoQCodec {
+ public:
+  class ControlCallback : public Callback {
+   public:
+    ~ControlCallback() override = default;
+
     virtual void onFrame(FrameType /*frameType*/) {}
     virtual void onClientSetup(ClientSetup clientSetup) = 0;
     virtual void onServerSetup(ServerSetup serverSetup) = 0;
-    virtual void onObjectHeader(ObjectHeader objectHeader) = 0;
-    virtual void onObjectPayload(
-        uint64_t subscribeID,
-        uint64_t trackAlias,
-        uint64_t groupID,
-        uint64_t id,
-        std::unique_ptr<folly::IOBuf> payload,
-        bool eom) = 0;
     virtual void onSubscribe(SubscribeRequest subscribeRequest) = 0;
-    virtual void onSubscribeUpdate(
-        SubscribeUpdateRequest subscribeUpdateRequest) = 0;
+    virtual void onSubscribeUpdate(SubscribeUpdate subscribeUpdate) = 0;
     virtual void onSubscribeOk(SubscribeOk subscribeOk) = 0;
     virtual void onSubscribeError(SubscribeError subscribeError) = 0;
     virtual void onSubscribeDone(SubscribeDone subscribeDone) = 0;
     virtual void onUnsubscribe(Unsubscribe unsubscribe) = 0;
+    virtual void onMaxSubscribeId(MaxSubscribeId maxSubId) = 0;
+    virtual void onFetch(Fetch fetch) = 0;
+    virtual void onFetchCancel(FetchCancel fetchCancel) = 0;
+    virtual void onFetchOk(FetchOk fetchOk) = 0;
+    virtual void onFetchError(FetchError fetchError) = 0;
     virtual void onAnnounce(Announce announce) = 0;
     virtual void onAnnounceOk(AnnounceOk announceOk) = 0;
     virtual void onAnnounceError(AnnounceError announceError) = 0;
     virtual void onUnannounce(Unannounce unannounce) = 0;
     virtual void onAnnounceCancel(AnnounceCancel announceCancel) = 0;
+    virtual void onSubscribeAnnounces(
+        SubscribeAnnounces subscribeAnnounces) = 0;
+    virtual void onSubscribeAnnouncesOk(
+        SubscribeAnnouncesOk subscribeAnnouncesOk) = 0;
+    virtual void onSubscribeAnnouncesError(
+        SubscribeAnnouncesError announceError) = 0;
+    virtual void onUnsubscribeAnnounces(
+        UnsubscribeAnnounces unsubscribeAnnounces) = 0;
     virtual void onTrackStatusRequest(
         TrackStatusRequest trackStatusRequest) = 0;
     virtual void onTrackStatus(TrackStatus trackStatus) = 0;
     virtual void onGoaway(Goaway goaway) = 0;
-    virtual void onConnectionError(ErrorCode error) = 0;
   };
+
   enum class Direction { CLIENT, SERVER };
-  MoQCodec(Direction dir, Callback* callback)
+  MoQControlCodec(Direction dir, ControlCallback* callback)
       : dir_(dir), callback_(callback) {}
 
-  void setCallback(Callback* callback) {
+  void setCallback(ControlCallback* callback) {
     callback_ = callback;
   }
 
-  void onIngress(std::unique_ptr<folly::IOBuf> data, bool eom);
+  void onIngress(std::unique_ptr<folly::IOBuf> data, bool eom) override;
 
  private:
   bool checkFrameAllowed(FrameType f) {
     switch (f) {
-      case FrameType::OBJECT_STREAM:
-      case FrameType::OBJECT_DATAGRAM:
       case FrameType::SUBSCRIBE:
       case FrameType::SUBSCRIBE_UPDATE:
       case FrameType::SUBSCRIBE_OK:
@@ -74,10 +104,17 @@ class MoQCodec {
       case FrameType::TRACK_STATUS_REQUEST:
       case FrameType::TRACK_STATUS:
       case FrameType::GOAWAY:
+      case FrameType::SUBSCRIBE_ANNOUNCES:
+      case FrameType::SUBSCRIBE_ANNOUNCES_OK:
+      case FrameType::SUBSCRIBE_ANNOUNCES_ERROR:
+      case FrameType::UNSUBSCRIBE_ANNOUNCES:
       case FrameType::CLIENT_SETUP:
       case FrameType::SERVER_SETUP:
-      case FrameType::STREAM_HEADER_TRACK:
-      case FrameType::STREAM_HEADER_GROUP:
+      case FrameType::MAX_SUBSCRIBE_ID:
+      case FrameType::FETCH:
+      case FrameType::FETCH_CANCEL:
+      case FrameType::FETCH_OK:
+      case FrameType::FETCH_ERROR:
         return true;
     }
     return false;
@@ -85,22 +122,60 @@ class MoQCodec {
 
   folly::Expected<folly::Unit, ErrorCode> parseFrame(folly::io::Cursor& cursor);
 
-  uint64_t streamId_{std::numeric_limits<uint64_t>::max()};
   Direction dir_;
-  Callback* callback_{nullptr};
-  folly::IOBufQueue ingress_{folly::IOBufQueue::cacheChainLength()};
-
+  ControlCallback* callback_{nullptr};
+  FrameType curFrameType_;
+  size_t curFrameLength_{0};
   enum class ParseState {
     FRAME_HEADER_TYPE,
+    FRAME_LENGTH,
     FRAME_PAYLOAD,
-    MULTI_OBJECT_HEADER,
-    OBJECT_PAYLOAD,
-    OBJECT_PAYLOAD_NO_LENGTH
   };
   ParseState parseState_{ParseState::FRAME_HEADER_TYPE};
-  FrameType curFrameType_;
-  folly::Optional<ErrorCode> connError_;
-  ObjectHeader curObjectHeader_;
+  bool seenSetup_{false};
+};
+
+class MoQObjectStreamCodec : public MoQCodec {
+ public:
+  class ObjectCallback : public Callback {
+   public:
+    ~ObjectCallback() override = default;
+
+    virtual void onFetchHeader(uint64_t subscribeID) = 0;
+    virtual void onObjectHeader(ObjectHeader objectHeader) = 0;
+
+    virtual void onObjectPayload(
+        TrackIdentifier trackIdentifier,
+        uint64_t groupID,
+        uint64_t id,
+        std::unique_ptr<folly::IOBuf> payload,
+        bool eom) = 0;
+  };
+
+  MoQObjectStreamCodec(ObjectCallback* callback) : callback_(callback) {}
+
+  void setCallback(ObjectCallback* callback) {
+    callback_ = callback;
+  }
+
+  void onIngress(std::unique_ptr<folly::IOBuf> data, bool eom) override;
+
+  TrackIdentifier getTrackIdentifier() const {
+    return curObjectHeader_.trackIdentifier;
+  }
+
+ private:
+  enum class ParseState {
+    STREAM_HEADER_TYPE,
+    OBJECT_STREAM,
+    FETCH_HEADER,
+    MULTI_OBJECT_HEADER,
+    OBJECT_PAYLOAD,
+    // OBJECT_PAYLOAD_NO_LENGTH
+  };
+  ParseState parseState_{ParseState::STREAM_HEADER_TYPE};
+  StreamType streamType_{StreamType::STREAM_HEADER_SUBGROUP};
+  ObjectCallback* callback_;
 };
 
 } // namespace moxygen
