@@ -184,8 +184,6 @@ class MoQSession : public MoQControlCodec::ControlCallback,
       std::shared_ptr<TrackConsumer> callback) override;
   std::shared_ptr<TrackConsumer> subscribeOk(SubscribeOk subOk);
   void subscribeError(SubscribeError subErr);
-  void unsubscribe(Unsubscribe unsubscribe);
-  void subscribeUpdate(SubscribeUpdate subUpdate);
 
   folly::coro::Task<FetchResult> fetch(
       Fetch fetch,
@@ -288,6 +286,9 @@ class MoQSession : public MoQControlCodec::ControlCallback,
 
   folly::coro::Task<void> handleTrackStatus(TrackStatusRequest trackStatusReq);
   void writeTrackStatus(TrackStatus trackStatus);
+
+  void unsubscribe(Unsubscribe unsubscribe);
+  void subscribeUpdate(SubscribeUpdate subUpdate);
 
   folly::coro::Task<void> handleSubscribeAnnounces(SubscribeAnnounces sa);
   void subscribeAnnouncesOk(SubscribeAnnouncesOk saOk);
