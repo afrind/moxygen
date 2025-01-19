@@ -1018,6 +1018,14 @@ void MoQSession::drain() {
   checkForCloseOnDrain();
 }
 
+void MoQSession::goaway(Goaway goaway) {
+  if (!draining_) {
+    writeGoaway(controlWriteBuf_, std::move(goaway));
+    controlWriteEvent_.signal();
+    drain();
+  }
+}
+
 void MoQSession::checkForCloseOnDrain() {
   if (draining_ && fetches_.empty() && subTracks_.empty()) {
     close(SessionCloseErrorCode::NO_ERROR);
@@ -2090,7 +2098,23 @@ void MoQSession::onTrackStatus(TrackStatus trackStatus) {
 
 void MoQSession::onGoaway(Goaway goaway) {
   XLOG(DBG1) << __func__ << " sess=" << this;
-  controlMessages_.enqueue(std::move(goaway));
+  if (receivedGoaway_) {
+    XLOG(ERR) << "Received multiple GOAWAYs sess=" << this;
+    close(SessionCloseErrorCode::PROTOCOL_VIOLATION);
+    return;
+  }
+  receivedGoaway_ = true;
+  folly::RequestContextScopeGuard guard;
+  setRequestSession();
+  if (publishHandler_) {
+    publishHandler_->goaway(goaway);
+  }
+  // This doesn't work if the application made a single object inherit both
+  // classes but provided separate intances.  But that's unlikely.
+  if (subscribeHandler_ &&
+      typeid(subscribeHandler_.get()) != typeid(publishHandler_.get())) {
+    subscribeHandler_->goaway(goaway);
+  }
 }
 
 void MoQSession::onConnectionError(ErrorCode error) {
@@ -2272,6 +2296,13 @@ folly::coro::Task<Publisher::SubscribeResult> MoQSession::subscribe(
     SubscribeRequest sub,
     std::shared_ptr<TrackConsumer> callback) {
   XLOG(DBG1) << __func__ << " sess=" << this;
+  if (draining_) {
+    co_return folly::makeUnexpected(SubscribeError{
+        std::numeric_limits<uint64_t>::max(),
+        500,
+        "Draining session",
+        folly::none});
+  }
   auto fullTrackName = sub.fullTrackName;
   if (nextSubscribeID_ >= peerMaxSubscribeID_) {
     XLOG(WARN) << "Issuing subscribe that will fail; nextSubscribeID_="
@@ -2503,6 +2534,10 @@ folly::coro::Task<Publisher::FetchResult> MoQSession::fetch(
   XLOG(DBG1) << __func__ << " sess=" << this;
   auto g =
       folly::makeGuard([func = __func__] { XLOG(DBG1) << "exit " << func; });
+  if (draining_) {
+    co_return folly::makeUnexpected(FetchError{
+        std::numeric_limits<uint64_t>::max(), 500, "Draining session"});
+  }
   auto fullTrackName = fetch.fullTrackName;
   if (nextSubscribeID_ >= peerMaxSubscribeID_) {
     XLOG(WARN) << "Issuing fetch that will fail; nextSubscribeID_="
