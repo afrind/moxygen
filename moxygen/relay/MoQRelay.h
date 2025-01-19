@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <folly/coro/SharedPromise.h>
 #include "moxygen/MoQSession.h"
 #include "moxygen/relay/MoQForwarder.h"
 
@@ -63,6 +64,7 @@ class MoQRelay : public Publisher,
     std::shared_ptr<MoQSession> upstream;
     SubscribeID subscribeID;
     std::shared_ptr<Publisher::SubscriptionHandle> handle;
+    folly::coro::SharedPromise<folly::Unit> promise;
   };
 
   void onEmpty(MoQForwarder* forwarder) override;

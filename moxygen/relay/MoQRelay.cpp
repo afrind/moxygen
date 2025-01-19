@@ -207,6 +207,17 @@ folly::coro::Task<Publisher::SubscribeResult> MoQRelay::subscribe(
     auto forwarder =
         std::make_shared<MoQForwarder>(subReq.fullTrackName, folly::none);
     forwarder->setCallback(shared_from_this());
+    subscriptions_.emplace(
+        std::piecewise_construct,
+        std::forward_as_tuple(subReq.fullTrackName),
+        std::forward_as_tuple(forwarder, upstreamSession, 0, nullptr));
+    auto g = folly::makeGuard([this, trackName = subReq.fullTrackName] {
+      auto it = subscriptions_.find(trackName);
+      if (it != subscriptions_.end()) {
+        it->second.promise.setException(std::runtime_error("failed"));
+        subscriptions_.erase(it);
+      }
+    });
     // Add subscriber first in case objects come before subscribe OK.
     auto subscriber = forwarder->addSubscriber(
         std::move(session), subReq, std::move(consumer));
@@ -215,6 +226,7 @@ folly::coro::Task<Publisher::SubscribeResult> MoQRelay::subscribe(
       co_return folly::makeUnexpected(
           SubscribeError({subReq.subscribeID, 502, "subscribe failed"}));
     }
+    g.dismiss();
     auto latest = subRes.value()->subscribeOk().latest;
     if (latest) {
       forwarder->updateLatest(latest->group, latest->object);
@@ -222,14 +234,19 @@ folly::coro::Task<Publisher::SubscribeResult> MoQRelay::subscribe(
     auto pubGroupOrder = subRes.value()->subscribeOk().groupOrder;
     forwarder->setGroupOrder(pubGroupOrder);
     subscriber->setPublisherGroupOrder(pubGroupOrder);
-    RelaySubscription rsub(
-        {forwarder,
-         upstreamSession,
-         subRes.value()->subscribeOk().subscribeID,
-         subRes.value()});
-    subscriptions_[subReq.fullTrackName] = std::move(rsub);
+    auto it = subscriptions_.find(subReq.fullTrackName);
+    XCHECK(it != subscriptions_.end());
+    auto& rsub = it->second;
+    rsub.subscribeID = subRes.value()->subscribeOk().subscribeID;
+    rsub.handle = std::move(subRes.value());
+    rsub.promise.setValue(folly::unit);
     co_return subscriber;
   } else {
+    if (!subscriptionIt->second.promise.isFulfilled()) {
+      // this will throw if the dependent subscribe failed, which is good
+      // because subscriptionIt will be invalid
+      co_await subscriptionIt->second.promise.getFuture();
+    }
     co_return subscriptionIt->second.forwarder->addSubscriber(
         std::move(session), subReq, std::move(consumer));
   }
