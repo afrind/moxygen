@@ -506,6 +506,22 @@ class MoQSession::TrackPublisherImpl : public MoQSession::PublisherImpl,
       : PublisherImpl(session, subscribeID, subPriority, groupOrder),
         trackAlias_(trackAlias) {}
 
+  void setSubscriptionHandle(
+      std::shared_ptr<Publisher::SubscriptionHandle> handle) {
+    handle_ = std::move(handle);
+    if (pendingSubscribeDone_) {
+      // If subscribeDone is called before publishHandler_->subscribe() returns,
+      // catch the DONE here and defer it until after we send subscribe OK.
+      auto subDone = std::move(*pendingSubscribeDone_);
+      pendingSubscribeDone_.reset();
+      PublisherImpl::subscribeDone(std::move(subDone));
+    }
+  }
+
+  std::shared_ptr<Publisher::SubscriptionHandle> getSubscriptionHandle() const {
+    return handle_;
+  }
+
   // PublisherImpl overrides
   void onStreamComplete(const ObjectHeader& finalHeader) override;
 
@@ -536,7 +552,9 @@ class MoQSession::TrackPublisherImpl : public MoQSession::PublisherImpl,
       SubscribeDone subDone) override;
 
  private:
+  std::shared_ptr<Publisher::SubscriptionHandle> handle_;
   TrackAlias trackAlias_;
+  folly::Optional<SubscribeDone> pendingSubscribeDone_;
   folly::F14FastMap<
       std::pair<uint64_t, uint64_t>,
       std::shared_ptr<StreamPublisherImpl>>
@@ -708,6 +726,12 @@ MoQSession::TrackPublisherImpl::datagram(
 folly::Expected<folly::Unit, MoQPublishError>
 MoQSession::TrackPublisherImpl::subscribeDone(SubscribeDone subDone) {
   subDone.subscribeID = subscribeID_;
+  if (!handle_) {
+    // subscribeDone called from inside the subscribe handler,
+    // before subscribeOk.
+    pendingSubscribeDone_ = std::move(subDone);
+    return folly::unit;
+  }
   return PublisherImpl::subscribeDone(std::move(subDone));
 }
 
@@ -1542,16 +1566,56 @@ void MoQSession::onSubscribe(SubscribeRequest subscribeRequest) {
       subscribeRequest.trackAlias,
       subscribeRequest.priority,
       subscribeRequest.groupOrder);
-  pubTracks_.emplace(subscribeID, std::move(trackPublisher));
+  pubTracks_.emplace(subscribeID, trackPublisher);
   // TODO: there should be a timeout for the application to call
   // subscribeOK/Error
-  controlMessages_.enqueue(std::move(subscribeRequest));
+  handleSubscribe(std::move(subscribeRequest), std::move(trackPublisher))
+      .scheduleOn(evb_)
+      .start();
+}
+
+folly::coro::Task<void> MoQSession::handleSubscribe(
+    SubscribeRequest sub,
+    std::shared_ptr<TrackPublisherImpl> trackPublisher) {
+  folly::RequestContextScopeGuard guard;
+  setRequestSession();
+  auto subscribeID = sub.subscribeID;
+  auto subscribeResult = co_await co_awaitTry(co_withCancellation(
+      cancellationSource_.getToken(),
+      publishHandler_->subscribe(
+          std::move(sub),
+          std::static_pointer_cast<TrackConsumer>(trackPublisher))));
+  if (subscribeResult.hasException()) {
+    XLOG(ERR) << "Exception in Publisher callback ex="
+              << subscribeResult.exception().what().toStdString();
+    subscribeError(
+        {subscribeID, 500, subscribeResult.exception().what().toStdString()});
+    co_return;
+  }
+  if (subscribeResult->hasError()) {
+    XLOG(DBG1) << "Application subscribe error err="
+               << subscribeResult->error().reasonPhrase;
+    auto subErr = std::move(subscribeResult->error());
+    subErr.subscribeID = subscribeID; // In case app got it wrong
+    subscribeError(std::move(subErr));
+  } else {
+    auto subHandle = std::move(subscribeResult->value());
+    auto subOk = subHandle->subscribeOk();
+    subOk.subscribeID = subscribeID;
+    subscribeOk(std::move(subOk));
+    trackPublisher->setSubscriptionHandle(std::move(subHandle));
+  }
 }
 
 void MoQSession::onSubscribeUpdate(SubscribeUpdate subscribeUpdate) {
   XLOG(DBG1) << __func__ << " id=" << subscribeUpdate.subscribeID
              << " sess=" << this;
   const auto subscribeID = subscribeUpdate.subscribeID;
+  if (!publishHandler_) {
+    XLOG(DBG1) << __func__ << "No publisher callback set";
+    return;
+  }
+
   auto it = pubTracks_.find(subscribeID);
   if (it == pubTracks_.end()) {
     XLOG(ERR) << "No matching subscribe ID=" << subscribeID << " sess=" << this;
@@ -1563,15 +1627,53 @@ void MoQSession::onSubscribeUpdate(SubscribeUpdate subscribeUpdate) {
 
   it->second->setSubPriority(subscribeUpdate.priority);
   // TODO: update priority of tracks in flight
-  controlMessages_.enqueue(std::move(subscribeUpdate));
+  auto pubTrackIt = pubTracks_.find(subscribeID);
+  if (pubTrackIt == pubTracks_.end()) {
+    XLOG(ERR) << "SubscribeUpdate track not found id=" << subscribeID
+              << " sess=" << this;
+    return;
+  }
+  auto trackPublisher =
+      dynamic_cast<TrackPublisherImpl*>(pubTrackIt->second.get());
+  if (!trackPublisher) {
+    XLOG(ERR) << "SubscribeID in SubscribeUpdate is for a FETCH, id="
+              << subscribeID << " sess=" << this;
+  } else if (!trackPublisher->getSubscriptionHandle()) {
+    XLOG(ERR) << "Received SubscribeUpdate before sending SUBSCRIBE_OK id="
+              << subscribeID << " sess=" << this;
+  } else {
+    trackPublisher->getSubscriptionHandle()->subscribeUpdate(
+        std::move(subscribeUpdate));
+  }
 }
 
 void MoQSession::onUnsubscribe(Unsubscribe unsubscribe) {
   XLOG(DBG1) << __func__ << " id=" << unsubscribe.subscribeID
              << " sess=" << this;
+  if (!publishHandler_) {
+    XLOG(DBG1) << __func__ << "No publisher callback set";
+    return;
+  }
   // How does this impact pending subscribes?
   // and open TrackReceiveStates
-  controlMessages_.enqueue(std::move(unsubscribe));
+  auto pubTrackIt = pubTracks_.find(unsubscribe.subscribeID);
+  if (pubTrackIt == pubTracks_.end()) {
+    XLOG(ERR) << "Unsubscribe track not found id=" << unsubscribe.subscribeID
+              << " sess=" << this;
+    return;
+  }
+  auto trackPublisher =
+      dynamic_cast<TrackPublisherImpl*>(pubTrackIt->second.get());
+  if (!trackPublisher) {
+    XLOG(ERR) << "SubscribeID in Unscubscribe is for a FETCH, id="
+              << unsubscribe.subscribeID << " sess=" << this;
+  } else if (!trackPublisher->getSubscriptionHandle()) {
+    XLOG(ERR) << "Received Unsubscribe before sending SUBSCRIBE_OK id="
+              << unsubscribe.subscribeID << " sess=" << this;
+  } else {
+    trackPublisher->getSubscriptionHandle()->unsubscribe();
+    // Maybe issue SUBSCRIBE_DONE/UNSUBSCRIBED + reset open streams?
+  }
 }
 
 void MoQSession::onSubscribeOk(SubscribeOk subOk) {
