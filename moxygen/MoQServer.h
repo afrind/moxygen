@@ -58,7 +58,7 @@ class MoQServer : public MoQSession::ServerSetupCallback {
 
   folly::Try<ServerSetup> onClientSetup(
       ClientSetup clientSetup,
-      std::shared_ptr<MoQSession> session) override;
+      const std::shared_ptr<MoQSession>& session) override;
 
   folly::Expected<folly::Unit, SessionCloseErrorCode> validateAuthority(
       const ClientSetup& clientSetup,
@@ -85,12 +85,19 @@ class MoQServer : public MoQSession::ServerSetupCallback {
   void startPacketForwarding(const folly::SocketAddress& addr);
 
   // Takeover part 4: Methods called on the old instance to wind down.
-  void rejectNewConnections(bool reject);
+  void rejectNewConnections(std::function<bool()> rejectFn);
   void pauseRead();
+
+  void setFizzContext(
+      std::shared_ptr<const fizz::server::FizzServerContext> ctx);
+
+  void setFizzContext(
+      folly::EventBase* evb,
+      std::shared_ptr<const fizz::server::FizzServerContext> ctx);
 
  protected:
   virtual std::shared_ptr<MoQSession> createSession(
-      std::shared_ptr<proxygen::WebTransport> wt,
+      folly::MaybeManagedPtr<proxygen::WebTransport> wt,
       std::shared_ptr<MoQExecutor> executor);
 
  private:
@@ -168,6 +175,5 @@ class MoQServer : public MoQSession::ServerSetupCallback {
   quic::samples::HQServerParams params_;
   std::unique_ptr<quic::samples::HQServer> hqServer_;
   std::string endpoint_;
-  uint16_t port_;
 };
 } // namespace moxygen

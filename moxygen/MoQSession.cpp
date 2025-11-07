@@ -9,6 +9,7 @@
 #include <folly/coro/FutureUtil.h>
 #include <folly/io/async/EventBase.h>
 #include <quic/common/CircularDeque.h>
+#include <moxygen/events/MoQDeliveryTimeoutManager.h>
 
 #include <folly/logging/xlog.h>
 
@@ -58,6 +59,30 @@ uint64_t getStreamPriority(
   return (
       (uint64_t(subPri) << 50) | (uint64_t(pubPri) << 42) | (groupBits << 21) |
       subgroupBits);
+}
+
+// Helper function to validate priority from application is set.
+// Applications must always provide a set priority value.
+folly::Expected<folly::Unit, MoQPublishError> validatePrioritySet(
+    const folly::Optional<uint8_t>& priority) {
+  if (!priority.has_value()) {
+    return folly::makeUnexpected(MoQPublishError(
+        MoQPublishError::API_ERROR,
+        "Application must provide a priority value (cannot be unset)"));
+  }
+  return folly::unit;
+}
+
+// Helper function to elide priority for writing if it matches publisher
+// priority from the control plane. Returns folly::none if priority matches
+// publisherPriority, otherwise returns the original priority.
+folly::Optional<uint8_t> elidePriorityForWrite(
+    uint8_t priority,
+    const folly::Optional<uint8_t>& publisherPriority) {
+  if (priority == publisherPriority) {
+    return folly::none;
+  }
+  return priority;
 }
 
 // Helper function to log RequestError with the correct logger method based on
@@ -122,6 +147,7 @@ class StreamPublisherImpl
       TrackAlias alias,
       uint64_t groupID,
       uint64_t subgroupID,
+      const folly::Optional<uint8_t>& sgPriority,
       SubgroupIDFormat format,
       bool includeExtensions,
       std::shared_ptr<MLogger> logger = nullptr,
@@ -327,9 +353,28 @@ class StreamPublisherImpl
     forward_ = forwardIn;
   }
 
-  void setDeliveryTimeout(folly::Optional<std::chrono::milliseconds> timeout) {
-    if (timeout.has_value() && timeout->count() > 0 && deliveryTimer_) {
-      deliveryTimer_->setDeliveryTimeout(*timeout);
+  void setDeliveryTimeout(
+      folly::Optional<std::chrono::milliseconds> timeout,
+      std::shared_ptr<MoQExecutor> exec) {
+    if (timeout.has_value() && timeout->count() > 0) {
+      if (!deliveryTimer_) {
+        // Create new delivery timer.
+        XLOG(DBG6)
+            << "MoQSession::SubgroupPublisher::setDeliveryTimeout: CREATING new delivery timer"
+            << " timeout=" << timeout->count() << "ms";
+        if (!exec) {
+          XLOG(ERR)
+              << "MoQSession::SubgroupPublisher::setDeliveryTimeout: ERROR: No executor available. Delivery timeout was not set.";
+          return;
+        }
+        deliveryTimer_ = std::make_unique<MoQDeliveryTimer>(exec, *timeout);
+        setDeliveryTimeoutCallback();
+      } else {
+        XLOG(DBG6)
+            << "[MoQSession::SubgroupPublisher::setDeliveryTimeout: CALLING deliveryTimer->setDeliveryTimeout"
+            << " timeout=" << timeout->count() << "ms";
+        deliveryTimer_->setDeliveryTimeout(*timeout);
+      }
     }
   }
 
@@ -456,6 +501,7 @@ StreamPublisherImpl::StreamPublisherImpl(
     TrackAlias alias,
     uint64_t groupID,
     uint64_t subgroupID,
+    const folly::Optional<uint8_t>& sgPriority,
     SubgroupIDFormat format,
     bool includeExtensions,
     std::shared_ptr<MLogger> logger,
@@ -468,11 +514,20 @@ StreamPublisherImpl::StreamPublisherImpl(
           std::move(deliveryTimer)) {
   CHECK(writeHandle)
       << "For a SUBSCRIBE, you need to pass in a non-null writeHandle";
+  // When sgPriority is none, the receiver will use the value from
+  // PUBLISHER_PRIORITY, which defaults to 128 if not sent by the publisher when
+  // establishing the subscription.
   streamType_ = getSubgroupStreamType(
-      publisher->getVersion(), format, includeExtensions, false);
+      publisher->getVersion(),
+      format,
+      includeExtensions,
+      false,
+      sgPriority.hasValue());
   trackAlias_ = alias;
   setWriteHandle(writeHandle);
   setGroupAndSubgroup(groupID, subgroupID);
+  // Set the priority in the header
+  header_.priority = sgPriority;
   logger_ = logger;
   if (logger_) {
     logger_->logStreamTypeSet(
@@ -573,11 +628,12 @@ StreamPublisherImpl::writeToStream(bool finStream, bool endObject) {
       !publisher_->canBufferBytes(writeBuf_.chainLength())) {
     publisher_->onTooManyBytesBuffered();
     return folly::makeUnexpected(
-        MoQPublishError(MoQPublishError::TOO_FAR_BEHIND));
+        MoQPublishError(MoQPublishError::TOO_FAR_BEHIND, "Too far behind"));
   }
 
   if (!writeHandle_) {
-    return folly::makeUnexpected(MoQPublishError(MoQPublishError::CANCELLED));
+    return folly::makeUnexpected(
+        MoQPublishError(MoQPublishError::CANCELLED, "Cancelled"));
   }
 
   auto writeHandle = writeHandle_;
@@ -937,8 +993,18 @@ class MoQSession::TrackPublisherImpl : public MoQSession::PublisherImpl,
             version,
             bytesBufferedThreshold),
         trackAlias_(trackAlias),
-        forward_(forward),
-        deliveryTimeout_(std::move(deliveryTimeout)) {}
+        forward_(forward) {
+    // Set callback for delivery timeout changes
+    deliveryTimeoutManager_.setOnChangeCallback(
+        [this](folly::Optional<std::chrono::milliseconds> newTimeout) {
+          onDeliveryTimeoutChanged(std::move(newTimeout));
+        });
+
+    // Initialize with downstream timeout by default
+    if (deliveryTimeout.has_value()) {
+      deliveryTimeoutManager_.setDownstreamTimeout(*deliveryTimeout);
+    }
+  }
 
   folly::Expected<folly::Unit, MoQPublishError> setTrackAlias(
       TrackAlias trackAlias) override {
@@ -965,7 +1031,8 @@ class MoQSession::TrackPublisherImpl : public MoQSession::PublisherImpl,
       auto subDone = std::move(*pendingSubscribeDone_);
       subDone.streamCount = streamCount_;
       pendingSubscribeDone_.reset();
-      PublisherImpl::subscribeDone(std::move(subDone));
+      XCHECK(session_);
+      session_->sendSubscribeDone(subDone);
     }
   }
 
@@ -986,8 +1053,17 @@ class MoQSession::TrackPublisherImpl : public MoQSession::PublisherImpl,
     } else {
       auto timeoutValue = MoQSession::getDeliveryTimeoutIfPresent(
           subscribeUpdate.params, *session_->getNegotiatedVersion());
-      if (timeoutValue.has_value()) {
-        setDeliveryTimeout(timeoutValue);
+      if (timeoutValue.has_value() && *timeoutValue > 0) {
+        XLOG(DBG6)
+            << "[MoQSession::TrackPublisherImpl::onSubscribeUpdate: SETTING downstream timeout on deliveryTimeoutManager"
+            << " timeout=" << *timeoutValue << "ms"
+            << " requestID=" << requestID_;
+        deliveryTimeoutManager_.setDownstreamTimeout(
+            std::chrono::milliseconds(*timeoutValue));
+      } else {
+        XLOG(DBG6)
+            << "MoQSession::TrackPublisherImpl::onSubscribeUpdate: No delivery timeout in params or timeout=0"
+            << " requestID=" << requestID_;
       }
       setForward(subscribeUpdate.forward);
       subscriptionHandle_->subscribeUpdate(std::move(subscribeUpdate));
@@ -997,17 +1073,22 @@ class MoQSession::TrackPublisherImpl : public MoQSession::PublisherImpl,
   void onPublishOk(const PublishOk& publishOk) {
     auto timeoutValue = MoQSession::getDeliveryTimeoutIfPresent(
         publishOk.params, *session_->getNegotiatedVersion());
-    if (timeoutValue.has_value()) {
-      setDeliveryTimeout(timeoutValue);
+    if (timeoutValue.has_value() && *timeoutValue > 0) {
+      deliveryTimeoutManager_.setDownstreamTimeout(
+          std::chrono::milliseconds(*timeoutValue));
     }
   }
 
-  void onSubscribeOk(const SubscribeOk& subscribeOk) {
+  void subscribeOkSent(const SubscribeOk& subscribeOk) {
+    if (!session_) {
+      return;
+    }
     setGroupOrder(subscribeOk.groupOrder);
     auto timeoutValue = MoQSession::getDeliveryTimeoutIfPresent(
         subscribeOk.params, *session_->getNegotiatedVersion());
-    if (timeoutValue.has_value()) {
-      setDeliveryTimeout(timeoutValue);
+    if (timeoutValue.has_value() && *timeoutValue > 0) {
+      deliveryTimeoutManager_.setUpstreamTimeout(
+          std::chrono::milliseconds(*timeoutValue));
     }
   }
 
@@ -1032,11 +1113,12 @@ class MoQSession::TrackPublisherImpl : public MoQSession::PublisherImpl,
   void terminatePublish(SubscribeDone subDone, ResetStreamErrorCode code)
       override {
     resetAllSubgroups(code);
+    auto session = std::exchange(session_, nullptr);
     if (!subscriptionHandle_) {
-      session_->subscribeError(
+      session->subscribeError(
           {subDone.requestID, SubscribeErrorCode::INTERNAL_ERROR, "terminate"});
     } else {
-      subscribeDone(std::move(subDone));
+      session->sendSubscribeDone(subDone);
     }
   }
 
@@ -1087,9 +1169,14 @@ class MoQSession::TrackPublisherImpl : public MoQSession::PublisherImpl,
     logger_ = logger;
   }
 
-  void setDeliveryTimeout(folly::Optional<uint64_t> timeoutMs);
-
  private:
+  void onDeliveryTimeoutChanged(
+      folly::Optional<std::chrono::milliseconds> newTimeout);
+
+  std::chrono::microseconds getCurrentRtt() const {
+    return session_->getTransportInfo().srtt;
+  }
+
   std::shared_ptr<MLogger> logger_ = nullptr;
   std::shared_ptr<Subscriber::SubscriptionHandle> subscriptionHandle_;
   folly::Optional<TrackAlias> trackAlias_;
@@ -1103,7 +1190,7 @@ class MoQSession::TrackPublisherImpl : public MoQSession::PublisherImpl,
   State state_{State::OPEN};
   bool forward_;
   std::shared_ptr<DeliveryCallback> deliveryCallback_;
-  folly::Optional<std::chrono::milliseconds> deliveryTimeout_;
+  MoQDeliveryTimeoutManager deliveryTimeoutManager_;
 };
 
 class MoQSession::FetchPublisherImpl : public MoQSession::PublisherImpl {
@@ -1235,12 +1322,18 @@ MoQSession::TrackPublisherImpl::beginSubgroup(
           groupID, subgroupID, subPriority_, pubPriority, groupOrder_),
       false);
 
-  // Create a new DeliveryTimer if deliveryTimeout_ is set
-  std::unique_ptr<MoQDeliveryTimer> timeoutManager = nullptr;
-  if (deliveryTimeout_.has_value()) {
-    timeoutManager =
-        std::make_unique<MoQDeliveryTimer>(session_->exec_, *deliveryTimeout_);
+  // Create a new DeliveryTimer if effective timeout is set
+  std::unique_ptr<MoQDeliveryTimer> timer = nullptr;
+  auto effectiveTimeout = deliveryTimeoutManager_.getEffectiveTimeout();
+  if (effectiveTimeout.has_value()) {
+    timer = std::make_unique<MoQDeliveryTimer>(
+        session_->exec_, *effectiveTimeout, [this]() {
+          return getCurrentRtt();
+        });
   }
+
+  // Elide priority if it matches publisher priority from control plane
+  auto elidedPriority = elidePriorityForWrite(pubPriority, publisherPriority_);
 
   auto subgroupPublisher = std::make_shared<StreamPublisherImpl>(
       shared_from_this(),
@@ -1248,11 +1341,12 @@ MoQSession::TrackPublisherImpl::beginSubgroup(
       *trackAlias_,
       groupID,
       subgroupID,
+      elidedPriority,
       format,
       includeExtensions,
       logger_,
       deliveryCallback_,
-      std::move(timeoutManager));
+      std::move(timer));
   // TODO: these are currently unused, but the intent might be to reset
   // open subgroups automatically from some path?
   subgroups_[{groupID, subgroupID}] = subgroupPublisher;
@@ -1275,22 +1369,23 @@ void MoQSession::TrackPublisherImpl::onStreamComplete(
   if (session_) {
     session_->onSubscriptionStreamClosed();
   }
-  // The reason we need the keepalive is that when we call subgroups_.erase(),
-  // we might end up erasing the last SubgroupPublisherImpl that has a
-  // shared_ptr reference to this TrackPublisherImpl, causing the destruction of
-  // the map while erasing from it.
+  // The reason we need the keepalive is that when we call
+  // subgroups_.erase(), we might end up erasing the last
+  // SubgroupPublisherImpl that has a shared_ptr reference to this
+  // TrackPublisherImpl, causing the destruction of the map while erasing
+  // from it.
   auto keepalive = shared_from_this();
   subgroups_.erase({finalHeader.group, finalHeader.subgroup});
 }
 
 void MoQSession::TrackPublisherImpl::onTooManyBytesBuffered() {
   // Note: There is one case in which this reset can be problematic. If some
-  // streams have been created, but have been reset before the subgroup header
-  // is sent out, then there can be a stream count discrepancy. We could, some
-  // time in the future, change this to a reliable reset so that we're ensured
-  // that the stream counts are consistent. We can also add in a timeout for the
-  // stream count discrepancy so that the peer doesn't hang indefinitely waiting
-  // for the stream counts to equalize.
+  // streams have been created, but have been reset before the subgroup
+  // header is sent out, then there can be a stream count discrepancy. We
+  // could, some time in the future, change this to a reliable reset so that
+  // we're ensured that the stream counts are consistent. We can also add in
+  // a timeout for the stream count discrepancy so that the peer doesn't
+  // hang indefinitely waiting for the stream counts to equalize.
   terminatePublish(
       SubscribeDone(
           {requestID_,
@@ -1308,12 +1403,17 @@ MoQSession::TrackPublisherImpl::objectStream(
     return folly::makeUnexpected(MoQPublishError(
         MoQPublishError::API_ERROR, "Must set track alias first"));
   }
+  // Validate that application provided a priority value
+  auto priorityValidation = validatePrioritySet(objHeader.priority);
+  if (priorityValidation.hasError()) {
+    return folly::makeUnexpected(std::move(priorityValidation.error()));
+  }
   XCHECK(objHeader.status == ObjectStatus::NORMAL || !payload);
   Extensions extensions = objHeader.extensions;
   auto subgroup = beginSubgroup(
       objHeader.group,
       objHeader.subgroup,
-      objHeader.priority,
+      *objHeader.priority,
       objHeader.subgroup == objHeader.id ? SubgroupIDFormat::FirstObject
                                          : SubgroupIDFormat::Present,
       !extensions.empty());
@@ -1379,6 +1479,11 @@ MoQSession::TrackPublisherImpl::datagram(
     return folly::makeUnexpected(MoQPublishError(
         MoQPublishError::API_ERROR, "Must set track alias first"));
   }
+  // Validate that application provided a priority value
+  auto priorityValidation = validatePrioritySet(header.priority);
+  if (priorityValidation.hasError()) {
+    return folly::makeUnexpected(std::move(priorityValidation.error()));
+  }
   if (!forward_) {
     return folly::makeUnexpected(MoQPublishError(
         MoQPublishError::API_ERROR,
@@ -1399,6 +1504,10 @@ MoQSession::TrackPublisherImpl::datagram(
     }
   }
 
+  // Elide priority if it matches publisher priority
+  auto elidedPriority =
+      elidePriorityForWrite(*header.priority, publisherPriority_);
+
   folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
   uint64_t headerLength = 0;
   if (header.length) {
@@ -1414,7 +1523,7 @@ MoQSession::TrackPublisherImpl::datagram(
           header.group,
           header.id,
           header.id,
-          header.priority,
+          elidedPriority,
           header.status,
           header.extensions,
           headerLength),
@@ -1430,9 +1539,9 @@ MoQSession::TrackPublisherImpl::datagram(
 
 folly::Expected<folly::Unit, MoQPublishError>
 MoQSession::TrackPublisherImpl::subscribeDone(SubscribeDone subDone) {
-  if (state_ != State::OPEN) {
-    return folly::makeUnexpected(
-        MoQPublishError(MoQPublishError::API_ERROR, "subscribeDone twice"));
+  if (state_ != State::OPEN || !session_) {
+    return folly::makeUnexpected(MoQPublishError(
+        MoQPublishError::API_ERROR, "subscribeDone twice or after close"));
   }
   state_ = State::DONE;
   subDone.requestID = requestID_;
@@ -1443,7 +1552,8 @@ MoQSession::TrackPublisherImpl::subscribeDone(SubscribeDone subDone) {
     return folly::unit;
   }
   subDone.streamCount = streamCount_;
-  return PublisherImpl::subscribeDone(std::move(subDone));
+  session_->sendSubscribeDone(subDone);
+  return folly::unit;
 }
 
 void MoQSession::TrackPublisherImpl::setDeliveryCallback(
@@ -1451,13 +1561,22 @@ void MoQSession::TrackPublisherImpl::setDeliveryCallback(
   deliveryCallback_ = std::move(callback);
 }
 
-void MoQSession::TrackPublisherImpl::setDeliveryTimeout(
-    folly::Optional<uint64_t> timeoutMs) {
-  if (timeoutMs.has_value() && *timeoutMs > 0) {
-    deliveryTimeout_ = std::chrono::milliseconds(*timeoutMs);
-    for (const auto& [_, subgroupPublisher] : subgroups_) {
-      subgroupPublisher->setDeliveryTimeout(deliveryTimeout_);
-    }
+void MoQSession::TrackPublisherImpl::onDeliveryTimeoutChanged(
+    folly::Optional<std::chrono::milliseconds> newTimeout) {
+  XLOG(DBG6)
+      << "MoQSession::TrackPublisherImpl::onDeliveryTimeoutChanged: CALLBACK INVOKED"
+      << " newTimeout="
+      << (newTimeout.has_value() ? std::to_string(newTimeout->count()) + "ms"
+                                 : "none")
+      << " requestID=" << requestID_ << " subgroups.size=" << subgroups_.size();
+
+  if (!newTimeout.has_value()) {
+    return;
+  }
+
+  // Propagate to all existing subgroups
+  for (const auto& [_, subgroupPublisher] : subgroups_) {
+    subgroupPublisher->setDeliveryTimeout(*newTimeout, session_->exec_);
   }
 }
 
@@ -1513,11 +1632,6 @@ class MoQSession::SubscribeTrackReceiveState
     return std::move(contract.second);
   }
 
-  TrackAlias getTrackAlias() const {
-    // This is only called when version < 12
-    return TrackAlias(requestID_.value);
-  }
-
   [[nodiscard]] const FullTrackName& fullTrackName() const {
     return fullTrackName_;
   }
@@ -1535,7 +1649,7 @@ class MoQSession::SubscribeTrackReceiveState
     cancelSource_.requestCancellation();
   }
 
-  void subscribeOK(SubscribeOk subscribeOK) {
+  void processSubscribeOK(SubscribeOk subscribeOK) {
     subscribePromise_.setValue(std::move(subscribeOK));
   }
 
@@ -1545,7 +1659,7 @@ class MoQSession::SubscribeTrackReceiveState
       subErr.requestID = requestID_;
       subscribePromise_.setValue(folly::makeUnexpected(std::move(subErr)));
     } else {
-      subscribeDone(
+      processSubscribeDone(
           {requestID_,
            SubscribeDoneStatusCode::SESSION_CLOSED,
            0, // forces immediately invoking the callback
@@ -1575,7 +1689,7 @@ class MoQSession::SubscribeTrackReceiveState
   }
 
   // return true if subscription can be removed from state
-  bool subscribeDone(SubscribeDone subDone) {
+  bool processSubscribeDone(SubscribeDone subDone) {
     XLOG(DBG1) << __func__ << " trackReceiveState=" << this;
     if (callback_) {
       if (subDone.streamCount > streamCount_) {
@@ -1596,6 +1710,15 @@ class MoQSession::SubscribeTrackReceiveState
     currentStreamId_ = id;
   }
 
+  uint8_t getPublisherPriority() const {
+    // Fallback to kDefaultPriority if not set
+    return publisherPriority_.value_or(kDefaultPriority);
+  }
+
+  void setPublisherPriority(uint8_t priority) {
+    publisherPriority_ = priority;
+  }
+
  private:
   std::shared_ptr<MLogger> logger_ = nullptr;
   std::shared_ptr<TrackConsumer> callback_;
@@ -1606,6 +1729,11 @@ class MoQSession::SubscribeTrackReceiveState
 
   // Indicates whether receiveState is for Publish
   bool publish_;
+
+  // Publisher priority from SUBSCRIBE_OK or PUBLISH parameter
+  // Stored as optional; if not set from SUBSCRIBE_OK, defaults to
+  // kDefaultPriority
+  folly::Optional<uint8_t> publisherPriority_;
 };
 
 class MoQSession::FetchTrackReceiveState
@@ -1703,8 +1831,9 @@ MoQSession::PendingRequestState::setError(
       return type_;
     }
     case FrameType::TRACK_STATUS: {
-      storage_.trackStatus_.setValue(folly::makeUnexpected(TrackStatusError(
-          {error.requestID, error.errorCode, error.reasonPhrase})));
+      storage_.trackStatus_.setValue(
+          folly::makeUnexpected(TrackStatusError(
+              {error.requestID, error.errorCode, error.reasonPhrase})));
       return type_;
     }
     case FrameType::FETCH_ERROR: {
@@ -1773,10 +1902,9 @@ void MoQSession::cleanup() {
   }
   for (auto& subTrack : subTracks_) {
     if (!subTrack.second->isPublish()) {
-      subTrack.second->subscribeError(
-          {/*TrackReceiveState fills in subId*/ 0,
-           SubscribeErrorCode::INTERNAL_ERROR,
-           "session closed"});
+      subTrack.second->subscribeError({/*TrackReceiveState fills in subId*/ 0,
+                                       SubscribeErrorCode::INTERNAL_ERROR,
+                                       "session closed"});
     }
   }
   subTracks_.clear();
@@ -1790,7 +1918,7 @@ void MoQSession::cleanup() {
   for (auto& [reqID, pendingState] : pendingRequests_) {
     pendingState->setError(
         RequestError{reqID, RequestErrorCode::INTERNAL_ERROR, "Session closed"},
-        pendingState->getFrameType());
+        pendingState->getErrorFrameType());
   }
   pendingRequests_.clear();
   if (!cancellationSource_.isCancellationRequested()) {
@@ -1932,29 +2060,23 @@ folly::coro::Task<ServerSetup> MoQSession::setup(ClientSetup setup) {
   auto maxRequestID = getMaxRequestIDIfPresent(setup.params);
 
   if (shouldIncludeMoqtImplementationParam(setup.supportedVersions)) {
-    setup.params.emplace_back(SetupParameter(
+    setup.params.insertParam(SetupParameter(
         {folly::to_underlying(SetupKey::MOQT_IMPLEMENTATION),
          getMoQTImplementationString(),
          0,
          {}}));
   }
 
-  // Choose serialization version based on supported v11 vs v12
   uint64_t setupSerializationVersion = kVersionDraft12;
-  for (auto supportedVersion : setup.supportedVersions) {
-    auto majorVersion = getDraftMajorVersion(supportedVersion);
-    if (majorVersion < 12) {
-      setupSerializationVersion = kVersionDraft11;
-      break;
-    }
+  if (negotiatedVersion_) {
+    setupSerializationVersion = *negotiatedVersion_;
   }
+
   // This sets the receive token cache size, but it's necesarily empty
   controlCodec_.setMaxAuthTokenCacheSize(
       getMaxAuthTokenCacheSizeIfPresent(setup.params));
   // Optimistically registers params without knowing peer's capabilities
-  if (getDraftMajorVersion(setupSerializationVersion) >= 12) {
-    aliasifyAuthTokens(setup.params, setupSerializationVersion);
-  }
+  aliasifyAuthTokens(setup.params, setupSerializationVersion);
   auto res =
       writeClientSetup(controlWriteBuf_, setup, setupSerializationVersion);
   if (!res) {
@@ -1979,13 +2101,16 @@ folly::coro::Task<ServerSetup> MoQSession::setup(ClientSetup setup) {
               << folly::exceptionStr(serverSetup.exception());
     co_yield folly::coro::co_error(serverSetup.exception());
   }
-  if (std::find(
-          setup.supportedVersions.begin(),
-          setup.supportedVersions.end(),
-          serverSetup->selectedVersion) == setup.supportedVersions.end()) {
-    close(SessionCloseErrorCode::VERSION_NEGOTIATION_FAILED);
-    XLOG(ERR) << "Server chose a version that the client doesn't support";
-    co_yield folly::coro::co_error(serverSetup.exception());
+  // Only validate version selection in non-alpn mode
+  if (!negotiatedVersion_) {
+    if (std::find(
+            setup.supportedVersions.begin(),
+            setup.supportedVersions.end(),
+            serverSetup->selectedVersion) == setup.supportedVersions.end()) {
+      close(SessionCloseErrorCode::VERSION_NEGOTIATION_FAILED);
+      XLOG(ERR) << "Server chose a version that the client doesn't support";
+      co_yield folly::coro::co_error(serverSetup.exception());
+    }
   }
 
   setupComplete_ = true;
@@ -2017,7 +2142,11 @@ void MoQSession::onServerSetup(ServerSetup serverSetup) {
     return;
   }
 
-  initializeNegotiatedVersion(serverSetup.selectedVersion);
+  // In LEGACY mode: initialize version from SERVER_SETUP
+  if (!negotiatedVersion_) {
+    initializeNegotiatedVersion(serverSetup.selectedVersion);
+  }
+
   peerMaxRequestID_ = getMaxRequestIDIfPresent(serverSetup.params);
   tokenCache_.setMaxSize(
       std::min(
@@ -2058,9 +2187,35 @@ void MoQSession::onClientSetup(ClientSetup clientSetup) {
     return;
   }
 
+  if (!getNegotiatedVersion()) {
+    // Version negotiation has not happened at alpn
+    // Negotiate from setup message
+
+    auto majorVersion = getDraftMajorVersion(serverSetup->selectedVersion);
+
+    if (majorVersion >= 15) {
+      // Version >= 15 should always be negotiated using alpn
+      XLOG(ERR) << "Selected version " << serverSetup->selectedVersion
+                << " (major=" << majorVersion
+                << ") can only be negotiated via alpn. sess=" << this;
+      close(SessionCloseErrorCode::VERSION_NEGOTIATION_FAILED);
+      return;
+    }
+
+    // Check if selected version is < 12 and handle appropriately
+    if (majorVersion < 12) {
+      XLOG(ERR) << "Selected version " << serverSetup->selectedVersion
+                << " (major=" << majorVersion
+                << ") is not supported. Minimum version is 12. sess=" << this;
+      close(SessionCloseErrorCode::VERSION_NEGOTIATION_FAILED);
+      return;
+    }
+    initializeNegotiatedVersion(serverSetup->selectedVersion);
+  }
+
   // Validate authority with the negotiated version
   auto authorityValidation = serverSetupCallback_->validateAuthority(
-      clientSetup, serverSetup->selectedVersion, shared_from_this());
+      clientSetup, *getNegotiatedVersion(), shared_from_this());
   if (!authorityValidation.hasValue()) {
     SessionCloseErrorCode errorCode = authorityValidation.error();
     XLOG(ERR) << "Authority validation failed sess=" << this
@@ -2069,25 +2224,14 @@ void MoQSession::onClientSetup(ClientSetup clientSetup) {
     return;
   }
 
-  if (getDraftMajorVersion(serverSetup->selectedVersion) >= 14) {
-    serverSetup->params.emplace_back(SetupParameter(
+  if (getDraftMajorVersion(*getNegotiatedVersion()) >= 14) {
+    serverSetup->params.insertParam(SetupParameter(
         {folly::to_underlying(SetupKey::MOQT_IMPLEMENTATION),
          getMoQTImplementationString(),
          0,
          {}}));
   }
 
-  // Check if selected version is < 11 and handle appropriately
-  auto majorVersion = getDraftMajorVersion(serverSetup->selectedVersion);
-  if (majorVersion < 11) {
-    XLOG(ERR) << "Selected version " << serverSetup->selectedVersion
-              << " (major=" << majorVersion
-              << ") is not supported. Minimum version is 11. sess=" << this;
-    close(SessionCloseErrorCode::VERSION_NEGOTIATION_FAILED);
-    return;
-  }
-
-  initializeNegotiatedVersion(serverSetup->selectedVersion);
   XLOG(DBG1) << "Negotiated Version=" << *getNegotiatedVersion();
   auto maxRequestID = getMaxRequestIDIfPresent(serverSetup->params);
 
@@ -2095,8 +2239,8 @@ void MoQSession::onClientSetup(ClientSetup clientSetup) {
   controlCodec_.setMaxAuthTokenCacheSize(
       getMaxAuthTokenCacheSizeIfPresent(serverSetup->params));
   aliasifyAuthTokens(serverSetup->params);
-  auto res = writeServerSetup(
-      controlWriteBuf_, *serverSetup, serverSetup->selectedVersion);
+  auto res =
+      writeServerSetup(controlWriteBuf_, *serverSetup, *getNegotiatedVersion());
   if (!res) {
     XLOG(ERR) << "writeServerSetup failed sess=" << this;
     close(SessionCloseErrorCode::VERSION_NEGOTIATION_FAILED);
@@ -2218,7 +2362,7 @@ class ObjectStreamCallback : public MoQObjectStreamCodec::ObjectCallback {
       TrackAlias alias,
       uint64_t group,
       uint64_t subgroup,
-      Priority priority) override {
+      folly::Optional<uint8_t> priority) override {
     XCHECK(subscribeState_);
     trackAlias_ = alias; // Store for use in onObjectBegin logging
     session_->onSubscriptionStreamOpenedByPeer();
@@ -2235,7 +2379,10 @@ class ObjectStreamCallback : public MoQObjectStreamCodec::ObjectCallback {
       XLOG(DBG2) << "No callback for subgroup";
       return;
     }
-    auto res = callback->beginSubgroup(group, subgroup, priority);
+    // Use object priority if present, else fall back to publisher priority
+    uint8_t effectivePriority =
+        priority.value_or(subscribeState_->getPublisherPriority());
+    auto res = callback->beginSubgroup(group, subgroup, effectivePriority);
     if (res.hasValue()) {
       subgroupCallback_ = *res;
     } else {
@@ -2243,7 +2390,7 @@ class ObjectStreamCallback : public MoQObjectStreamCodec::ObjectCallback {
     }
     if (logger_) {
       logger_->logSubgroupHeaderParsed(
-          currentStreamId_, alias, group, subgroup, priority);
+          currentStreamId_, alias, group, subgroup, effectivePriority);
     }
 
     subscribeState_->setCurrentStreamId(currentStreamId_);
@@ -2359,13 +2506,17 @@ class ObjectStreamCallback : public MoQObjectStreamCodec::ObjectCallback {
       uint64_t group,
       uint64_t subgroup,
       uint64_t objectID,
-      Priority pri,
+      folly::Optional<uint8_t> priority,
       ObjectStatus status,
       Extensions extensions) override {
     if (isCancelled()) {
       return;
     }
     folly::Expected<folly::Unit, MoQPublishError> res{folly::unit};
+    // Use object priority if present, else fall back to publisher priority
+    uint8_t effectivePriority = priority.value_or(
+        subscribeState_ ? subscribeState_->getPublisherPriority()
+                        : kDefaultPriority);
     // Handle subscription/fetch consumers
     switch (status) {
       case ObjectStatus::NORMAL:
@@ -2387,7 +2538,7 @@ class ObjectStreamCallback : public MoQObjectStreamCodec::ObjectCallback {
               group, subgroup, std::move(extensions), false);
         } else {
           res = subscribeState_->getSubscribeCallback()->groupNotExists(
-              group, subgroup, pri, std::move(extensions));
+              group, subgroup, effectivePriority, std::move(extensions));
           endOfSubgroup();
         }
         break;
@@ -2530,9 +2681,10 @@ MoQSession::headerParsed(
     constexpr std::chrono::milliseconds kUnknownAliasTimeout(5000);
     auto waitRes = co_await co_awaitTry(baton.wait(kUnknownAliasTimeout));
     if (waitRes.hasException()) {
-      // TODO: Remove the baton we created from bufferedSubgroups_. The removal
-      // would be a lot easier once we've implemented a TimedBaton/TimedBarrier
-      // that allows multiple waiters on the same object.
+      // TODO: Remove the baton we created from bufferedSubgroups_. The
+      // removal would be a lot easier once we've implemented a
+      // TimedBaton/TimedBarrier that allows multiple waiters on the same
+      // object.
       MoQPublishError err(
           MoQPublishError::CANCELLED, "Timed out waiting for unknown alias");
       co_return folly::makeUnexpected(err);
@@ -2713,7 +2865,14 @@ folly::coro::Task<void> MoQSession::handleSubscribe(
   setRequestSession();
   auto requestID = sub.requestID;
   auto fullTrackName = sub.fullTrackName;
-  auto params = sub.params;
+  auto& params = sub.params;
+
+  // TODO: Formalize after parameter refactor
+  // We should only keep e2e params here and remove everything else
+  //// Remove DELIVERY_TIMEOUT param from params before passing to
+  //// publishHandler_
+  params.eraseAllParamsOfType(TrackRequestParamKey::DELIVERY_TIMEOUT);
+
   auto subscribeResult = co_await co_awaitTry(co_withCancellation(
       cancellationSource_.getToken(),
       publishHandler_->subscribe(
@@ -2739,10 +2898,52 @@ folly::coro::Task<void> MoQSession::handleSubscribe(
     auto subOk = subHandle->subscribeOk();
     subOk.requestID = requestID;
 
-    // TODO: verify TrackAlias is unique
-    subscribeOk(subOk);
+    setPublisherPriorityFromParams(subOk.params, trackPublisher);
+    trackPublisher->subscribeOkSent(subOk);
 
+    // TODO: verify TrackAlias is unique
+    sendSubscribeOk(subOk);
     trackPublisher->setSubscriptionHandle(std::move(subHandle));
+  }
+}
+
+void MoQSession::setPublisherPriorityFromParams(
+    const TrackRequestParameters& params,
+    const std::shared_ptr<TrackPublisherImpl>& trackPublisher) {
+  // Extract PUBLISHER_PRIORITY parameter if present (version 15+)
+  if (getDraftMajorVersion(*getNegotiatedVersion()) >= 15) {
+    auto publisherPriority =
+        getFirstIntParam(params, TrackRequestParamKey::PUBLISHER_PRIORITY);
+    if (publisherPriority) {
+      if (*publisherPriority <= 255) {
+        trackPublisher->setPublisherPriority(
+            static_cast<uint8_t>(*publisherPriority));
+      } else {
+        XLOG(WARN) << "Invalid priority value: "
+                   << static_cast<uint64_t>(*publisherPriority);
+      }
+    } else {
+      trackPublisher->setPublisherPriority(kDefaultPriority);
+    }
+  }
+}
+
+void MoQSession::setPublisherPriorityFromParams(
+    const TrackRequestParameters& params,
+    const std::shared_ptr<SubscribeTrackReceiveState>& trackReceiveState) {
+  // Extract PUBLISHER_PRIORITY parameter if present (version 15+)
+  if (getDraftMajorVersion(*getNegotiatedVersion()) >= 15) {
+    auto publisherPriority =
+        getFirstIntParam(params, TrackRequestParamKey::PUBLISHER_PRIORITY);
+    if (publisherPriority) {
+      if (*publisherPriority <= 255) {
+        trackReceiveState->setPublisherPriority(
+            static_cast<uint8_t>(*publisherPriority));
+      } else {
+        XLOG(ERR) << "Invalid priority value: "
+                  << static_cast<uint64_t>(*publisherPriority);
+      }
+    }
   }
 }
 
@@ -2856,7 +3057,8 @@ void MoQSession::onPublishOk(PublishOk publishOk) {
     return;
   }
 
-  // Extract delivery timeout from PUBLISH_OK params and update trackPublisher
+  // Extract delivery timeout from PUBLISH_OK params and update
+  // trackPublisher
   auto trackIt = pubTracks_.find(publishOk.requestID);
   if (trackIt != pubTracks_.end()) {
     auto trackPublisher =
@@ -2874,20 +3076,31 @@ void MoQSession::onRequestError(RequestError error, FrameType frameType) {
              << " sess=" << this;
 
   // Log the error using the appropriate logger method
-  logRequestError(logger_, error, frameType, ControlMessageType::PARSED);
+  auto g = folly::makeGuard([&] {
+    logRequestError(logger_, error, frameType, ControlMessageType::PARSED);
+  });
 
   // Find the pending request and invoke setError
   auto it = pendingRequests_.find(error.requestID);
   if (it != pendingRequests_.end()) {
     auto pendingState = std::move(it->second);
     pendingRequests_.erase(it);
+    if (getDraftMajorVersion(*getNegotiatedVersion()) > 14) {
+      // determine real frame type from pendingRequest
+      frameType = pendingState->getErrorFrameType();
+    }
+
     auto setErrorRes = pendingState->setError(error, frameType);
     if (setErrorRes.hasError()) {
+      XLOG(ERR) << "setError failure id=" << error.requestID
+                << " sess=" << this;
       close(SessionCloseErrorCode::PROTOCOL_VIOLATION);
+      return;
     }
   } else {
-    // Error: request not found
+    XLOG(ERR) << "Request not found id=" << error.requestID << " sess=" << this;
     close(SessionCloseErrorCode::PROTOCOL_VIOLATION);
+    return;
   }
 
   // Additional cleanup for specific error types if needed
@@ -2947,9 +3160,6 @@ void MoQSession::onSubscribeOk(SubscribeOk subOk) {
   }
   auto trackReceiveState = std::move(*trackPtr);
   pendingRequests_.erase(it);
-  if (getDraftMajorVersion(*getNegotiatedVersion()) < 12) {
-    subOk.trackAlias = trackReceiveState->getTrackAlias();
-  }
 
   auto res = reqIdToTrackAlias_.try_emplace(subOk.requestID, subOk.trackAlias);
   if (!res.second) {
@@ -2966,7 +3176,8 @@ void MoQSession::onSubscribeOk(SubscribeOk subOk) {
     close(SessionCloseErrorCode::DUPLICATE_TRACK_ALIAS);
   }
   auto trackAlias = subOk.trackAlias;
-  trackReceiveState->subscribeOK(std::move(subOk));
+  setPublisherPriorityFromParams(subOk.params, trackReceiveState);
+  trackReceiveState->processSubscribeOK(std::move(subOk));
   if (trackReceiveState->getSubscribeCallback()) {
     trackReceiveState->getSubscribeCallback()->setTrackAlias(trackAlias);
   }
@@ -3037,10 +3248,11 @@ void MoQSession::onPublish(PublishRequest publish) {
 
   if (!subscribeHandler_) {
     XLOG(DBG1) << __func__ << " No subscriber callback set";
-    publishError(PublishError{
-        publish.requestID,
-        PublishErrorCode::NOT_SUPPORTED,
-        "Not a subscriber"});
+    publishError(
+        PublishError{
+            publish.requestID,
+            PublishErrorCode::NOT_SUPPORTED,
+            "Not a subscriber"});
     return;
   }
 
@@ -3062,6 +3274,7 @@ folly::coro::Task<void> MoQSession::handlePublish(
   auto requestID = publish.requestID;
   auto alias = publish.trackAlias;
   auto ftn = publish.fullTrackName;
+  auto params = publish.params;
 
   // PubError if error occurs
   auto publishErr =
@@ -3097,6 +3310,10 @@ folly::coro::Task<void> MoQSession::handlePublish(
         // Add ReceiveState to subTracks_
         auto trackReceiveState = std::make_shared<SubscribeTrackReceiveState>(
             ftn, requestID, initiator.consumer, logger_, true);
+
+        // Extract PUBLISHER_PRIORITY parameter if present (version 15+)
+        setPublisherPriorityFromParams(params, trackReceiveState);
+
         initiator.consumer->setTrackAlias(alias);
         subTracks_.emplace(alias, trackReceiveState);
         // Ensure the PublishOk we send back corresponds to the inbound
@@ -3137,14 +3354,14 @@ void MoQSession::onSubscribeDone(SubscribeDone subscribeDone) {
 
   // TODO: handle final object and status code
   // TODO: there could still be objects in flight.  Removing from maps now
-  // will prevent their delivery.  I think the only way to handle this is with
-  // timeouts.
+  // will prevent their delivery.  I think the only way to handle this is
+  // with timeouts.
   auto alias = trackAliasIt->second;
   auto reqId = subscribeDone.requestID;
   auto trackReceiveStateIt = subTracks_.find(alias);
   if (trackReceiveStateIt != subTracks_.end()) {
     auto state = trackReceiveStateIt->second;
-    if (state->subscribeDone(std::move(subscribeDone))) {
+    if (state->processSubscribeDone(std::move(subscribeDone))) {
       removeSubscriptionState(alias, reqId);
     }
   } else {
@@ -3218,8 +3435,9 @@ void MoQSession::onFetch(Fetch fetch) {
   }
   if (standalone) {
     if (standalone->end <= standalone->start) {
-      // If the end object is zero this indicates a fetch for the entire group,
-      // which is valid as long as the start and end group are the same.
+      // If the end object is zero this indicates a fetch for the entire
+      // group, which is valid as long as the start and end group are the
+      // same.
       if (!(standalone->end.group == standalone->start.group &&
             standalone->end.object == 0)) {
         fetchError(
@@ -3283,12 +3501,13 @@ folly::coro::Task<void> MoQSession::handleFetch(
       publishHandler_->fetch(
           std::move(fetch), fetchPublisher->getStreamPublisher())));
   if (fetchResult.hasException() || fetchResult->hasError()) {
-    // We need to call reset() in order to ensure that the StreamPublisherImpl
-    // is destructed, otherwise there could be memory leaks, since the
-    // StreamPublisherImpl and the PublisherImpl hold references to each other.
-    // This doesn't actually reset the stream unless the user wrote something to
-    // it within the fetch handler, because the stream creation is deferred
-    // until the user actually writes something to a stream.
+    // We need to call reset() in order to ensure that the
+    // StreamPublisherImpl is destructed, otherwise there could be memory
+    // leaks, since the StreamPublisherImpl and the PublisherImpl hold
+    // references to each other. This doesn't actually reset the stream
+    // unless the user wrote something to it within the fetch handler,
+    // because the stream creation is deferred until the user actually
+    // writes something to a stream.
     fetchPublisher->reset(ResetStreamErrorCode::INTERNAL_ERROR);
   }
 
@@ -3313,7 +3532,8 @@ folly::coro::Task<void> MoQSession::handleFetch(
     fetchOkMsg.requestID = requestID;
     fetchOk(fetchOkMsg);
     fetchPublisher->setFetchHandle(std::move(fetchHandle));
-  } // else, no need to fetchError, state has been removed on both sides already
+  } // else, no need to fetchError, state has been removed on both sides
+    // already
 }
 
 void MoQSession::onFetchCancel(FetchCancel fetchCancel) {
@@ -3469,10 +3689,11 @@ folly::coro::Task<MoQSession::TrackStatusResult> MoQSession::trackStatus(
   auto res = moqFrameWriter_.writeTrackStatus(controlWriteBuf_, trackStatus);
   if (!res) {
     XLOG(ERR) << "writeTrackStatus failed sess=" << this;
-    co_return folly::makeUnexpected(TrackStatusError{
-        trackStatus.requestID,
-        TrackStatusErrorCode::INTERNAL_ERROR,
-        "local write failed"});
+    co_return folly::makeUnexpected(
+        TrackStatusError{
+            trackStatus.requestID,
+            TrackStatusErrorCode::INTERNAL_ERROR,
+            "local write failed"});
   }
   if (logger_) {
     logger_->logTrackStatus(trackStatus);
@@ -3600,17 +3821,21 @@ Subscriber::PublishResult MoQSession::publish(
   // Reject new publish attempts if session is draining
   if (draining_) {
     XLOG(DBG1) << "Rejecting publish request, session draining sess=" << this;
-    return folly::makeUnexpected(PublishError{
-        pub.requestID, PublishErrorCode::INTERNAL_ERROR, "Session draining"});
+    return folly::makeUnexpected(
+        PublishError{
+            pub.requestID,
+            PublishErrorCode::INTERNAL_ERROR,
+            "Session draining"});
   }
 
   if (!handle) {
     XLOG(DBG1) << "Rejecting publish request, no subscription handle sess="
                << this;
-    return folly::makeUnexpected(PublishError{
-        pub.requestID,
-        PublishErrorCode::INTERNAL_ERROR,
-        "No subscription handle"});
+    return folly::makeUnexpected(
+        PublishError{
+            pub.requestID,
+            PublishErrorCode::INTERNAL_ERROR,
+            "No subscription handle"});
   }
 
   auto publishStartTime = std::chrono::steady_clock::now();
@@ -3631,8 +3856,11 @@ Subscriber::PublishResult MoQSession::publish(
   auto res = moqFrameWriter_.writePublish(controlWriteBuf_, pub);
   if (!res) {
     XLOG(ERR) << "writePublish failed sess=" << this;
-    return folly::makeUnexpected(PublishError{
-        pub.requestID, PublishErrorCode::INTERNAL_ERROR, "local write failed"});
+    return folly::makeUnexpected(
+        PublishError{
+            pub.requestID,
+            PublishErrorCode::INTERNAL_ERROR,
+            "local write failed"});
   }
   controlWriteEvent_.signal();
 
@@ -3660,6 +3888,9 @@ Subscriber::PublishResult MoQSession::publish(
   // Set publishHandle in trackPublisher so it can cancel on unsubscribes
   trackPublisher->setSubscriptionHandle(handle);
 
+  // Extract PUBLISHER_PRIORITY parameter if present (version 15+)
+  setPublisherPriorityFromParams(pub.params, trackPublisher);
+
   // Store the track publisher for later lookup
   pubTracks_.emplace(pub.requestID, trackPublisher);
 
@@ -3676,13 +3907,14 @@ Subscriber::PublishResult MoQSession::publish(
        rid = pub.requestID,
        trackPublisher,
        this]() mutable
-      -> folly::coro::Task<folly::Expected<PublishOk, PublishError>> {
+          -> folly::coro::Task<folly::Expected<PublishOk, PublishError>> {
         auto result = co_await std::move(fut);
         if (result.hasValue()) {
           auto it = pubTracks_.find(rid);
           if (it != pubTracks_.end()) {
             // If Receive PublishOk is received, update the trackPublisher
-            // If Receive PublishError, the session is reset in onPublishError()
+            // If Receive PublishError, the session is reset in
+            // onPublishError()
             trackPublisher->setForward(result.value().forward);
             trackPublisher->setGroupOrder(result.value().groupOrder);
             trackPublisher->setSubPriority(result.value().subscriberPriority);
@@ -3819,31 +4051,13 @@ folly::coro::Task<Publisher::SubscribeResult> MoQSession::subscribe(
   }
 }
 
-std::shared_ptr<TrackConsumer> MoQSession::subscribeOk(
-    const SubscribeOk& subOk) {
+void MoQSession::sendSubscribeOk(const SubscribeOk& subOk) {
   XLOG(DBG1) << __func__ << " sess=" << this;
   MOQ_PUBLISHER_STATS(publisherStatsCallback_, onSubscribeSuccess);
-  auto it = pubTracks_.find(subOk.requestID);
-  if (it == pubTracks_.end()) {
-    XLOG(ERR) << "Invalid Subscribe OK, id=" << subOk.requestID;
-    return nullptr;
-  }
-  auto trackPublisher =
-      std::static_pointer_cast<TrackPublisherImpl>(it->second);
-  if (!trackPublisher) {
-    XLOG(ERR) << "subscribe ID maps to a fetch, not a subscribe, id="
-              << subOk.requestID;
-    subscribeError(
-        {subOk.requestID,
-         SubscribeErrorCode::INTERNAL_ERROR,
-         "Invalid internal state"});
-    return nullptr;
-  }
-  trackPublisher->onSubscribeOk(subOk);
   auto res = moqFrameWriter_.writeSubscribeOk(controlWriteBuf_, subOk);
   if (!res) {
     XLOG(ERR) << "writeSubscribeOk failed sess=" << this;
-    return nullptr;
+    return;
   }
 
   if (logger_) {
@@ -3851,7 +4065,6 @@ std::shared_ptr<TrackConsumer> MoQSession::subscribeOk(
   }
 
   controlWriteEvent_.signal();
-  return std::static_pointer_cast<TrackConsumer>(trackPublisher);
 }
 
 void MoQSession::subscribeError(const SubscribeError& subErr) {
@@ -3900,7 +4113,8 @@ void MoQSession::unsubscribe(const Unsubscribe& unsubscribe) {
   // no more callbacks after unsubscribe
   XLOG(DBG1) << "unsubscribing from ftn=" << trackIt->second->fullTrackName()
              << " sess=" << this;
-  // cancel() should send STOP_SENDING on any open streams for this subscription
+  // cancel() should send STOP_SENDING on any open streams for this
+  // subscription
   trackIt->second->cancel();
   subTracks_.erase(trackIt);
   reqIdToTrackAlias_.erase(trackAliasIt);
@@ -3919,15 +4133,7 @@ void MoQSession::unsubscribe(const Unsubscribe& unsubscribe) {
   checkForCloseOnDrain();
 }
 
-folly::Expected<folly::Unit, MoQPublishError>
-MoQSession::PublisherImpl::subscribeDone(SubscribeDone subscribeDone) {
-  CHECK(session_) << "session_ is NULL in subscribeDone";
-  XLOG(DBG1) << __func__ << " sess=" << session_;
-  session_->subscribeDone(subscribeDone);
-  return folly::unit;
-}
-
-void MoQSession::subscribeDone(const SubscribeDone& subDone) {
+void MoQSession::sendSubscribeDone(const SubscribeDone& subDone) {
   XLOG(DBG1) << __func__ << " sess=" << this;
   MOQ_PUBLISHER_STATS(
       publisherStatsCallback_, onSubscribeDone, subDone.statusCode);
@@ -4214,7 +4420,7 @@ folly::coro::Task<MoQSession::JoinResult> MoQSession::join(
     uint64_t joiningStart,
     uint8_t fetchPri,
     GroupOrder fetchOrder,
-    std::vector<TrackRequestParameter> fetchParams,
+    TrackRequestParameters fetchParams,
     std::shared_ptr<FetchConsumer> fetchCallback,
     FetchType fetchType) {
   Fetch fetchReq(
@@ -4356,6 +4562,10 @@ void MoQSession::onDatagram(std::unique_ptr<folly::IOBuf> datagram) {
   if (state) {
     auto callback = state->getSubscribeCallback();
     if (callback) {
+      // Populate priority from publisher priority if not set in object header
+      if (!objHeader.objectHeader.priority.hasValue()) {
+        objHeader.objectHeader.priority = state->getPublisherPriority();
+      }
       callback->datagram(objHeader.objectHeader, readBuf.move());
     }
   }
@@ -4411,8 +4621,7 @@ void MoQSession::initializeNegotiatedVersion(uint64_t negotiatedVersion) {
 }
 
 /*static*/
-uint64_t MoQSession::getMaxRequestIDIfPresent(
-    const std::vector<SetupParameter>& params) {
+uint64_t MoQSession::getMaxRequestIDIfPresent(const SetupParameters& params) {
   for (const auto& param : params) {
     if (param.key == folly::to_underlying(SetupKey::MAX_REQUEST_ID)) {
       return param.asUint64;
@@ -4423,7 +4632,7 @@ uint64_t MoQSession::getMaxRequestIDIfPresent(
 
 /*static*/
 folly::Optional<std::string> MoQSession::getMoQTImplementationIfPresent(
-    const std::vector<SetupParameter>& params) {
+    const SetupParameters& params) {
   for (const auto& param : params) {
     if (param.key == folly::to_underlying(SetupKey::MOQT_IMPLEMENTATION)) {
       return param.asString;
@@ -4450,7 +4659,7 @@ bool MoQSession::shouldIncludeMoqtImplementationParam(
 }
 
 uint64_t MoQSession::getMaxAuthTokenCacheSizeIfPresent(
-    const std::vector<SetupParameter>& params) {
+    const SetupParameters& params) {
   constexpr uint64_t kMaxAuthTokenCacheSize = 4096;
   for (const auto& param : params) {
     if (param.key ==
@@ -4463,10 +4672,11 @@ uint64_t MoQSession::getMaxAuthTokenCacheSizeIfPresent(
 
 /*static*/
 folly::Optional<uint64_t> MoQSession::getDeliveryTimeoutIfPresent(
-    const std::vector<TrackRequestParameter>& params,
+    const TrackRequestParameters& params,
     uint64_t version) {
   for (const auto& param : params) {
-    if (param.key == getDeliveryTimeoutParamKey(version)) {
+    if (param.key ==
+        folly::to_underlying(TrackRequestParamKey::DELIVERY_TIMEOUT)) {
       return param.asUint64;
     }
   }
@@ -4474,47 +4684,64 @@ folly::Optional<uint64_t> MoQSession::getDeliveryTimeoutIfPresent(
 }
 
 void MoQSession::aliasifyAuthTokens(
-    std::vector<Parameter>& params,
+    Parameters& params,
     const folly::Optional<uint64_t>& forceVersion) {
   auto version = forceVersion ? forceVersion : getNegotiatedVersion();
   if (!version) {
     return;
   }
 
-  auto authParamKey = getAuthorizationParamKey(*version);
-  for (auto it = params.begin(); it != params.end(); ++it) {
-    if (it->key == authParamKey) {
-      const auto& token = it->asAuthToken;
-      if (token.alias && token.tokenValue.size() < tokenCache_.maxTokenSize()) {
-        auto lookupRes =
-            tokenCache_.getAliasForToken(token.tokenType, token.tokenValue);
-        if (lookupRes) {
-          it->asString = moqFrameWriter_.encodeUseAlias(*lookupRes);
-          continue;
-        } // else, evict tokens and register this one
-        auto tokenCopy = token;
-        it = params.erase(it);
-        while (!tokenCache_.canRegister(token.tokenType, token.tokenValue)) {
-          auto aliasToEvict = tokenCache_.evictLRU();
-          Parameter p;
-          p.key = authParamKey;
-          p.asString = moqFrameWriter_.encodeDeleteTokenAlias(aliasToEvict);
-          it = params.insert(it, std::move(p));
-          ++it;
-        }
-        auto alias =
-            tokenCache_.registerToken(tokenCopy.tokenType, tokenCopy.tokenValue)
-                .value();
+  auto authParamKey =
+      folly::to_underlying(TrackRequestParamKey::AUTHORIZATION_TOKEN);
+
+  size_t currentPosition = 0;
+
+  while (currentPosition < params.size()) {
+    const auto& param = params.at(currentPosition);
+    if (param.key != authParamKey) {
+      ++currentPosition;
+      continue;
+    }
+
+    const auto& token = param.asAuthToken;
+    if (token.alias && token.tokenValue.size() < tokenCache_.maxTokenSize()) {
+      auto lookupRes =
+          tokenCache_.getAliasForToken(token.tokenType, token.tokenValue);
+      if (lookupRes) {
+        params.modifyString(
+            currentPosition, moqFrameWriter_.encodeUseAlias(*lookupRes));
+        ++currentPosition;
+        continue;
+      }
+
+      auto tokenCopy = token;
+      params.eraseParam(currentPosition);
+      while (!tokenCache_.canRegister(token.tokenType, token.tokenValue)) {
+        auto aliasToEvict = tokenCache_.evictLRU();
         Parameter p;
         p.key = authParamKey;
-        p.asString = moqFrameWriter_.encodeRegisterToken(
-            alias, tokenCopy.tokenType, tokenCopy.tokenValue);
-        it = params.insert(it, std::move(p));
-      } else {
-        it->asString = moqFrameWriter_.encodeTokenValue(
-            token.tokenType, token.tokenValue, version);
+        p.asString = moqFrameWriter_.encodeDeleteTokenAlias(aliasToEvict);
+        params.insertParam(currentPosition, std::move(p));
+        ++currentPosition;
       }
+
+      auto alias =
+          tokenCache_.registerToken(tokenCopy.tokenType, tokenCopy.tokenValue)
+              .value();
+      Parameter p;
+      p.key = authParamKey;
+      p.asString = moqFrameWriter_.encodeRegisterToken(
+          alias, tokenCopy.tokenType, tokenCopy.tokenValue);
+      params.insertParam(currentPosition, std::move(p));
+      ++currentPosition;
+      continue;
     }
+
+    params.modifyString(
+        currentPosition,
+        moqFrameWriter_.encodeTokenValue(
+            token.tokenType, token.tokenValue, version));
+    ++currentPosition;
   }
 }
 
@@ -4522,15 +4749,16 @@ void MoQSession::aliasifyAuthTokens(
 void MoQSession::onAnnounce(Announce announce) {
   XLOG(DBG1) << __func__ << " ns=" << announce.trackNamespace
              << " - sending NOT_SUPPORTED error, sess=" << this;
-  announceError(AnnounceError{
-      announce.requestID,
-      AnnounceErrorCode::NOT_SUPPORTED,
-      "Announce not supported by simple client"});
+  announceError(
+      AnnounceError{
+          announce.requestID,
+          AnnounceErrorCode::NOT_SUPPORTED,
+          "Announce not supported by simple client"});
 }
 
-void MoQSession::onAnnounceOk(AnnounceOk announceOk) {
-  XLOG(DBG1) << __func__ << " ns=" << announceOk.trackNamespace
-             << " - unexpected in simple client, sess=" << this;
+void MoQSession::onRequestOk(RequestOk /*requestOk*/, FrameType /*frameType*/) {
+  XLOG(DBG1) << __func__
+             << " REQUEST_OK unexpected in simple client, sess=" << this;
   close(SessionCloseErrorCode::PROTOCOL_VIOLATION);
 }
 
@@ -4555,18 +4783,11 @@ void MoQSession::onSubscribeAnnounces(SubscribeAnnounces subscribeAnnounces) {
   XLOG(DBG1) << __func__
              << " prefix=" << subscribeAnnounces.trackNamespacePrefix
              << " - sending NOT_SUPPORTED error, sess=" << this;
-  subscribeAnnouncesError(SubscribeAnnouncesError{
-      subscribeAnnounces.requestID,
-      SubscribeAnnouncesErrorCode::NOT_SUPPORTED,
-      "SubscribeAnnounces not supported by simple client"});
-}
-
-void MoQSession::onSubscribeAnnouncesOk(
-    SubscribeAnnouncesOk subscribeAnnouncesOk) {
-  XLOG(DBG1) << __func__
-             << " prefix=" << subscribeAnnouncesOk.trackNamespacePrefix
-             << " - unexpected in simple client, sess=" << this;
-  close(SessionCloseErrorCode::PROTOCOL_VIOLATION);
+  subscribeAnnouncesError(
+      SubscribeAnnouncesError{
+          subscribeAnnounces.requestID,
+          SubscribeAnnouncesErrorCode::NOT_SUPPORTED,
+          "SubscribeAnnounces not supported by simple client"});
 }
 
 void MoQSession::onUnsubscribeAnnounces(
@@ -4674,6 +4895,13 @@ void MoQSession::setPublishHandler(std::shared_ptr<Publisher> publishHandler) {
 void MoQSession::setSubscribeHandler(
     std::shared_ptr<Subscriber> subscribeHandler) {
   subscribeHandler_ = std::move(subscribeHandler);
+}
+
+void MoQSession::validateAndSetVersionFromAlpn(const std::string& alpn) {
+  auto version = getVersionFromAlpn(folly::StringPiece(alpn));
+  if (version) {
+    initializeNegotiatedVersion(*version);
+  }
 }
 
 } // namespace moxygen

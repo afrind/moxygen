@@ -30,6 +30,10 @@ DEFINE_string(video_track_name, "video0", "Video track Name");
 DEFINE_string(audio_track_name, "audio0", "Track Name");
 DEFINE_int32(connect_timeout, 1000, "Connect timeout (ms)");
 DEFINE_int32(transaction_timeout, 120, "Transaction timeout (s)");
+DEFINE_uint64(
+    delivery_timeout,
+    0,
+    "Delivery timeout in milliseconds (0 = disabled)");
 DEFINE_int32(
     dejitter_buffer_size_ms,
     300,
@@ -37,6 +41,10 @@ DEFINE_int32(
 DEFINE_bool(quic_transport, false, "Use raw QUIC transport");
 DEFINE_bool(fetch, false, "Use fetch rather than subscribe");
 DEFINE_string(auth, "secret", "MOQ subscription auth string");
+DEFINE_bool(
+    use_legacy_setup,
+    false,
+    "If true, use only moq-00 ALPN (legacy). If false, use both moqt-15 and moq-00");
 
 namespace {
 using namespace moxygen;
@@ -191,8 +199,8 @@ class TrackReceiverHandler : public ObjectReceiverCallback {
       XLOG(DBG1) << trackMediaType_.toStr()
                  << " Received payload. Size=" << payloadSize;
 
-      auto payloadDecodedData =
-          MoQMi::decodeMoQMi(std::make_unique<MoQMi::MoqMiObject>(
+      auto payloadDecodedData = MoQMi::decodeMoQMi(
+          std::make_unique<MoQMi::MoqMiObject>(
               objHeader.extensions.getMutableExtensions(), std::move(payload)));
       logData(payloadDecodedData);
       if (payloadDecodedData.index() ==
@@ -378,12 +386,19 @@ class MoQFlvReceiverClient
     auto g =
         folly::makeGuard([func = __func__] { XLOG(INFO) << "exit " << func; });
     try {
+      std::vector<std::string> alpns;
+      if (FLAGS_use_legacy_setup) {
+        alpns = {std::string(kAlpnMoqtLegacy)};
+      } else {
+        alpns = {std::string(kAlpnMoqtDraft15), std::string(kAlpnMoqtLegacy)};
+      }
       co_await moqClient_->setupMoQSession(
           std::chrono::milliseconds(FLAGS_connect_timeout),
           std::chrono::seconds(FLAGS_transaction_timeout),
           /*publishHandler=*/nullptr,
           /*subscribeHandler=*/shared_from_this(),
-          quic::TransportSettings());
+          quic::TransportSettings(),
+          alpns);
       // Create output file
       flvw_ = std::make_shared<FlvWriterShared>(flvOutPath_);
       trackReceiverHandlerAudio_->setFlvWriterShared(flvw_);
@@ -391,6 +406,16 @@ class MoQFlvReceiverClient
 
       uint64_t negotiatedVersion =
           *(moqClient_->moqSession_->getNegotiatedVersion());
+
+      TrackRequestParameters params{
+          getAuthParam(negotiatedVersion, FLAGS_auth)};
+      if (FLAGS_delivery_timeout > 0) {
+        params.insertParam(
+            {folly::to_underlying(TrackRequestParamKey::DELIVERY_TIMEOUT),
+             "",
+             FLAGS_delivery_timeout,
+             {}});
+      }
 
       auto subAudio = SubscribeRequest::make(
           moxygen::FullTrackName(
@@ -403,7 +428,7 @@ class MoQFlvReceiverClient
           LocationType::LargestObject,
           folly::none,
           0,
-          {getAuthParam(negotiatedVersion, FLAGS_auth)});
+          params);
       auto subVideo = SubscribeRequest::make(
           moxygen::FullTrackName(
               {TrackNamespace(
@@ -415,7 +440,7 @@ class MoQFlvReceiverClient
           LocationType::LargestObject,
           folly::none,
           0,
-          {getAuthParam(negotiatedVersion, FLAGS_auth)});
+          params);
 
       // Subscribe to audio
       subRxHandlerAudio_ = std::make_shared<ObjectReceiver>(
@@ -478,8 +503,7 @@ class MoQFlvReceiverClient
     // receiver client doesn't expect server or relay to announce anything, but
     // announce OK anyways
     return folly::coro::makeTask<AnnounceResult>(
-        std::make_shared<AnnounceHandle>(
-            AnnounceOk{announce.requestID, announce.trackNamespace}));
+        std::make_shared<AnnounceHandle>(AnnounceOk{announce.requestID, {}}));
   }
 
   void goaway(Goaway goaway) override {

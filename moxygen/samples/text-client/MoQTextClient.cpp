@@ -13,6 +13,7 @@
 #include <moxygen/MoQWebTransportClient.h>
 #include <moxygen/ObjectReceiver.h>
 #include <moxygen/relay/MoQRelayClient.h>
+#include <moxygen/util/InsecureVerifierDangerousDoNotUseInProduction.h>
 
 DEFINE_string(connect_url, "", "URL for webtransport server");
 DEFINE_string(track_namespace, "", "Track Namespace");
@@ -41,6 +42,18 @@ DEFINE_bool(
     false,
     "If client will unsubscribe from PUBLISH track after a specified time");
 DEFINE_uint64(unsubscribe_time, 30, "Time to unsubscribe in seconds");
+DEFINE_bool(
+    use_legacy_setup,
+    false,
+    "If true, use only moq-00 ALPN (legacy). If false, use both moqt-15 and moq-00");
+DEFINE_uint64(
+    delivery_timeout,
+    0,
+    "Delivery timeout in milliseconds (0 = disabled)");
+DEFINE_bool(
+    insecure,
+    false,
+    "Use insecure verifier (skip certificate validation)");
 
 namespace {
 using namespace moxygen;
@@ -143,17 +156,20 @@ class MoQTextClient : public Subscriber,
   MoQTextClient(
       std::shared_ptr<MoQFollyExecutorImpl> evb,
       proxygen::URL url,
-      FullTrackName ftn)
+      FullTrackName ftn,
+      std::shared_ptr<fizz::CertificateVerifier> verifier = nullptr)
       : moqClient_(
             FLAGS_quic_transport
                 ? std::make_unique<MoQClient>(
                       evb,
                       std::move(url),
-                      MoQRelaySession::createRelaySessionFactory())
+                      MoQRelaySession::createRelaySessionFactory(),
+                      verifier)
                 : std::make_unique<MoQWebTransportClient>(
                       evb,
                       std::move(url),
-                      MoQRelaySession::createRelaySessionFactory())),
+                      MoQRelaySession::createRelaySessionFactory(),
+                      verifier)),
         fullTrackName_(std::move(ftn)) {}
 
   folly::coro::Task<MoQSession::SubscribeAnnouncesResult> subscribeAnnounces(
@@ -198,12 +214,19 @@ class MoQTextClient : public Subscriber,
     auto g =
         folly::makeGuard([func = __func__] { XLOG(INFO) << "exit " << func; });
     try {
+      std::vector<std::string> alpns;
+      if (FLAGS_use_legacy_setup) {
+        alpns = {std::string(kAlpnMoqtLegacy)};
+      } else {
+        alpns = {std::string(kAlpnMoqtDraft15), std::string(kAlpnMoqtLegacy)};
+      }
       co_await moqClient_.setup(
           /*publisher=*/nullptr,
           /*subscriber=*/shared_from_this(),
           std::chrono::milliseconds(FLAGS_connect_timeout),
           std::chrono::seconds(FLAGS_transaction_timeout),
-          quic::TransportSettings());
+          quic::TransportSettings(),
+          alpns);
 
       if (FLAGS_publish) {
         SubscribeAnnounces subAnn{
@@ -329,8 +352,7 @@ class MoQTextClient : public Subscriber,
     // text client doesn't expect server or relay to announce anything,
     // but announce OK anyways
     return folly::coro::makeTask<AnnounceResult>(
-        std::make_shared<AnnounceHandle>(AnnounceOk{
-            announce.requestID, std::move(announce.trackNamespace)}));
+        std::make_shared<AnnounceHandle>(AnnounceOk{announce.requestID, {}}));
   }
 
   void goaway(Goaway goaway) override {
@@ -385,8 +407,16 @@ int main(int argc, char* argv[]) {
       TrackNamespace(FLAGS_track_namespace, FLAGS_track_namespace_delimiter);
   std::shared_ptr<MoQFollyExecutorImpl> moqEvb =
       std::make_shared<MoQFollyExecutorImpl>(&eventBase);
+  std::shared_ptr<fizz::CertificateVerifier> verifier = nullptr;
+  if (FLAGS_insecure) {
+    verifier = std::make_shared<
+        moxygen::test::InsecureVerifierDangerousDoNotUseInProduction>();
+  }
   auto textClient = std::make_shared<MoQTextClient>(
-      moqEvb, std::move(url), moxygen::FullTrackName({ns, FLAGS_track_name}));
+      moqEvb,
+      std::move(url),
+      moxygen::FullTrackName({ns, FLAGS_track_name}),
+      verifier);
 
   class SigHandler : public folly::AsyncSignalHandler {
    public:
@@ -415,17 +445,26 @@ int main(int argc, char* argv[]) {
   });
 
   auto subParams = flags2params();
+  TrackRequestParameters params;
+  if (FLAGS_delivery_timeout > 0) {
+    params.insertParam(
+        {folly::to_underlying(TrackRequestParamKey::DELIVERY_TIMEOUT),
+         "",
+         FLAGS_delivery_timeout,
+         {}});
+  }
   co_withExecutor(
       &eventBase,
-      textClient->run(SubscribeRequest::make(
-          moxygen::FullTrackName({std::move(ns), FLAGS_track_name}),
-          0,
-          GroupOrder::OldestFirst,
-          FLAGS_forward,
-          subParams.locType,
-          subParams.start,
-          subParams.endGroup,
-          {})))
+      textClient->run(
+          SubscribeRequest::make(
+              moxygen::FullTrackName({std::move(ns), FLAGS_track_name}),
+              0,
+              GroupOrder::OldestFirst,
+              FLAGS_forward,
+              subParams.locType,
+              subParams.start,
+              subParams.endGroup,
+              std::move(params))))
       .start()
       .via(&eventBase)
       .thenTry([&handler](auto) { handler.unreg(); });

@@ -10,6 +10,37 @@
 
 #include <folly/portability/GTest.h>
 
+namespace {
+moxygen::FrameType getErrorFrameType(
+    uint64_t version,
+    moxygen::FrameType frameType) {
+  return (moxygen::getDraftMajorVersion(version) < 15)
+      ? frameType
+      : moxygen::FrameType::REQUEST_ERROR;
+}
+
+void expectOnRequestError(
+    testing::NiceMock<moxygen::MockMoQCodecCallback>& callback,
+    uint64_t version,
+    moxygen::FrameType frameType) {
+  EXPECT_CALL(
+      callback,
+      onRequestError(testing::_, getErrorFrameType(version, frameType)))
+      .RetiresOnSaturation();
+}
+void expectOnRequestOk(
+    testing::NiceMock<moxygen::MockMoQCodecCallback>& callback,
+    uint64_t version,
+    moxygen::FrameType frameType) {
+  auto expectedFrameType = (moxygen::getDraftMajorVersion(version) < 15)
+      ? frameType
+      : moxygen::FrameType::REQUEST_OK;
+  EXPECT_CALL(callback, onRequestOk(testing::_, expectedFrameType))
+      .RetiresOnSaturation();
+}
+
+} // namespace
+
 namespace moxygen::test {
 using testing::_;
 
@@ -43,32 +74,30 @@ class MoQCodecTest : public ::testing::TestWithParam<uint64_t> {
     EXPECT_CALL(callback, onSubscribe(testing::_));
     EXPECT_CALL(callback, onSubscribeUpdate(testing::_));
     EXPECT_CALL(callback, onSubscribeOk(testing::_));
-    EXPECT_CALL(
-        callback, onRequestError(testing::_, FrameType::SUBSCRIBE_ERROR));
+    expectOnRequestError(callback, GetParam(), FrameType::SUBSCRIBE_ERROR);
     EXPECT_CALL(callback, onUnsubscribe(testing::_));
     EXPECT_CALL(callback, onSubscribeDone(testing::_));
     EXPECT_CALL(callback, onPublish(testing::_));
     EXPECT_CALL(callback, onPublishOk(testing::_));
-    EXPECT_CALL(callback, onRequestError(testing::_, FrameType::PUBLISH_ERROR));
+    expectOnRequestError(callback, GetParam(), FrameType::PUBLISH_ERROR);
     EXPECT_CALL(callback, onAnnounce(testing::_));
-    EXPECT_CALL(callback, onAnnounceOk(testing::_));
-    EXPECT_CALL(
-        callback, onRequestError(testing::_, FrameType::ANNOUNCE_ERROR));
+    expectOnRequestOk(callback, GetParam(), FrameType::ANNOUNCE_OK);
+    expectOnRequestError(callback, GetParam(), FrameType::ANNOUNCE_ERROR);
     EXPECT_CALL(callback, onUnannounce(testing::_));
     EXPECT_CALL(callback, onTrackStatus(testing::_));
     EXPECT_CALL(callback, onTrackStatusOk(testing::_));
     EXPECT_CALL(callback, onGoaway(testing::_));
     EXPECT_CALL(callback, onMaxRequestID(testing::_));
     EXPECT_CALL(callback, onSubscribeAnnounces(testing::_));
-    EXPECT_CALL(callback, onSubscribeAnnouncesOk(testing::_));
-    EXPECT_CALL(
-        callback,
-        onRequestError(testing::_, FrameType::SUBSCRIBE_ANNOUNCES_ERROR));
+    expectOnRequestOk(callback, GetParam(), FrameType::SUBSCRIBE_ANNOUNCES_OK);
+    expectOnRequestError(
+        callback, GetParam(), FrameType::SUBSCRIBE_ANNOUNCES_ERROR);
     EXPECT_CALL(callback, onUnsubscribeAnnounces(testing::_));
     EXPECT_CALL(callback, onFetch(testing::_));
     EXPECT_CALL(callback, onFetchCancel(testing::_));
     EXPECT_CALL(callback, onFetchOk(testing::_));
-    EXPECT_CALL(callback, onRequestError(testing::_, FrameType::FETCH_ERROR));
+    expectOnRequestError(callback, GetParam(), FrameType::FETCH_ERROR);
+
     EXPECT_CALL(callback, onFrame(testing::_)).Times(28);
 
     codec.onIngress(std::move(allMsgs), true);
@@ -97,32 +126,31 @@ class MoQCodecTest : public ::testing::TestWithParam<uint64_t> {
     EXPECT_CALL(callback, onSubscribe(testing::_));
     EXPECT_CALL(callback, onSubscribeUpdate(testing::_));
     EXPECT_CALL(callback, onSubscribeOk(testing::_));
-    EXPECT_CALL(
-        callback, onRequestError(testing::_, FrameType::SUBSCRIBE_ERROR));
+    expectOnRequestError(callback, GetParam(), FrameType::SUBSCRIBE_ERROR);
     EXPECT_CALL(callback, onUnsubscribe(testing::_));
     EXPECT_CALL(callback, onSubscribeDone(testing::_));
     EXPECT_CALL(callback, onPublish(testing::_));
     EXPECT_CALL(callback, onPublishOk(testing::_));
-    EXPECT_CALL(callback, onRequestError(testing::_, FrameType::PUBLISH_ERROR));
+    expectOnRequestError(callback, GetParam(), FrameType::PUBLISH_ERROR);
     EXPECT_CALL(callback, onAnnounce(testing::_));
-    EXPECT_CALL(callback, onAnnounceOk(testing::_));
-    EXPECT_CALL(
-        callback, onRequestError(testing::_, FrameType::ANNOUNCE_ERROR));
+    expectOnRequestOk(callback, GetParam(), FrameType::ANNOUNCE_OK);
+
+    expectOnRequestError(callback, GetParam(), FrameType::ANNOUNCE_ERROR);
     EXPECT_CALL(callback, onUnannounce(testing::_));
     EXPECT_CALL(callback, onTrackStatus(testing::_));
     EXPECT_CALL(callback, onTrackStatusOk(testing::_));
     EXPECT_CALL(callback, onGoaway(testing::_));
     EXPECT_CALL(callback, onMaxRequestID(testing::_));
     EXPECT_CALL(callback, onSubscribeAnnounces(testing::_));
-    EXPECT_CALL(callback, onSubscribeAnnouncesOk(testing::_));
-    EXPECT_CALL(
-        callback,
-        onRequestError(testing::_, FrameType::SUBSCRIBE_ANNOUNCES_ERROR));
+    expectOnRequestOk(callback, GetParam(), FrameType::SUBSCRIBE_ANNOUNCES_OK);
+
+    expectOnRequestError(
+        callback, GetParam(), FrameType::SUBSCRIBE_ANNOUNCES_ERROR);
     EXPECT_CALL(callback, onUnsubscribeAnnounces(testing::_));
     EXPECT_CALL(callback, onFetch(testing::_));
     EXPECT_CALL(callback, onFetchCancel(testing::_));
     EXPECT_CALL(callback, onFetchOk(testing::_));
-    EXPECT_CALL(callback, onRequestError(testing::_, FrameType::FETCH_ERROR));
+    expectOnRequestError(callback, GetParam(), FrameType::FETCH_ERROR);
     EXPECT_CALL(callback, onFrame(testing::_)).Times(28);
     while (!readBuf.empty()) {
       codec.onIngress(readBuf.split(1), false);
@@ -232,7 +260,9 @@ TEST_P(MoQCodecTest, ObjectStreamPayloadFin) {
       ObjectHeader(2, 3, 4, 5, 11),
       folly::IOBuf::copyBuffer("hello world"));
 
-  EXPECT_CALL(objectStreamCodecCallback_, onSubgroup(TrackAlias(1), 2, 3, 5));
+  EXPECT_CALL(
+      objectStreamCodecCallback_,
+      onSubgroup(TrackAlias(1), 2, 3, folly::Optional<uint8_t>(5)));
   EXPECT_CALL(
       objectStreamCodecCallback_,
       onObjectBegin(2, 3, 4, testing::_, testing::_, testing::_, true, true));
@@ -248,7 +278,9 @@ TEST_P(MoQCodecTest, ObjectStreamPayload) {
       ObjectHeader(2, 3, 4, 5, 11),
       folly::IOBuf::copyBuffer("hello world"));
 
-  EXPECT_CALL(objectStreamCodecCallback_, onSubgroup(TrackAlias(1), 2, 3, 5));
+  EXPECT_CALL(
+      objectStreamCodecCallback_,
+      onSubgroup(TrackAlias(1), 2, 3, folly::Optional<uint8_t>(5)));
   EXPECT_CALL(
       objectStreamCodecCallback_,
       onObjectBegin(2, 3, 4, testing::_, testing::_, _, true, false));
@@ -266,10 +298,18 @@ TEST_P(MoQCodecTest, EmptyObjectPayload) {
       ObjectHeader(2, 3, 4, 5, ObjectStatus::OBJECT_NOT_EXIST),
       nullptr);
 
-  EXPECT_CALL(objectStreamCodecCallback_, onSubgroup(TrackAlias(1), 2, 3, 5));
   EXPECT_CALL(
       objectStreamCodecCallback_,
-      onObjectStatus(2, 3, 4, 5, ObjectStatus::OBJECT_NOT_EXIST, _));
+      onSubgroup(TrackAlias(1), 2, 3, folly::Optional<uint8_t>(5)));
+  EXPECT_CALL(
+      objectStreamCodecCallback_,
+      onObjectStatus(
+          2,
+          3,
+          4,
+          folly::Optional<uint8_t>(5),
+          ObjectStatus::OBJECT_NOT_EXIST,
+          _));
   EXPECT_CALL(objectStreamCodecCallback_, onEndOfStream());
   // extra coverage of underflow in header
   objectStreamCodec_.onIngress(writeBuf.split(3), false);
@@ -366,7 +406,8 @@ TEST_P(MoQCodecTest, Fetch) {
       onObjectBegin(2, 3, 4, testing::_, 5, _, true, false));
   EXPECT_CALL(
       objectStreamCodecCallback_,
-      onObjectStatus(3, 3, 0, 5, ObjectStatus::END_OF_TRACK, _));
+      onObjectStatus(
+          3, 3, 0, folly::Optional<uint8_t>(5), ObjectStatus::END_OF_TRACK, _));
   // object after terminal status
   EXPECT_CALL(
       objectStreamCodecCallback_,
@@ -464,5 +505,5 @@ TEST_P(MoQCodecTest, ServerGetsServerSetup) {
 INSTANTIATE_TEST_SUITE_P(
     MoQCodecTest,
     MoQCodecTest,
-    ::testing::Values(kVersionDraft11, kVersionDraft12));
+    ::testing::ValuesIn(kSupportedVersions));
 } // namespace moxygen::test

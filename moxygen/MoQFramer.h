@@ -18,6 +18,7 @@
 #include <quic/QuicException.h>
 #include <quic/codec/QuicInteger.h>
 #include <quic/folly_utils/Utils.h>
+#include <algorithm>
 #include <vector>
 
 namespace moxygen {
@@ -138,8 +139,10 @@ enum class FrameType : uint64_t {
   SUBSCRIBE = 3,
   SUBSCRIBE_OK = 4,
   SUBSCRIBE_ERROR = 5,
+  REQUEST_ERROR = 5,
   ANNOUNCE = 0x6,
   ANNOUNCE_OK = 0x7,
+  REQUEST_OK = 0x7,
   ANNOUNCE_ERROR = 0x8,
   UNANNOUNCE = 9,
   UNSUBSCRIBE = 0xA,
@@ -169,11 +172,6 @@ enum class FrameType : uint64_t {
 };
 
 enum class DatagramType : uint64_t {
-  OBJECT_DATAGRAM_NO_EXT_V11 = 0x0,
-  OBJECT_DATAGRAM_EXT_V11 = 0x1,
-  OBJECT_DATAGRAM_STATUS_V11 = 0x2,
-  OBJECT_DATAGRAM_STATUS_EXT_V11 = 0x3,
-
   OBJECT_DATAGRAM_NO_EXT = 0x0,
   OBJECT_DATAGRAM_EXT = 0x1,
   OBJECT_DATAGRAM_NO_EXT_EOG = 0x2,
@@ -184,17 +182,26 @@ enum class DatagramType : uint64_t {
   OBJECT_DATAGRAM_EXT_EOG_ID_ZERO = 0x7,
   OBJECT_DATAGRAM_STATUS = 0x20,
   OBJECT_DATAGRAM_STATUS_EXT = 0x21,
+  OBJECT_DATAGRAM_STATUS_ID_ZERO = 0x24,
+  OBJECT_DATAGRAM_STATUS_EXT_ID_ZERO = 0x25,
+
+  // Version 15+ datagram types without priority
+  OBJECT_DATAGRAM_NO_EXT_NO_PRI = 0x8,
+  OBJECT_DATAGRAM_EXT_NO_PRI = 0x9,
+  OBJECT_DATAGRAM_NO_EXT_EOG_NO_PRI = 0xA,
+  OBJECT_DATAGRAM_EXT_EOG_NO_PRI = 0xB,
+  OBJECT_DATAGRAM_NO_EXT_ID_ZERO_NO_PRI = 0xC,
+  OBJECT_DATAGRAM_EXT_ID_ZERO_NO_PRI = 0xD,
+  OBJECT_DATAGRAM_NO_EXT_EOG_ID_ZERO_NO_PRI = 0xE,
+  OBJECT_DATAGRAM_EXT_EOG_ID_ZERO_NO_PRI = 0xF,
+  OBJECT_DATAGRAM_STATUS_NO_PRI = 0x28,
+  OBJECT_DATAGRAM_STATUS_EXT_NO_PRI = 0x29,
+  OBJECT_DATAGRAM_STATUS_ID_ZERO_NO_PRI = 0x2C,
+  OBJECT_DATAGRAM_STATUS_EXT_ID_ZERO_NO_PRI = 0x2D,
 };
 
 enum class StreamType : uint64_t {
   FETCH_HEADER = 0x5,
-  SUBGROUP_HEADER_MASK_V11 = 0x8,
-  SUBGROUP_HEADER_SG_ZERO_V11 = 0x8,
-  SUBGROUP_HEADER_SG_ZERO_EXT_V11 = 0x9,
-  SUBGROUP_HEADER_SG_FIRST_V11 = 0xA,
-  SUBGROUP_HEADER_SG_FIRST_EXT_V11 = 0xB,
-  SUBGROUP_HEADER_SG_V11 = 0xC,
-  SUBGROUP_HEADER_SG_EXT_V11 = 0xD,
 
   SUBGROUP_HEADER_MASK = 0x10,
   SUBGROUP_HEADER_SG_ZERO = 0x10,
@@ -209,6 +216,20 @@ enum class StreamType : uint64_t {
   SUBGROUP_HEADER_SG_FIRST_EXT_EOG = 0x1B,
   SUBGROUP_HEADER_SG_EOG = 0x1C,
   SUBGROUP_HEADER_SG_EXT_EOG = 0x1D,
+
+  // Version 15+ subgroup types without priority
+  SUBGROUP_HEADER_SG_ZERO_NO_PRI = 0x30,
+  SUBGROUP_HEADER_SG_ZERO_EXT_NO_PRI = 0x31,
+  SUBGROUP_HEADER_SG_FIRST_NO_PRI = 0x32,
+  SUBGROUP_HEADER_SG_FIRST_EXT_NO_PRI = 0x33,
+  SUBGROUP_HEADER_SG_NO_PRI = 0x34,
+  SUBGROUP_HEADER_SG_EXT_NO_PRI = 0x35,
+  SUBGROUP_HEADER_SG_ZERO_EOG_NO_PRI = 0x38,
+  SUBGROUP_HEADER_SG_ZERO_EXT_EOG_NO_PRI = 0x39,
+  SUBGROUP_HEADER_SG_FIRST_EOG_NO_PRI = 0x3A,
+  SUBGROUP_HEADER_SG_FIRST_EXT_EOG_NO_PRI = 0x3B,
+  SUBGROUP_HEADER_SG_EOG_NO_PRI = 0x3C,
+  SUBGROUP_HEADER_SG_EXT_EOG_NO_PRI = 0x3D,
 };
 
 // Subgroup Bit Fields
@@ -216,12 +237,15 @@ constexpr uint8_t SG_HAS_EXTENSIONS = 0x1;
 constexpr uint8_t SG_SUBGROUP_VALUE = 0x2;
 constexpr uint8_t SG_HAS_SUBGROUP_ID = 0x4;
 constexpr uint8_t SG_HAS_END_OF_GROUP = 0x8;
+constexpr uint8_t SG_PRIORITY_NOT_PRESENT = 0x20;
 
 // Datagram Type Bit Fields
 constexpr uint8_t DG_HAS_EXTENSIONS = 0x1;
 constexpr uint8_t DG_HAS_STATUS_V11 = 0x2;
 constexpr uint8_t DG_HAS_END_OF_GROUP = 0x2;
 constexpr uint8_t DG_OBJECT_ID_ZERO = 0x4;
+constexpr uint8_t DG_PRIORITY_NOT_PRESENT = 0x8;
+constexpr uint8_t DG_IS_STATUS = 0x20;
 
 enum class SubgroupIDFormat : uint8_t { Present, Zero, FirstObject };
 
@@ -229,6 +253,7 @@ struct SubgroupOptions {
   bool hasExtensions{false};
   SubgroupIDFormat subgroupIDFormat{SubgroupIDFormat::Present};
   bool hasEndOfGroup{false};
+  bool priorityPresent{true};
 };
 
 std::ostream& operator<<(std::ostream& os, FrameType type);
@@ -262,15 +287,184 @@ struct AuthToken {
   static constexpr folly::Optional<uint64_t> DontRegister = folly::none;
 };
 
+struct AbsoluteLocation {
+  uint64_t group{0};
+  uint64_t object{0};
+
+  AbsoluteLocation() = default;
+  constexpr AbsoluteLocation(uint64_t g, uint64_t o) : group(g), object(o) {}
+
+  bool operator==(const AbsoluteLocation& other) const {
+    return group == other.group && object == other.object;
+  }
+
+  bool operator!=(const AbsoluteLocation& other) const {
+    return !(*this == other);
+  }
+
+  bool operator<(const AbsoluteLocation& other) const {
+    if (group < other.group) {
+      return true;
+    } else if (group == other.group) {
+      return object < other.object;
+    }
+    return false;
+  }
+
+  bool operator<=(const AbsoluteLocation& other) const {
+    return *this < other || *this == other;
+  }
+
+  bool operator>(const AbsoluteLocation& other) const {
+    return !(*this <= other);
+  }
+
+  bool operator>=(const AbsoluteLocation& other) const {
+    return !(*this < other);
+  }
+
+  friend std::ostream& operator<<(
+      std::ostream& os,
+      const AbsoluteLocation& loc) {
+    os << loc.describe();
+    return os;
+  }
+
+  std::string describe() const {
+    return folly::to<std::string>("{", group, ",", object, "}");
+  }
+};
+
+constexpr AbsoluteLocation kLocationMin;
+constexpr AbsoluteLocation kLocationMax{
+    quic::kEightByteLimit,
+    quic::kEightByteLimit};
+
+enum class LocationType : uint8_t {
+  NextGroupStart = 1,
+  LargestObject = 2,
+  AbsoluteStart = 3,
+  AbsoluteRange = 4,
+  LargestGroup = 250,
+};
+
+std::string toString(LocationType locType);
+
+struct SubscriptionFilter {
+  LocationType filterType;
+  folly::Optional<AbsoluteLocation> location;
+  folly::Optional<uint64_t> endGroup;
+
+  SubscriptionFilter() = default;
+  SubscriptionFilter(
+      LocationType ft,
+      folly::Optional<AbsoluteLocation> loc,
+      folly::Optional<uint64_t> eg)
+      : filterType(ft), location(loc), endGroup(std::move(eg)) {}
+};
+
 struct Parameter {
   uint64_t key;
   std::string asString;
   uint64_t asUint64;
   AuthToken asAuthToken;
+  SubscriptionFilter asSubscriptionFilter;
 };
 
 using SetupParameter = Parameter;
 using TrackRequestParameter = Parameter;
+
+enum class TrackRequestParamKey : uint64_t {
+  AUTHORIZATION_TOKEN = 3,
+  DELIVERY_TIMEOUT = 2,
+  MAX_CACHE_DURATION = 4,
+  PUBLISHER_PRIORITY = 0x0E,
+  SUBSCRIPTION_FILTER = 0x21,
+};
+
+class Parameters {
+ public:
+  using const_iterator = std::vector<Parameter>::const_iterator;
+
+  Parameters() = default;
+
+  /* implicit */ Parameters(std::initializer_list<Parameter> params)
+      : params_(params) {}
+
+  const Parameter& getParam(size_t position) const {
+    return params_.at(position);
+  }
+
+  const Parameter& at(size_t position) const {
+    return params_.at(position);
+  }
+
+  void insertParam(Parameter&& param) {
+    params_.emplace_back(std::move(param));
+  }
+
+  void insertParam(const Parameter& param) {
+    params_.emplace_back(param);
+  }
+
+  void insertParam(size_t position, Parameter&& param) {
+    CHECK_LE(position, params_.size());
+    params_.insert(params_.begin() + position, std::move(param));
+  }
+
+  void eraseParam(size_t position) {
+    CHECK_LT(position, params_.size());
+    params_.erase(params_.begin() + position);
+  }
+
+  void modifyString(size_t position, const std::string& newValue) {
+    params_.at(position).asString = newValue;
+  }
+
+  void eraseAllParamsOfType(TrackRequestParamKey key) {
+    const auto targetKey = static_cast<uint64_t>(key);
+    params_.erase(
+        std::remove_if(
+            params_.begin(),
+            params_.end(),
+            [targetKey](const Parameter& param) {
+              return param.key == targetKey;
+            }),
+        params_.end());
+  }
+
+  void modifyParam(
+      size_t position,
+      const std::string& newString,
+      uint64_t newInt64,
+      AuthToken newAuthToken) {
+    params_.at(position).asString = newString;
+    params_.at(position).asUint64 = newInt64;
+    params_.at(position).asAuthToken = std::move(newAuthToken);
+  }
+
+  const_iterator begin() const {
+    return params_.begin();
+  }
+
+  const_iterator end() const {
+    return params_.end();
+  }
+
+  size_t size() const {
+    return params_.size();
+  }
+
+  bool empty() const {
+    return params_.empty();
+  }
+
+ private:
+  std::vector<Parameter> params_;
+};
+
+using SetupParameters = Parameters;
+using TrackRequestParameters = Parameters;
 
 constexpr uint64_t kVersionDraft01 = 0xff000001;
 constexpr uint64_t kVersionDraft02 = 0xff000002;
@@ -298,20 +492,42 @@ constexpr uint64_t kVersionDraft08_exp9 = 0xff080009; // Draft 8 Extensions
 
 constexpr uint64_t kVersionDraft09 = 0xff000009;
 constexpr uint64_t kVersionDraft10 = 0xff00000A;
-constexpr uint64_t kVersionDraft11 = 0xff00000B;
 constexpr uint64_t kVersionDraft12 = 0xff00000C;
 constexpr uint64_t kVersionDraft13 = 0xff00000D;
 constexpr uint64_t kVersionDraft14 = 0xff00000E;
+constexpr uint64_t kVersionDraft15 = 0xff00000F;
 
-constexpr uint64_t kVersionDraftCurrent = kVersionDraft11;
+constexpr uint64_t kVersionDraftCurrent = kVersionDraft14;
+
+// ALPN constants for version negotiation
+constexpr std::string_view kAlpnMoqtLegacy = "moq-00";
+constexpr std::string_view kAlpnMoqtDraft15 = "moqt-15";
 
 // In the terminology I'm using for this function, each draft has a "major"
 // and a "minor" version. For example, kVersionDraft08_exp2 has the major
 // version 8 and minor version 2.
 uint64_t getDraftMajorVersion(uint64_t version);
-constexpr std::array<uint64_t, 2> kSupportedVersions{
-    kVersionDraft11,
-    kVersionDraft12};
+
+// ALPN utility functions
+bool isLegacyAlpn(folly::StringPiece alpn);
+std::vector<uint64_t> getSupportedLegacyVersions();
+folly::Optional<uint64_t> getVersionFromAlpn(folly::StringPiece alpn);
+folly::Optional<std::string> getAlpnFromVersion(uint64_t version);
+
+constexpr std::array<uint64_t, 3> kSupportedVersions{
+    kVersionDraft12,
+    kVersionDraft14,
+    kVersionDraft15};
+
+bool isSupportedVersion(uint64_t version);
+
+// Returns a comma-separated list of supported versions, useful for logging.
+std::string getSupportedVersionsString();
+
+// Helper function to extract an integer parameter by key from a parameter list
+folly::Optional<uint64_t> getFirstIntParam(
+    const TrackRequestParameters& params,
+    TrackRequestParamKey key);
 
 void writeVarint(
     folly::IOBufQueue& buf,
@@ -321,12 +537,12 @@ void writeVarint(
 
 struct ClientSetup {
   std::vector<uint64_t> supportedVersions;
-  std::vector<SetupParameter> params;
+  SetupParameters params;
 };
 
 struct ServerSetup {
   uint64_t selectedVersion;
-  std::vector<SetupParameter> params;
+  SetupParameters params;
 };
 
 enum class ObjectStatus : uint64_t {
@@ -520,7 +736,7 @@ struct ObjectHeader {
       uint64_t groupIn,
       uint64_t subgroupIn,
       uint64_t idIn,
-      uint8_t priorityIn = 128,
+      folly::Optional<uint8_t> priorityIn = kDefaultPriority,
       ObjectStatus statusIn = ObjectStatus::NORMAL,
       Extensions extensionsIn = noExtensions(),
       folly::Optional<uint64_t> lengthIn = folly::none)
@@ -535,7 +751,7 @@ struct ObjectHeader {
       uint64_t groupIn,
       uint64_t subgroupIn,
       uint64_t idIn,
-      uint8_t priorityIn,
+      folly::Optional<uint8_t> priorityIn,
       uint64_t lengthIn,
       Extensions extensionsIn = noExtensions())
       : group(groupIn),
@@ -548,7 +764,7 @@ struct ObjectHeader {
   uint64_t group;
   uint64_t subgroup{0}; // meaningless for Datagram
   uint64_t id;
-  uint8_t priority{kDefaultPriority};
+  folly::Optional<uint8_t> priority{kDefaultPriority};
   ObjectStatus status{ObjectStatus::NORMAL};
   Extensions extensions;
   folly::Optional<uint64_t> length{folly::none};
@@ -572,75 +788,6 @@ struct DatagramObjectHeader {
 };
 
 std::ostream& operator<<(std::ostream& os, const ObjectHeader& type);
-
-uint64_t getAuthorizationParamKey(uint64_t version);
-
-uint64_t getDeliveryTimeoutParamKey(uint64_t version);
-
-uint64_t getMaxCacheDurationParamKey(uint64_t version);
-
-enum class LocationType : uint8_t {
-  NextGroupStart = 1,
-  LargestObject = 2,
-  AbsoluteStart = 3,
-  AbsoluteRange = 4,
-  LargestGroup = 250,
-};
-
-std::string toString(LocationType locType);
-
-struct AbsoluteLocation {
-  uint64_t group{0};
-  uint64_t object{0};
-
-  AbsoluteLocation() = default;
-  constexpr AbsoluteLocation(uint64_t g, uint64_t o) : group(g), object(o) {}
-
-  bool operator==(const AbsoluteLocation& other) const {
-    return group == other.group && object == other.object;
-  }
-
-  bool operator!=(const AbsoluteLocation& other) const {
-    return !(*this == other);
-  }
-
-  bool operator<(const AbsoluteLocation& other) const {
-    if (group < other.group) {
-      return true;
-    } else if (group == other.group) {
-      return object < other.object;
-    }
-    return false;
-  }
-
-  bool operator<=(const AbsoluteLocation& other) const {
-    return *this < other || *this == other;
-  }
-
-  bool operator>(const AbsoluteLocation& other) const {
-    return !(*this <= other);
-  }
-
-  bool operator>=(const AbsoluteLocation& other) const {
-    return !(*this < other);
-  }
-
-  friend std::ostream& operator<<(
-      std::ostream& os,
-      const AbsoluteLocation& loc) {
-    os << loc.describe();
-    return os;
-  }
-
-  std::string describe() const {
-    return folly::to<std::string>("{", group, ",", object, "}");
-  }
-};
-
-constexpr AbsoluteLocation kLocationMin;
-constexpr AbsoluteLocation kLocationMax{
-    quic::kEightByteLimit,
-    quic::kEightByteLimit};
 
 struct TrackNamespace {
   std::vector<std::string> trackNamespace;
@@ -765,7 +912,7 @@ struct SubscribeRequest {
       LocationType locType = LocationType::LargestGroup,
       folly::Optional<AbsoluteLocation> start = folly::none,
       uint64_t endGroup = 0,
-      std::vector<TrackRequestParameter> params = {}) {
+      TrackRequestParameters params = {}) {
     return SubscribeRequest{
         RequestID(), // Default constructed RequestID
         folly::none, // Default constructed TrackAlias (folly::none)
@@ -784,11 +931,11 @@ struct SubscribeRequest {
   FullTrackName fullTrackName;
   uint8_t priority{kDefaultPriority};
   GroupOrder groupOrder;
-  bool forward{true}; // Only used in draft-11 and above
+  bool forward{true}; // Only used in draft-12 and above
   LocationType locType;
   folly::Optional<AbsoluteLocation> start;
   uint64_t endGroup;
-  std::vector<TrackRequestParameter> params;
+  TrackRequestParameters params;
 };
 
 struct SubscribeUpdate {
@@ -797,8 +944,8 @@ struct SubscribeUpdate {
   AbsoluteLocation start;
   uint64_t endGroup;
   uint8_t priority{kDefaultPriority};
-  bool forward{true}; // Only used in draft-11 and above
-  std::vector<TrackRequestParameter> params;
+  bool forward{true}; // Only used in draft-12 and above
+  TrackRequestParameters params;
 };
 
 struct SubscribeOk {
@@ -808,7 +955,7 @@ struct SubscribeOk {
   GroupOrder groupOrder;
   // context exists is inferred from presence of largest
   folly::Optional<AbsoluteLocation> largest;
-  std::vector<TrackRequestParameter> params;
+  TrackRequestParameters params;
 };
 
 // SubscribeError is now an alias for RequestError - see below
@@ -831,7 +978,7 @@ struct PublishRequest {
   GroupOrder groupOrder{GroupOrder::Default};
   folly::Optional<AbsoluteLocation> largest;
   bool forward{true};
-  std::vector<TrackRequestParameter> params;
+  TrackRequestParameters params;
 };
 
 struct PublishOk {
@@ -842,7 +989,7 @@ struct PublishOk {
   LocationType locType;
   folly::Optional<AbsoluteLocation> start;
   folly::Optional<uint64_t> endGroup;
-  std::vector<TrackRequestParameter> params;
+  TrackRequestParameters params;
 };
 
 // PublishError is now an alias for RequestError - see below
@@ -850,12 +997,7 @@ struct PublishOk {
 struct Announce {
   RequestID requestID;
   TrackNamespace trackNamespace;
-  std::vector<TrackRequestParameter> params;
-};
-
-struct AnnounceOk {
-  RequestID requestID;
-  TrackNamespace trackNamespace;
+  TrackRequestParameters params;
 };
 
 // AnnounceError is now an alias for RequestError - see below
@@ -881,7 +1023,7 @@ struct TrackStatusOk {
   GroupOrder groupOrder{};
   // context exists is inferred from presence of largest
   folly::Optional<AbsoluteLocation> largest;
-  std::vector<TrackRequestParameter> params;
+  TrackRequestParameters params;
   // < v14 parameters maintained for compatibility
   FullTrackName fullTrackName;
   TrackStatusCode statusCode{};
@@ -940,7 +1082,7 @@ struct Fetch {
       AbsoluteLocation e,
       uint8_t p = kDefaultPriority,
       GroupOrder g = GroupOrder::Default,
-      std::vector<TrackRequestParameter> pa = {})
+      TrackRequestParameters pa = {})
       : requestID(su),
         fullTrackName(std::move(ftn)),
         priority(p),
@@ -956,7 +1098,7 @@ struct Fetch {
       FetchType fetchType,
       uint8_t p = kDefaultPriority,
       GroupOrder g = GroupOrder::Default,
-      std::vector<TrackRequestParameter> pa = {})
+      TrackRequestParameters pa = {})
       : requestID(su),
         priority(p),
         groupOrder(g),
@@ -970,7 +1112,7 @@ struct Fetch {
   FullTrackName fullTrackName;
   uint8_t priority{kDefaultPriority};
   GroupOrder groupOrder;
-  std::vector<TrackRequestParameter> params;
+  TrackRequestParameters params;
   std::variant<StandaloneFetch, JoiningFetch> args;
 };
 
@@ -988,7 +1130,7 @@ struct FetchOk {
   GroupOrder groupOrder;
   uint8_t endOfTrack;
   AbsoluteLocation endLocation;
-  std::vector<TrackRequestParameter> params;
+  TrackRequestParameters params;
 };
 
 // FetchError is now an alias for RequestError - see below
@@ -996,12 +1138,7 @@ struct FetchOk {
 struct SubscribeAnnounces {
   RequestID requestID;
   TrackNamespace trackNamespacePrefix;
-  std::vector<TrackRequestParameter> params;
-};
-
-struct SubscribeAnnouncesOk {
-  RequestID requestID;
-  TrackNamespace trackNamespacePrefix;
+  TrackRequestParameters params;
 };
 
 // SubscribeAnnouncesError is now an alias for RequestError - see below
@@ -1009,6 +1146,14 @@ struct SubscribeAnnouncesOk {
 struct UnsubscribeAnnounces {
   TrackNamespace trackNamespacePrefix;
 };
+
+struct RequestOk {
+  RequestID requestID;
+  TrackRequestParameters params;
+};
+
+using SubscribeAnnouncesOk = RequestOk;
+using AnnounceOk = RequestOk;
 
 // Consolidated request error structure
 struct RequestError {
@@ -1037,63 +1182,52 @@ inline StreamType getSubgroupStreamType(
     uint64_t version,
     SubgroupIDFormat format,
     bool includeExtensions,
-    bool endOfGroup) {
+    bool endOfGroup,
+    bool priorityPresent = true) {
   auto majorVersion = getDraftMajorVersion(version);
-  if (majorVersion == 11) {
-    return StreamType(
-        folly::to_underlying(StreamType::SUBGROUP_HEADER_MASK_V11) |
-        (format == SubgroupIDFormat::Present ? SG_HAS_SUBGROUP_ID : 0) |
-        (format == SubgroupIDFormat::FirstObject ? SG_SUBGROUP_VALUE : 0) |
-        (includeExtensions ? SG_HAS_EXTENSIONS : 0));
-  } else {
-    return StreamType(
-        folly::to_underlying(StreamType::SUBGROUP_HEADER_MASK) |
-        (format == SubgroupIDFormat::Present ? SG_HAS_SUBGROUP_ID : 0) |
-        (format == SubgroupIDFormat::FirstObject ? SG_SUBGROUP_VALUE : 0) |
-        (includeExtensions ? SG_HAS_EXTENSIONS : 0) |
-        (endOfGroup ? SG_HAS_END_OF_GROUP : 0));
-  }
+  return StreamType(
+      folly::to_underlying(StreamType::SUBGROUP_HEADER_MASK) |
+      (format == SubgroupIDFormat::Present ? SG_HAS_SUBGROUP_ID : 0) |
+      (format == SubgroupIDFormat::FirstObject ? SG_SUBGROUP_VALUE : 0) |
+      (includeExtensions ? SG_HAS_EXTENSIONS : 0) |
+      (endOfGroup ? SG_HAS_END_OF_GROUP : 0) |
+      (majorVersion >= 15 && !priorityPresent ? SG_PRIORITY_NOT_PRESENT : 0));
 }
-inline folly::Optional<SubgroupOptions> getSubgroupOptions(
+
+bool isValidSubgroupType(uint64_t version, uint64_t streamType);
+
+inline SubgroupOptions getSubgroupOptions(
     uint64_t version,
     StreamType streamType) {
   SubgroupOptions options;
   auto streamTypeInt = folly::to_underlying(streamType);
   auto majorVersion = getDraftMajorVersion(version);
-  if (majorVersion == 11) {
-    if ((streamTypeInt &
-         folly::to_underlying(StreamType::SUBGROUP_HEADER_MASK_V11)) == 0) {
-      return folly::none;
-    }
-    streamTypeInt &=
-        ~folly::to_underlying(StreamType::SUBGROUP_HEADER_MASK_V11);
-  } else {
-    if ((streamTypeInt &
-         folly::to_underlying(StreamType::SUBGROUP_HEADER_MASK)) == 0) {
-      return folly::none;
-    }
-    streamTypeInt &= ~folly::to_underlying(StreamType::SUBGROUP_HEADER_MASK);
-    options.hasEndOfGroup =
-        folly::to_underlying(streamType) & SG_HAS_END_OF_GROUP;
-  }
 
   options.hasExtensions = streamTypeInt & SG_HAS_EXTENSIONS;
   options.subgroupIDFormat = streamTypeInt & SG_HAS_SUBGROUP_ID
       ? SubgroupIDFormat::Present
       : (streamTypeInt & SG_SUBGROUP_VALUE) ? SubgroupIDFormat::FirstObject
                                             : SubgroupIDFormat::Zero;
-  options.hasEndOfGroup = false;
+  options.hasEndOfGroup =
+      folly::to_underlying(streamType) & SG_HAS_END_OF_GROUP;
+  // In Draft 15+, check if priority is not present
+  if (majorVersion >= 15) {
+    options.priorityPresent = !(streamTypeInt & SG_PRIORITY_NOT_PRESENT);
+  }
   return options;
 }
 
 bool isValidDatagramType(uint64_t version, uint64_t datagramType);
+bool datagramPriorityPresent(uint64_t version, DatagramType datagramType);
+bool subgroupPriorityPresent(uint64_t version, StreamType streamType);
 
 inline DatagramType getDatagramType(
     uint64_t version,
     bool status,
     bool includeExtensions,
     bool endOfGroup,
-    bool isObjectIdZero) {
+    bool isObjectIdZero,
+    bool priorityPresent = true) {
   auto majorVersion = getDraftMajorVersion(version);
   if (majorVersion == 11) {
     return DatagramType(
@@ -1101,14 +1235,15 @@ inline DatagramType getDatagramType(
         (includeExtensions ? DG_HAS_EXTENSIONS : 0));
   } else if (status) {
     return DatagramType(
-        folly::to_underlying(DatagramType::OBJECT_DATAGRAM_STATUS) |
-        (includeExtensions ? DG_HAS_EXTENSIONS : 0) |
-        (isObjectIdZero ? DG_OBJECT_ID_ZERO : 0));
+        DG_IS_STATUS | (includeExtensions ? DG_HAS_EXTENSIONS : 0) |
+        (isObjectIdZero ? DG_OBJECT_ID_ZERO : 0) |
+        (majorVersion >= 15 && !priorityPresent ? DG_PRIORITY_NOT_PRESENT : 0));
   } else {
     return DatagramType(
         (includeExtensions ? DG_HAS_EXTENSIONS : 0) |
         (endOfGroup ? DG_HAS_END_OF_GROUP : 0) |
-        (isObjectIdZero ? DG_OBJECT_ID_ZERO : 0));
+        (isObjectIdZero ? DG_OBJECT_ID_ZERO : 0) |
+        (majorVersion >= 15 && !priorityPresent ? DG_PRIORITY_NOT_PRESENT : 0));
   }
 }
 
@@ -1142,8 +1277,7 @@ class MoQFrameParser {
 
   folly::Expected<SubgroupHeaderResult, ErrorCode> parseSubgroupHeader(
       folly::io::Cursor& cursor,
-      SubgroupIDFormat format,
-      bool includeExtensions) const noexcept;
+      const SubgroupOptions& options) const noexcept;
 
   // Parses the stream header and if it's a subgroup type,
   // parses and returns the Track Alias.  For non-subgroups,
@@ -1159,8 +1293,7 @@ class MoQFrameParser {
   folly::Expected<ObjectHeader, ErrorCode> parseSubgroupObjectHeader(
       folly::io::Cursor& cursor,
       const ObjectHeader& headerTemplate,
-      SubgroupIDFormat format,
-      bool includeExtensions) const noexcept;
+      const SubgroupOptions& options) const noexcept;
 
   folly::Expected<SubscribeRequest, ErrorCode> parseSubscribeRequest(
       folly::io::Cursor& cursor,
@@ -1197,6 +1330,11 @@ class MoQFrameParser {
   folly::Expected<AnnounceOk, ErrorCode> parseAnnounceOk(
       folly::io::Cursor& cursor,
       size_t length) const noexcept;
+
+  folly::Expected<RequestOk, ErrorCode> parseRequestOk(
+      folly::io::Cursor& cursor,
+      size_t length,
+      FrameType frameType) const noexcept;
 
   folly::Expected<Unannounce, ErrorCode> parseUnannounce(
       folly::io::Cursor& cursor,
@@ -1293,7 +1431,8 @@ class MoQFrameParser {
       folly::io::Cursor& cursor,
       size_t& length,
       size_t numParams,
-      std::vector<TrackRequestParameter>& params) const noexcept;
+      TrackRequestParameters& params,
+      std::vector<Parameter>& requestSpecificParams) const noexcept;
 
   folly::Expected<folly::Optional<AuthToken>, ErrorCode> parseToken(
       folly::io::Cursor& cursor,
@@ -1304,10 +1443,6 @@ class MoQFrameParser {
       size_t& length) const noexcept;
 
   folly::Expected<FullTrackName, ErrorCode> parseFullTrackName(
-      folly::io::Cursor& cursor,
-      size_t& length) const noexcept;
-
-  folly::Expected<AbsoluteLocation, ErrorCode> parseAbsoluteLocation(
       folly::io::Cursor& cursor,
       size_t& length) const noexcept;
 
@@ -1322,6 +1457,21 @@ class MoQFrameParser {
       size_t& length,
       ObjectHeader& objectHeader,
       bool allowImmutable = true) const noexcept;
+
+  folly::Optional<SubscriptionFilter> extractSubscriptionFilter(
+      const std::vector<Parameter>& requestSpecificParams) const noexcept;
+
+  void handleRequestSpecificParams(
+      SubscribeRequest& subscribeRequest,
+      const std::vector<Parameter>& requestSpecificParams) const noexcept;
+
+  void handleRequestSpecificParams(
+      SubscribeUpdate& subscribeUpdate,
+      const std::vector<Parameter>& requestSpecificParams) const noexcept;
+
+  void handleRequestSpecificParams(
+      PublishOk& publishOk,
+      const std::vector<Parameter>& requestSpecificParams) const noexcept;
 
   folly::Optional<uint64_t> version_;
   mutable MoQTokenCache tokenCache_;
@@ -1427,6 +1577,11 @@ class MoQFrameWriter {
       folly::IOBufQueue& writeBuf,
       const AnnounceOk& announceOk) const noexcept;
 
+  WriteResult writeRequestOk(
+      folly::IOBufQueue& writeBuf,
+      const RequestOk& requestOk,
+      FrameType frameType) const noexcept;
+
   WriteResult writeUnannounce(
       folly::IOBufQueue& writeBuf,
       const Unannounce& unannounce) const noexcept;
@@ -1520,7 +1675,14 @@ class MoQFrameWriter {
 
   void writeTrackRequestParams(
       folly::IOBufQueue& writeBuf,
-      const std::vector<TrackRequestParameter>& params,
+      const TrackRequestParameters& params,
+      const std::vector<Parameter>& requestSpecificParams,
+      size_t& size,
+      bool& error) const noexcept;
+
+  void writeSubscriptionFilter(
+      folly::IOBufQueue& writeBuf,
+      const SubscriptionFilter& filter,
       size_t& size,
       bool& error) const noexcept;
 

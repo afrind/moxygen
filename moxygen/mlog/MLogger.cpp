@@ -350,8 +350,10 @@ void MLogger::logAnnounceOk(
     const MOQTByteStringType& type,
     ControlMessageType controlType) {
   auto baseMsg = std::make_unique<MOQTAnnounceOk>();
-  baseMsg->trackNamespace = convertTrackNamespaceToByteStringFormat(
-      req.trackNamespace.trackNamespace, type);
+  // TODO
+  TrackNamespace ns;
+  baseMsg->trackNamespace =
+      convertTrackNamespaceToByteStringFormat(ns.trackNamespace, type);
 
   logControlMessage(
       controlType, kFirstBidiStreamId, folly::none, std::move(baseMsg));
@@ -619,8 +621,10 @@ void MLogger::logSubscribeAnnouncesOk(
     const MOQTByteStringType& type,
     ControlMessageType controlType) {
   auto baseMsg = std::make_unique<MOQTSubscribeAnnouncesOk>();
-  baseMsg->trackNamespace = convertTrackNamespaceToByteStringFormat(
-      req.trackNamespacePrefix.trackNamespace, type);
+  // TODO
+  TrackNamespace ns;
+  baseMsg->trackNamespace =
+      convertTrackNamespaceToByteStringFormat(ns.trackNamespace, type);
 
   logControlMessage(
       controlType, kFirstBidiStreamId, folly::none, std::move(baseMsg));
@@ -647,7 +651,7 @@ void MLogger::logSubscribeAnnouncesError(
 }
 
 std::vector<MOQTParameter> MLogger::convertSetupParamsToMoQTParams(
-    const std::vector<SetupParameter>& params) {
+    const SetupParameters& params) {
   // Add Params to params vector
   std::vector<MOQTParameter> moqParams;
 
@@ -687,7 +691,7 @@ std::vector<MOQTParameter> MLogger::convertSetupParamsToMoQTParams(
 }
 
 std::vector<MOQTParameter> MLogger::convertTrackParamsToMoQTParams(
-    const std::vector<TrackRequestParameter>& params) {
+    const TrackRequestParameters& params) {
   std::vector<MOQTParameter> moqParams;
   for (const auto& param : params) {
     MOQTParameter p;
@@ -754,7 +758,7 @@ void MLogger::logObjectDatagramCreated(
   baseMsg.trackAlias = trackAlias.value;
   baseMsg.groupId = header.group;
   baseMsg.objectId = header.id;
-  baseMsg.publisherPriority = header.priority;
+  baseMsg.publisherPriority = header.priority.value_or(kDefaultPriority);
   baseMsg.extensionHeadersLength = header.extensions.size();
   baseMsg.extensionHeaders = convertExtensionToMoQTExtensionHeaders(
       header.extensions.getMutableExtensions());
@@ -770,7 +774,7 @@ void MLogger::logObjectDatagramParsed(
   baseMsg.trackAlias = trackAlias.value;
   baseMsg.groupId = header.group;
   baseMsg.objectId = header.id;
-  baseMsg.publisherPriority = header.priority;
+  baseMsg.publisherPriority = header.priority.value_or(kDefaultPriority);
   baseMsg.extensionHeadersLength = header.extensions.size();
   baseMsg.extensionHeaders = convertExtensionToMoQTExtensionHeaders(
       header.extensions.getMutableExtensions());
@@ -787,7 +791,7 @@ void MLogger::logObjectDatagramStatusCreated(
   baseMsg.trackAlias = trackAlias.value;
   baseMsg.groupId = header.group;
   baseMsg.objectId = header.id;
-  baseMsg.publisherPriority = header.priority;
+  baseMsg.publisherPriority = header.priority.value_or(kDefaultPriority);
   baseMsg.extensionHeadersLength = header.extensions.size();
   baseMsg.extensionHeaders = convertExtensionToMoQTExtensionHeaders(
       header.extensions.getMutableExtensions());
@@ -802,7 +806,7 @@ void MLogger::logObjectDatagramStatusParsed(
   baseMsg.trackAlias = trackAlias.value;
   baseMsg.groupId = header.group;
   baseMsg.objectId = header.id;
-  baseMsg.publisherPriority = header.priority;
+  baseMsg.publisherPriority = header.priority.value_or(kDefaultPriority);
   baseMsg.extensionHeadersLength = header.extensions.size();
   baseMsg.extensionHeaders = convertExtensionToMoQTExtensionHeaders(
       header.extensions.getMutableExtensions());
@@ -905,7 +909,7 @@ void MLogger::logFetchObjectCreated(
   baseMsg.groupId = objHeader.group;
   baseMsg.subgroupId = objHeader.id;
   baseMsg.objectId = objHeader.id;
-  baseMsg.publisherPriority = objHeader.priority;
+  baseMsg.publisherPriority = objHeader.priority.value_or(kDefaultPriority);
   baseMsg.extensionHeadersLength = objHeader.extensions.size();
   baseMsg.extensionHeaders = convertExtensionToMoQTExtensionHeaders(
       objHeader.extensions.getMutableExtensions());
@@ -924,7 +928,7 @@ void MLogger::logFetchObjectParsed(
   baseMsg.groupId = objHeader.group;
   baseMsg.subgroupId = objHeader.id;
   baseMsg.objectId = objHeader.id;
-  baseMsg.publisherPriority = objHeader.priority;
+  baseMsg.publisherPriority = objHeader.priority.value_or(kDefaultPriority);
   baseMsg.extensionHeadersLength = objHeader.extensions.size();
   baseMsg.extensionHeaders = convertExtensionToMoQTExtensionHeaders(
       objHeader.extensions.getMutableExtensions());

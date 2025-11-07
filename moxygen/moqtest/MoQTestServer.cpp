@@ -281,7 +281,7 @@ folly::coro::Task<void> MoQTestServer::sendTwoSubgroupsPerGroup(
     MoQTestParameters params,
     std::shared_ptr<TrackConsumer> callback) {
   // Iterate through Objects
-  LOG(INFO) << "Starting Two Subgroups Per Group" << std::endl;
+  LOG(INFO) << "Starting Two Subgroups Per Group";
 
   // Odd number of objects in track means end on subgroupZero
   bool endZero = (params.lastObjectInTrack - params.startObject) % 2 == 1;
@@ -372,10 +372,11 @@ folly::coro::Task<MoQSession::SubscribeResult> MoQTestServer::sendDatagram(
          objectId <= params.lastObjectInTrack;
          objectId += params.objectIncrement) {
       if (isSubCancelled()) {
-        co_return folly::makeUnexpected(SubscribeError{
-            sub.requestID,
-            SubscribeErrorCode::INTERNAL_ERROR,
-            "Datagram Subscription Cancelled"});
+        co_return folly::makeUnexpected(
+            SubscribeError{
+                sub.requestID,
+                SubscribeErrorCode::INTERNAL_ERROR,
+                "Datagram Subscription Cancelled"});
       }
       // Add Integer/Variable Extensions if needed
       std::vector<Extension> extensions = getExtensions(
@@ -395,10 +396,11 @@ folly::coro::Task<MoQSession::SubscribeResult> MoQTestServer::sendDatagram(
 
       auto res = callback->datagram(header, std::move(objectPayload));
       if (res.hasError()) {
-        co_return folly::makeUnexpected(SubscribeError{
-            sub.requestID,
-            SubscribeErrorCode::INTERNAL_ERROR,
-            "Error Sending Datagram Objects"});
+        co_return folly::makeUnexpected(
+            SubscribeError{
+                sub.requestID,
+                SubscribeErrorCode::INTERNAL_ERROR,
+                "Error Sending Datagram Objects"});
       }
 
       // Set Delay Based on Object Frequency
@@ -692,7 +694,7 @@ void MoQTAnnounceCallback::announceCancel(
 
 folly::coro::Task<MoQSession::SubscribeAnnouncesResult>
 MoQTestServer::subscribeAnnounces(SubscribeAnnounces subAnn) {
-  SubscribeAnnouncesOk ok{subAnn.requestID, subAnn.trackNamespacePrefix};
+  SubscribeAnnouncesOk ok{subAnn.requestID, {}};
   auto handle =
       std::make_shared<MoQTestSubscribeAnnouncesHandle>(std::move(ok));
   co_return handle;

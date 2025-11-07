@@ -28,6 +28,7 @@ class MockMoQCodecCallback : public MoQControlCodec::ControlCallback,
   MOCK_METHOD(void, onSubscribe, (SubscribeRequest subscribeRequest));
   MOCK_METHOD(void, onSubscribeUpdate, (SubscribeUpdate subscribeUpdate));
   MOCK_METHOD(void, onSubscribeOk, (SubscribeOk subscribeOk));
+  MOCK_METHOD(void, onRequestOk, (RequestOk reqOk, FrameType frameType));
   MOCK_METHOD(void, onRequestError, (RequestError error, FrameType frameType));
   MOCK_METHOD(void, onSubscribeDone, (SubscribeDone subscribeDone));
   MOCK_METHOD(void, onUnsubscribe, (Unsubscribe unsubscribe));
@@ -39,11 +40,9 @@ class MockMoQCodecCallback : public MoQControlCodec::ControlCallback,
   MOCK_METHOD(void, onFetchCancel, (FetchCancel fetchCancel));
   MOCK_METHOD(void, onFetchOk, (FetchOk fetchOk));
   MOCK_METHOD(void, onAnnounce, (Announce announce));
-  MOCK_METHOD(void, onAnnounceOk, (AnnounceOk announceOk));
   MOCK_METHOD(void, onUnannounce, (Unannounce unannounce));
   MOCK_METHOD(void, onAnnounceCancel, (AnnounceCancel announceCancel));
   MOCK_METHOD(void, onSubscribeAnnounces, (SubscribeAnnounces announce));
-  MOCK_METHOD(void, onSubscribeAnnouncesOk, (SubscribeAnnouncesOk announceOk));
 
   MOCK_METHOD(
       void,
@@ -56,7 +55,10 @@ class MockMoQCodecCallback : public MoQControlCodec::ControlCallback,
   MOCK_METHOD(void, onConnectionError, (ErrorCode error));
 
   MOCK_METHOD(void, onFetchHeader, (RequestID));
-  MOCK_METHOD(void, onSubgroup, (TrackAlias, uint64_t, uint64_t, uint8_t));
+  MOCK_METHOD(
+      void,
+      onSubgroup,
+      (TrackAlias, uint64_t, uint64_t, folly::Optional<uint8_t>));
   MOCK_METHOD(
       void,
       onObjectBegin,
@@ -71,7 +73,12 @@ class MockMoQCodecCallback : public MoQControlCodec::ControlCallback,
   MOCK_METHOD(
       void,
       onObjectStatus,
-      (uint64_t, uint64_t, uint64_t, Priority, ObjectStatus, Extensions));
+      (uint64_t,
+       uint64_t,
+       uint64_t,
+       folly::Optional<uint8_t>,
+       ObjectStatus,
+       Extensions));
   MOCK_METHOD(void, onObjectPayload, (Payload, bool));
   MOCK_METHOD(void, onEndOfStream, ());
 };

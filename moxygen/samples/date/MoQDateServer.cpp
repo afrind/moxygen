@@ -30,6 +30,11 @@ DEFINE_string(
 DEFINE_bool(quic_transport, false, "Use raw QUIC transport");
 DEFINE_bool(publish, false, "Send PUBLISH to subscriber");
 DEFINE_string(ns, "moq-date", "Namespace for date track");
+DEFINE_bool(
+    use_legacy_setup,
+    false,
+    "If true, use only moq-00 ALPN (legacy). If false, use both moqt-15 and moq-00");
+DEFINE_int32(delivery_timeout, 0, "the delivery timeout in ms for server");
 
 namespace {
 using namespace moxygen;
@@ -82,13 +87,21 @@ class MoQDateServer : public MoQServer,
             : std::make_unique<MoQWebTransportClient>(
                   moqEvb_, url, MoQRelaySession::createRelaySessionFactory())));
 
+    std::vector<std::string> alpns;
+    if (FLAGS_use_legacy_setup) {
+      alpns = {std::string(kAlpnMoqtLegacy)};
+    } else {
+      alpns = {std::string(kAlpnMoqtDraft15), std::string(kAlpnMoqtLegacy)};
+    }
     folly::coro::blockingWait(
         relayClient_
             ->setup(
                 /*publisher=*/shared_from_this(),
                 /*subscriber=*/nullptr,
                 std::chrono::milliseconds(FLAGS_relay_connect_timeout),
-                std::chrono::seconds(FLAGS_relay_transaction_timeout))
+                std::chrono::seconds(FLAGS_relay_transaction_timeout),
+                quic::TransportSettings(),
+                alpns)
             .scheduleOn(evb)
             .start());
     relayClient_
@@ -130,10 +143,11 @@ class MoQDateServer : public MoQServer,
       TrackStatus trackStatus) override {
     XLOG(DBG1) << __func__ << trackStatus.fullTrackName;
     if (trackStatus.fullTrackName != dateTrackName()) {
-      co_return folly::makeUnexpected(TrackStatusError{
-          trackStatus.requestID,
-          TrackStatusErrorCode::TRACK_NOT_EXIST,
-          "The requested track does not exist"});
+      co_return folly::makeUnexpected(
+          TrackStatusError{
+              trackStatus.requestID,
+              TrackStatusErrorCode::TRACK_NOT_EXIST,
+              "The requested track does not exist"});
     }
     // TODO: add other trackSTatus codes
     // TODO: unify this with subscribe. You can get the same information both
@@ -217,18 +231,20 @@ class MoQDateServer : public MoQServer,
                << " name=" << subReq.fullTrackName.trackName
                << " requestID=" << subReq.requestID;
     if (subReq.fullTrackName != dateTrackName()) {
-      co_return folly::makeUnexpected(SubscribeError{
-          subReq.requestID,
-          SubscribeErrorCode::TRACK_NOT_EXIST,
-          "unexpected subscribe"});
+      co_return folly::makeUnexpected(
+          SubscribeError{
+              subReq.requestID,
+              SubscribeErrorCode::TRACK_NOT_EXIST,
+              "unexpected subscribe"});
     }
     auto largest = updateLargest();
     if (subReq.locType == LocationType::AbsoluteRange &&
         subReq.endGroup < largest.group) {
-      co_return folly::makeUnexpected(SubscribeError{
-          subReq.requestID,
-          SubscribeErrorCode::INVALID_RANGE,
-          "Range in the past, use FETCH"});
+      co_return folly::makeUnexpected(
+          SubscribeError{
+              subReq.requestID,
+              SubscribeErrorCode::INVALID_RANGE,
+              "Range in the past, use FETCH"});
       // start may be in the past, it will get adjusted forward to largest
     }
 
@@ -240,8 +256,10 @@ class MoQDateServer : public MoQServer,
       co_withExecutor(session->getExecutor(), publishDateLoop()).start();
     }
 
-    co_return forwarder_.addSubscriber(
+    forwarder_.setDeliveryTimeout(FLAGS_delivery_timeout);
+    auto subscriber = forwarder_.addSubscriber(
         std::move(session), subReq, std::move(consumer));
+    co_return subscriber;
   }
 
   class FetchHandle : public Publisher::FetchHandle {
@@ -261,10 +279,11 @@ class MoQDateServer : public MoQServer,
                << " name=" << fetch.fullTrackName.trackName
                << " requestID=" << fetch.requestID;
     if (fetch.fullTrackName != dateTrackName()) {
-      co_return folly::makeUnexpected(FetchError{
-          fetch.requestID,
-          FetchErrorCode::TRACK_NOT_EXIST,
-          "unexpected fetch"});
+      co_return folly::makeUnexpected(
+          FetchError{
+              fetch.requestID,
+              FetchErrorCode::TRACK_NOT_EXIST,
+              "unexpected fetch"});
     }
     auto largest = updateLargest();
     auto [standalone, joining] = fetchType(fetch);
@@ -285,14 +304,16 @@ class MoQDateServer : public MoQServer,
     if (standalone->end < standalone->start &&
         !(standalone->start.group == standalone->end.group &&
           standalone->end.object == 0)) {
-      co_return folly::makeUnexpected(FetchError{
-          fetch.requestID, FetchErrorCode::INVALID_RANGE, "No objects"});
+      co_return folly::makeUnexpected(
+          FetchError{
+              fetch.requestID, FetchErrorCode::INVALID_RANGE, "No objects"});
     }
     if (standalone->start > largest) {
-      co_return folly::makeUnexpected(FetchError{
-          fetch.requestID,
-          FetchErrorCode::INVALID_RANGE,
-          "fetch starts in future"});
+      co_return folly::makeUnexpected(
+          FetchError{
+              fetch.requestID,
+              FetchErrorCode::INVALID_RANGE,
+              "fetch starts in future"});
     }
     XLOG(DBG1) << "Fetch {" << standalone->start.group << ","
                << standalone->start.object << "}.." << standalone->end.group

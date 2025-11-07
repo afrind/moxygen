@@ -8,30 +8,6 @@
 #include <quic/client/QuicClientTransport.h>
 #include <moxygen/MoQClientBase.h>
 
-// TODO: clean this up.
-namespace proxygen {
-
-// This is an insecure certificate verifier and is not meant to be
-// used in production. Using it in production would mean that this will
-// leave everyone insecure.
-class InsecureVerifierDangerousDoNotUseInProduction
-    : public fizz::CertificateVerifier {
- public:
-  ~InsecureVerifierDangerousDoNotUseInProduction() override = default;
-
-  std::shared_ptr<const folly::AsyncTransportCertificate> verify(
-      const std::vector<std::shared_ptr<const fizz::PeerCert>>& certs)
-      const override {
-    return certs.front();
-  }
-
-  std::vector<fizz::Extension> getCertificateRequestExtensions()
-      const override {
-    return std::vector<fizz::Extension>();
-  }
-};
-} // namespace proxygen
-
 namespace moxygen {
 /*static*/
 bool MoQClientBase::shouldSendAuthorityParam(
@@ -49,23 +25,39 @@ folly::coro::Task<void> MoQClientBase::setupMoQSession(
     std::chrono::milliseconds transaction_timeout,
     std::shared_ptr<Publisher> publishHandler,
     std::shared_ptr<Subscriber> subscribeHandler,
-    const quic::TransportSettings& transportSettings) noexcept {
+    const quic::TransportSettings& transportSettings,
+    const std::vector<std::string>& alpns) noexcept {
   proxygen::WebTransport* wt = nullptr;
-  // Establish QUIC connection
+
+  std::vector<std::string> alpn;
+  if (alpns.empty()) {
+    // Default: use both ALPNs
+    alpn = {std::string(kAlpnMoqtDraft15), std::string(kAlpnMoqtLegacy)};
+  } else {
+    alpn = alpns;
+  }
+  // Establish QUIC connection with multiple ALPN options
   auto quicClient = co_await connectQuic(
       folly::SocketAddress(
           url_.getHost(), url_.getPort(), true), // blocking DNS,
       connect_timeout,
-      std::make_shared<
-          proxygen::InsecureVerifierDangerousDoNotUseInProduction>(),
-      "moq-00",
+      verifier_,
+      alpn,
       transportSettings);
+
+  // Detect negotiated ALPN before wrapping the socket
+  auto stdAlpn = quicClient->getAppProtocol();
+  if (stdAlpn) {
+    negotiatedProtocol_ = *stdAlpn;
+    XLOG(INFO) << "Client: Negotiated ALPN: " << *negotiatedProtocol_;
+  }
 
   // Make WebTransport object
   quicWebTransport_ =
       std::make_shared<proxygen::QuicWebTransport>(std::move(quicClient));
   quicWebTransport_->setHandler(this);
   wt = quicWebTransport_.get();
+
   co_await completeSetupMoQSession(
       wt,
       url_.getPath(),
@@ -81,6 +73,14 @@ folly::coro::Task<ServerSetup> MoQClientBase::completeSetupMoQSession(
   //  Create MoQSession and Setup MoQSession parameters
   moqSession_ =
       createSession(folly::MaybeManagedPtr<proxygen::WebTransport>(wt));
+
+  // Configure session based on negotiated ALPN
+  // If there is no ALPN negotiation, the negotiation will be done in the
+  // Setup messages.
+  if (negotiatedProtocol_) {
+    moqSession_->validateAndSetVersionFromAlpn(*negotiatedProtocol_);
+  }
+
   moqSession_->setPublishHandler(std::move(publishHandler));
   moqSession_->setSubscribeHandler(std::move(subscribeHandler));
   moqSession_->setLogger(logger_);
@@ -99,22 +99,22 @@ ClientSetup MoQClientBase::getClientSetup(
   // via relay needs to support subscribes.
   const uint32_t kDefaultMaxRequestID = 100;
   const uint32_t kMaxAuthTokenCacheSize = 1024;
-  static const std::vector<uint64_t> post11Versions = {
-      kVersionDraft11, kVersionDraft12, kVersionDraft13, kVersionDraft14};
 
+  const auto& legacyVersions = getSupportedLegacyVersions();
   ClientSetup clientSetup{
-      post11Versions,
-      {{folly::to_underlying(SetupKey::MAX_REQUEST_ID),
-        "",
-        kDefaultMaxRequestID,
-        {}},
-       {folly::to_underlying(SetupKey::MAX_AUTH_TOKEN_CACHE_SIZE),
-        "",
-        kMaxAuthTokenCacheSize,
-        {}}}};
+      legacyVersions,
+      SetupParameters{
+          {folly::to_underlying(SetupKey::MAX_REQUEST_ID),
+           "",
+           kDefaultMaxRequestID,
+           {}},
+          {folly::to_underlying(SetupKey::MAX_AUTH_TOKEN_CACHE_SIZE),
+           "",
+           kMaxAuthTokenCacheSize,
+           {}}}};
 
   if (path) {
-    clientSetup.params.emplace_back(
+    clientSetup.params.insertParam(
         SetupParameter({folly::to_underlying(SetupKey::PATH), *path, 0, {}}));
   }
 
@@ -127,7 +127,7 @@ ClientSetup MoQClientBase::getClientSetup(
         authority += ":" + std::to_string(url_.getPort());
       }
 
-      clientSetup.params.emplace_back(SetupParameter(
+      clientSetup.params.insertParam(SetupParameter(
           {folly::to_underlying(SetupKey::AUTHORITY), authority, 0}));
     }
   }

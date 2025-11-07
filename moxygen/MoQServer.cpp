@@ -21,7 +21,9 @@ namespace moxygen {
 MoQServer::MoQServer(std::string cert, std::string key, std::string endpoint)
     : MoQServer(
           quic::samples::createFizzServerContext(
-              {"h3", "moq-00"},
+              {"h3",
+               std::string(kAlpnMoqtDraft15),
+               std::string(kAlpnMoqtLegacy)},
               fizz::server::ClientAuthMode::Optional,
               cert,
               key),
@@ -37,13 +39,12 @@ MoQServer::MoQServer(
   auto factory = std::make_unique<HQServerTransportFactory>(
       params_, [this](HTTPMessage*) { return new Handler(*this); }, nullptr);
   factory->addAlpnHandler(
-      {"moq-00"},
+      {std::string(kAlpnMoqtLegacy), std::string(kAlpnMoqtDraft15)},
       [this](
           std::shared_ptr<quic::QuicSocket> quicSocket,
           wangle::ConnectionManager*) {
         createMoQQuicSession(std::move(quicSocket));
       });
-  const std::vector<std::string> supportedAlpns = {"h3", "moq-00"};
   hqServer_ =
       std::make_unique<HQServer>(params_, std::move(factory), fizzContext);
 }
@@ -58,14 +59,22 @@ void MoQServer::stop() {
   hqServer_->stop();
 }
 
-void MoQServer::rejectNewConnections(bool reject) {
+void MoQServer::rejectNewConnections(std::function<bool()> rejectFn) {
   if (hqServer_) {
-    hqServer_->rejectNewConnections(reject);
+    hqServer_->rejectNewConnections(std::move(rejectFn));
   }
 }
 
 void MoQServer::createMoQQuicSession(
     std::shared_ptr<quic::QuicSocket> quicSocket) {
+  // Detect negotiated ALPN before wrapping the socket
+  auto stdAlpn = quicSocket->getAppProtocol();
+  folly::Optional<std::string> alpn;
+  if (stdAlpn) {
+    alpn = *stdAlpn;
+    XLOG(INFO) << "Server: Negotiated ALPN: " << *alpn;
+  }
+
   auto qevb = quicSocket->getEventBase();
   auto ts = quicSocket->getTransportSettings();
   // TODO make this configurable, also have a shared pacing timer per thread.
@@ -81,6 +90,12 @@ void MoQServer::createMoQQuicSession(
                  ->getBackingEventBase();
   auto moqSession =
       createSession(std::move(wt), std::make_unique<MoQFollyExecutorImpl>(evb));
+
+  // Configure session based on negotiated ALPN
+  if (alpn) {
+    moqSession->validateAndSetVersionFromAlpn(*alpn);
+  }
+
   qWtPtr->setHandler(moqSession.get());
   // the handleClientSession coro this session moqSession
   co_withExecutor(evb, handleClientSession(std::move(moqSession))).start();
@@ -178,29 +193,58 @@ void MoQServer::pauseRead() {
   hqServer_->pauseRead();
 }
 
+void MoQServer::setFizzContext(
+    std::shared_ptr<const fizz::server::FizzServerContext> ctx) {
+  hqServer_->setFizzContext(std::move(ctx));
+}
+
+void MoQServer::setFizzContext(
+    folly::EventBase* evb,
+    std::shared_ptr<const fizz::server::FizzServerContext> ctx) {
+  hqServer_->setFizzContext(evb, std::move(ctx));
+}
+
 folly::Try<ServerSetup> MoQServer::onClientSetup(
     ClientSetup setup,
-    std::shared_ptr<MoQSession>) {
-  XLOG(INFO) << "ClientSetup";
+    const std::shared_ptr<MoQSession>& session) {
+  XLOG(INFO) << "MoQServer::ClientSetup";
 
   uint64_t negotiatedVersion = 0;
-  // Iterate over supported versions and set the highest version within the
-  // range
-  constexpr uint64_t kVersionMin = kVersionDraft11;
-  constexpr uint64_t kVersionMax = kVersionDraft14;
-  uint64_t highestVersion = 0;
-  for (const auto& version : setup.supportedVersions) {
-    if (version >= kVersionMin && version <= kVersionMax) {
-      highestVersion = std::max(highestVersion, version);
+
+  // Check if version was negotiated via ALPN first (takes precedence)
+  auto sessionVersion = session->getNegotiatedVersion();
+  if (sessionVersion) {
+    // ALPN mode: use the ALPN-negotiated version
+    negotiatedVersion = *sessionVersion;
+    XLOG(INFO) << "MoQServer::ClientSetup: Using ALPN-negotiated version: moqt-"
+               << getDraftMajorVersion(negotiatedVersion);
+  } else if (!setup.supportedVersions.empty()) {
+    // Legacy mode: negotiate from version array in CLIENT_SETUP
+    // Iterate over supported versions and set the highest version within the
+    // range
+    uint64_t highestVersion = 0;
+    for (const auto& version : setup.supportedVersions) {
+      if (getDraftMajorVersion(version) >= 15) {
+        XLOG(WARN) << "MoQServer::ClientSetup: Skiping version " << version
+                   << " (which needs alpn negotiation), to attempt fallback.";
+        continue;
+      }
+      if (isSupportedVersion(version)) {
+        highestVersion = std::max(highestVersion, version);
+      }
     }
+    if (highestVersion == 0) {
+      std::string errorMessage = folly::to<std::string>(
+          "The only supported versions in client_setup are ",
+          getSupportedVersionsString());
+      return folly::Try<ServerSetup>(std::runtime_error(errorMessage));
+    }
+    negotiatedVersion = highestVersion;
+  } else {
+    // No version available from either ALPN or CLIENT_SETUP
+    return folly::Try<ServerSetup>(
+        std::runtime_error("No version negotiated via ALPN or CLIENT_SETUP"));
   }
-  if (highestVersion == 0) {
-    return folly::Try<ServerSetup>(std::runtime_error(
-        "Client does not support versions in the range " +
-        std::to_string(getDraftMajorVersion(kVersionMin)) + " to " +
-        std::to_string(getDraftMajorVersion(kVersionMax))));
-  }
-  negotiatedVersion = highestVersion;
 
   // TODO: Make the default MAX_REQUEST_ID configurable and
   // take in the value from ClientSetup
@@ -260,12 +304,16 @@ void MoQServer::Handler::onHeadersComplete(
   }
   resp.setStatusCode(200);
   resp.getHeaders().add("sec-webtransport-http3-draft", "draft02");
-  std::vector<std::string> supportedProtocols{"moq-00"};
+  std::vector<std::string> supportedProtocols{
+      std::string(kAlpnMoqtDraft15), std::string(kAlpnMoqtLegacy)};
+  folly::Optional<std::string> negotiatedProtocol;
   if (auto wtAvailableProtocols =
           HTTPWebTransport::getWTAvailableProtocols(*req)) {
     if (auto wtProtocol = HTTPWebTransport::negotiateWTProtocol(
             wtAvailableProtocols.value(), supportedProtocols)) {
       HTTPWebTransport::setWTProtocol(resp, wtProtocol.value());
+      negotiatedProtocol = wtProtocol.value();
+      XLOG(INFO) << "WebTransport: Negotiated protocol: " << *wtProtocol;
     } else {
       VLOG(4) << "Failed to negotiate WebTransport protocol";
       resp.setStatusCode(400);
@@ -279,8 +327,16 @@ void MoQServer::Handler::onHeadersComplete(
     return;
   }
   auto evb = folly::EventBaseManager::get()->getEventBase();
-  clientSession_ = std::make_shared<MoQSession>(
-      wt, server_, std::make_unique<MoQFollyExecutorImpl>(evb));
+  clientSession_ = server_.createSession(
+      folly::MaybeManagedPtr<proxygen::WebTransport>(wt),
+
+      std::make_unique<MoQFollyExecutorImpl>(evb));
+
+  // Configure session based on negotiated WebTransport protocol
+  if (negotiatedProtocol) {
+    clientSession_->validateAndSetVersionFromAlpn(*negotiatedProtocol);
+  }
+
   co_withExecutor(evb, server_.handleClientSession(clientSession_)).start();
 }
 
@@ -296,7 +352,7 @@ void MoQServer::setQuicStatsFactory(
 }
 
 std::shared_ptr<MoQSession> MoQServer::createSession(
-    std::shared_ptr<proxygen::WebTransport> wt,
+    folly::MaybeManagedPtr<proxygen::WebTransport> wt,
     std::shared_ptr<MoQExecutor> executor) {
   return std::make_shared<MoQSession>(
       folly::MaybeManagedPtr<proxygen::WebTransport>(std::move(wt)),

@@ -41,25 +41,29 @@ class QuicConnectCB : public quic::QuicSocket::ConnectionSetupCallback {
   void onConnectionSetupError(quic::QuicError error) noexcept override {
     switch (error.code.type()) {
       case quic::QuicErrorCode::Type::ApplicationErrorCode:
-        quicConnectErr(quic::QuicApplicationException(
-            error.message, *error.code.asApplicationErrorCode()));
+        quicConnectErr(
+            quic::QuicApplicationException(
+                error.message, *error.code.asApplicationErrorCode()));
         break;
       case quic::QuicErrorCode::Type::LocalErrorCode:
-        quicConnectErr(quic::QuicInternalException(
-            error.message, *error.code.asLocalErrorCode()));
+        quicConnectErr(
+            quic::QuicInternalException(
+                error.message, *error.code.asLocalErrorCode()));
         break;
       case quic::QuicErrorCode::Type::TransportErrorCode:
-        quicConnectErr(quic::QuicTransportException(
-            error.message, *error.code.asTransportErrorCode()));
+        quicConnectErr(
+            quic::QuicTransportException(
+                error.message, *error.code.asTransportErrorCode()));
         break;
     }
   }
   void onReplaySafe() noexcept override {}
   void onTransportReady() noexcept override {
     if (cancellationToken_.isCancellationRequested()) {
-      quicConnectErr(quic::QuicTransportException(
-          "Connection has been cancelled",
-          quic::TransportErrorCode::INTERNAL_ERROR));
+      quicConnectErr(
+          quic::QuicTransportException(
+              "Connection has been cancelled",
+              quic::TransportErrorCode::INTERNAL_ERROR));
     }
     promise_.setValue(folly::unit);
   }
@@ -78,12 +82,12 @@ QuicConnector::connectQuic(
     folly::SocketAddress connectAddr,
     std::chrono::milliseconds timeoutMs,
     std::shared_ptr<fizz::CertificateVerifier> verifier,
-    std::string alpn,
+    const std::vector<std::string>& alpns,
     const quic::TransportSettings& transportSettings) {
   auto qEvb = std::make_shared<quic::FollyQuicEventBase>(eventBase);
   auto sock = std::make_unique<quic::FollyQuicAsyncUDPSocket>(qEvb);
   auto fizzContext = std::make_shared<fizz::client::FizzClientContext>();
-  fizzContext->setSupportedAlpns({alpn});
+  fizzContext->setSupportedAlpns(alpns);
   auto quicClient = quic::QuicClientTransport::newClient(
       std::move(qEvb),
       std::move(sock),
@@ -92,7 +96,11 @@ QuicConnector::connectQuic(
           .setCertificateVerifier(std::move(verifier))
           .build(),
       /*connectionIdSize=*/0);
-  quicClient->setTransportSettings(transportSettings);
+  // Make a copy of transportSettings and enable datagram support
+  auto ts = transportSettings;
+  ts.datagramConfig.enabled = true;
+
+  quicClient->setTransportSettings(ts);
   quicClient->addNewPeerAddress(connectAddr);
   quicClient->setSupportedVersions({quic::QuicVersion::QUIC_V1});
   folly::CancellationToken cancellationToken =
@@ -108,8 +116,9 @@ QuicConnector::connectQuic(
     auto errString = folly::exceptionStr(res.exception()).toStdString();
     quicClient->close(
         quic::QuicError(quic::QuicErrorCode(err), std::string(errString)));
-    co_yield folly::coro::co_error(quic::QuicInternalException(
-        std::move(errString), quic::LocalErrorCode::CONNECT_FAILED));
+    co_yield folly::coro::co_error(
+        quic::QuicInternalException(
+            std::move(errString), quic::LocalErrorCode::CONNECT_FAILED));
   }
   if (cb.quicException) {
     co_yield folly::coro::co_error(std::move(cb.quicException));

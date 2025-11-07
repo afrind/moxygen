@@ -26,6 +26,14 @@ DEFINE_string(audio_track_name, "audio0", "Audio track Name");
 DEFINE_int32(connect_timeout, 1000, "Connect timeout (ms)");
 DEFINE_int32(transaction_timeout, 120, "Transaction timeout (s)");
 DEFINE_bool(quic_transport, false, "Use raw QUIC transport");
+DEFINE_bool(
+    use_legacy_setup,
+    false,
+    "If true, use only moq-00 ALPN (legacy). If false, use both moqt-15 and moq-00");
+DEFINE_uint64(
+    delivery_timeout,
+    0,
+    "Delivery timeout in milliseconds (0 = disabled)");
 
 namespace {
 using namespace moxygen;
@@ -49,13 +57,20 @@ class MoQFlvStreamerClient
     auto g =
         folly::makeGuard([func = __func__] { XLOG(INFO) << "exit " << func; });
     try {
+      std::vector<std::string> alpns;
+      if (FLAGS_use_legacy_setup) {
+        alpns = {std::string(kAlpnMoqtLegacy)};
+      } else {
+        alpns = {std::string(kAlpnMoqtDraft15), std::string(kAlpnMoqtLegacy)};
+      }
       // Create session
       co_await moqClient_.setup(
           /*publisher=*/shared_from_this(),
           /*subscriber=*/nullptr,
           std::chrono::milliseconds(FLAGS_connect_timeout),
           std::chrono::seconds(FLAGS_transaction_timeout),
-          quic::TransportSettings());
+          quic::TransportSettings(),
+          alpns);
       // Announce
       auto annResp = co_await moqClient_.getSession()->announce(std::move(ann));
       if (annResp.hasValue()) {
@@ -147,10 +162,11 @@ class MoQFlvStreamerClient
     AbsoluteLocation largest;
     // Location mode not supported
     if (subscribeReq.locType != LocationType::LargestObject) {
-      co_return folly::makeUnexpected(SubscribeError{
-          subscribeReq.requestID,
-          SubscribeErrorCode::NOT_SUPPORTED,
-          "Only location LargestObject mode supported"});
+      co_return folly::makeUnexpected(
+          SubscribeError{
+              subscribeReq.requestID,
+              SubscribeErrorCode::NOT_SUPPORTED,
+              "Only location LargestObject mode supported"});
     }
     // Track not available
     auto alias = subscribeReq.trackAlias.value_or(
@@ -164,11 +180,23 @@ class MoQFlvStreamerClient
       largest = largestAudio_;
       audioPub_ = std::move(consumer);
     } else {
-      co_return folly::makeUnexpected(SubscribeError{
-          subscribeReq.requestID,
-          SubscribeErrorCode::TRACK_NOT_EXIST,
-          "Full trackname NOT available"});
+      co_return folly::makeUnexpected(
+          SubscribeError{
+              subscribeReq.requestID,
+              SubscribeErrorCode::TRACK_NOT_EXIST,
+              "Full trackname NOT available"});
     }
+
+    // Build response parameters
+    TrackRequestParameters params;
+    if (FLAGS_delivery_timeout > 0) {
+      params.insertParam(
+          {folly::to_underlying(TrackRequestParamKey::DELIVERY_TIMEOUT),
+           "",
+           FLAGS_delivery_timeout,
+           {}});
+    }
+
     // Save subscribe
     auto subscription = std::make_shared<Subscription>(
         SubscribeOk{
@@ -178,7 +206,7 @@ class MoQFlvStreamerClient
             MoQSession::resolveGroupOrder(
                 GroupOrder::OldestFirst, subscribeReq.groupOrder),
             largest,
-            {}},
+            std::move(params)},
         consumerPtr,
         *this);
     subscriptions_.emplace(subscribeReq.requestID, subscription);
@@ -267,8 +295,9 @@ class MoQFlvStreamerClient
   }
 
  private:
-  static const uint8_t AUDIO_STREAM_PRIORITY = 100; /* Lower is higher pri */
-  static const uint8_t VIDEO_STREAM_PRIORITY = 200;
+  static constexpr uint8_t AUDIO_STREAM_PRIORITY =
+      100; /* Lower is higher pri */
+  static constexpr uint8_t VIDEO_STREAM_PRIORITY = 200;
 
   std::shared_ptr<MoQFollyExecutorImpl> moqExecutor_;
   MoQRelayClient moqClient_;

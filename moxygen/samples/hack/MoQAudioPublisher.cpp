@@ -86,17 +86,26 @@ folly::Executor::KeepAlive<folly::EventBase> MoQAudioPublisher::getExecutor()
   }
   return nullptr;
 }
-
+// Implementation of setup function
 bool MoQAudioPublisher::setup(
     const std::string& connectURL,
-    std::shared_ptr<Subscriber> subscriber) {
+    std::shared_ptr<Subscriber> subscriber,
+    bool useLegacySetup,
+    std::shared_ptr<fizz::CertificateVerifier> verifier) {
   proxygen::URL url(connectURL);
   if (!url.isValid() || !url.hasHost()) {
     XLOG(ERR) << "Invalid url: " << connectURL;
     return false;
   }
   relayClient_ = std::make_unique<MoQRelayClient>(
-      std::make_unique<MoQClient>(moqExecutor_, url));
+      std::make_unique<MoQClient>(moqExecutor_, url, std::move(verifier)));
+
+  std::vector<std::string> alpns;
+  if (useLegacySetup) {
+    alpns = {std::string(kAlpnMoqtLegacy)};
+  } else {
+    alpns = {std::string(kAlpnMoqtDraft15), std::string(kAlpnMoqtLegacy)};
+  }
 
   cancel_ = folly::CancellationSource();
   running_ = true;
@@ -106,7 +115,9 @@ bool MoQAudioPublisher::setup(
                                     /*publisher=*/shared_from_this(),
                                     /*subscriber=*/subscriber,
                                     kConnectTimeout,
-                                    kTransactionTimeout))
+                                    kTransactionTimeout,
+                                    quic::TransportSettings(),
+                                    alpns))
                                 .start());
 
   {
@@ -183,7 +194,7 @@ folly::coro::Task<void> MoQAudioPublisher::initialAudioPublish(
         replyEvb,
         folly::coro::co_invoke(
             [selfWeak, replyTask = std::move(replyTask)]() mutable
-            -> folly::coro::Task<void> {
+                -> folly::coro::Task<void> {
               try {
                 auto reply = co_await std::move(replyTask);
                 if (reply.hasError()) {
@@ -214,8 +225,9 @@ folly::coro::Task<Publisher::SubscribeResult> MoQAudioPublisher::subscribe(
   }
 
   XLOG(ERR) << "Unknown track " << sub.fullTrackName;
-  co_return folly::makeUnexpected(SubscribeError{
-      sub.requestID, SubscribeErrorCode::TRACK_NOT_EXIST, "Unknown track"});
+  co_return folly::makeUnexpected(
+      SubscribeError{
+          sub.requestID, SubscribeErrorCode::TRACK_NOT_EXIST, "Unknown track"});
 }
 
 void MoQAudioPublisher::publishAudioFrame(
@@ -283,13 +295,13 @@ void MoQAudioPublisher::publishAudioFrameToMoQ(
     return;
   }
 
-  ObjectHeader objHeader = ObjectHeader{
-      /*groupIn=*/id,
-      /*subgroupIn=*/0,
-      /*idIn=*/0,
-      AUDIO_STREAM_PRIORITY,
-      ObjectStatus::NORMAL,
-      Extensions(std::move(moqMiObj->extensions), {})};
+  ObjectHeader objHeader =
+      ObjectHeader{/*groupIn=*/id,
+                   /*subgroupIn=*/0,
+                   /*idIn=*/0,
+                   AUDIO_STREAM_PRIORITY,
+                   ObjectStatus::NORMAL,
+                   Extensions(std::move(moqMiObj->extensions), {})};
 
   if (auto res = audioTrackPublisher_->objectStream(
           objHeader, std::move(moqMiObj->payload));
@@ -316,13 +328,12 @@ void MoQAudioPublisher::endPublish() {
         } else {
           uint64_t grp = self->audioSeqId_++;
           XLOG(INFO) << "EOU sync publish: group=" << grp << " id=0";
-          ObjectHeader hdr{
-              /*groupIn=*/grp,
-              /*subgroupIn=*/0,
-              /*idIn=*/0,
-              AUDIO_STREAM_PRIORITY,
-              ObjectStatus::NORMAL,
-              /*extensionsIn=*/{}};
+          ObjectHeader hdr{/*groupIn=*/grp,
+                           /*subgroupIn=*/0,
+                           /*idIn=*/0,
+                           AUDIO_STREAM_PRIORITY,
+                           ObjectStatus::NORMAL,
+                           /*extensionsIn=*/{}};
           Payload emptyPayload;
           auto res = self->audioTrackPublisher_->objectStream(
               hdr, std::move(emptyPayload));
@@ -386,13 +397,12 @@ void MoQAudioPublisher::signalEndOfUtterance(uint64_t clientReleaseUs) {
       // Construct zero-length AUDIO control marker with explicit length=0
       uint64_t grp = self->audioSeqId_++;
       XLOG(INFO) << "EOU publish: group=" << grp << " id=0";
-      ObjectHeader hdr{
-          /*groupIn=*/grp,
-          /*subgroupIn=*/0,
-          /*idIn=*/0,
-          AUDIO_STREAM_PRIORITY,
-          ObjectStatus::NORMAL,
-          /*extensionsIn=*/{}};
+      ObjectHeader hdr{/*groupIn=*/grp,
+                       /*subgroupIn=*/0,
+                       /*idIn=*/0,
+                       AUDIO_STREAM_PRIORITY,
+                       ObjectStatus::NORMAL,
+                       /*extensionsIn=*/{}};
       // Optionally stamp client release timestamp (disabled in hack sample)
       (void)clientReleaseUs;
       // Null payload yields length==0 on wire

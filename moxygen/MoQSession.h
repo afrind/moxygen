@@ -12,6 +12,8 @@
 #include <moxygen/events/MoQExecutor.h>
 
 #include <folly/MaybeManagedPtr.h>
+#include <folly/Optional.h>
+#include <folly/container/F14Map.h>
 #include <folly/coro/Promise.h>
 #include <folly/coro/Task.h>
 #include <folly/logging/xlog.h>
@@ -63,7 +65,7 @@ class MoQSession : public Subscriber,
     virtual ~ServerSetupCallback() = default;
     virtual folly::Try<ServerSetup> onClientSetup(
         ClientSetup clientSetup,
-        std::shared_ptr<MoQSession> session) = 0;
+        const std::shared_ptr<MoQSession>& session) = 0;
 
     // Authority validation callback - returns error code if validation fails
     virtual folly::Expected<folly::Unit, SessionCloseErrorCode>
@@ -149,6 +151,8 @@ class MoQSession : public Subscriber,
     return maxRequestID_;
   }
 
+  void validateAndSetVersionFromAlpn(const std::string& alpn);
+
   static GroupOrder resolveGroupOrder(GroupOrder pubOrder, GroupOrder subOrder);
 
   static std::string getMoQTImplementationString();
@@ -174,7 +178,7 @@ class MoQSession : public Subscriber,
       uint64_t joiningStart,
       uint8_t fetchPri,
       GroupOrder fetchOrder,
-      std::vector<TrackRequestParameter> fetchParams,
+      TrackRequestParameters fetchParams,
       std::shared_ptr<FetchConsumer> fetchCallback,
       FetchType fetchType);
 
@@ -242,6 +246,14 @@ class MoQSession : public Subscriber,
       groupOrder_ = groupOrder;
     }
 
+    folly::Optional<uint8_t> getPublisherPriority() const {
+      return publisherPriority_;
+    }
+
+    void setPublisherPriority(uint8_t priority) {
+      publisherPriority_ = priority;
+    }
+
     void setSession(MoQSession* session) {
       session_ = session;
     }
@@ -262,9 +274,6 @@ class MoQSession : public Subscriber,
       }
       return (bytesBuffered_ + numBytes <= bytesBufferedThreshold_);
     }
-
-    folly::Expected<folly::Unit, MoQPublishError> subscribeDone(
-        SubscribeDone subDone);
 
     void fetchComplete();
 
@@ -304,6 +313,7 @@ class MoQSession : public Subscriber,
     uint64_t version_;
     uint64_t bytesBuffered_{0};
     uint64_t bytesBufferedThreshold_{0};
+    folly::Optional<uint8_t> publisherPriority_;
   };
 
   void onNewUniStream(proxygen::WebTransport::StreamReadHandle* rh) override;
@@ -335,7 +345,7 @@ class MoQSession : public Subscriber,
   // Making this public temporarily until we have param management in a single
   // place
   static folly::Optional<uint64_t> getDeliveryTimeoutIfPresent(
-      const std::vector<TrackRequestParameter>& params,
+      const TrackRequestParameters& params,
       uint64_t version);
 
  private:
@@ -364,11 +374,11 @@ class MoQSession : public Subscriber,
   folly::coro::Task<void> handleSubscribe(
       SubscribeRequest sub,
       std::shared_ptr<TrackPublisherImpl> trackPublisher);
-  std::shared_ptr<TrackConsumer> subscribeOk(const SubscribeOk& subOk);
+  void sendSubscribeOk(const SubscribeOk& subOk);
   void subscribeError(const SubscribeError& subErr);
   void unsubscribe(const Unsubscribe& unsubscribe);
   void subscribeUpdate(const SubscribeUpdate& subUpdate);
-  void subscribeDone(const SubscribeDone& subDone);
+  void sendSubscribeDone(const SubscribeDone& subDone);
 
   folly::coro::Task<void> handleFetch(
       Fetch fetch,
@@ -391,6 +401,7 @@ class MoQSession : public Subscriber,
   void onSubscribe(SubscribeRequest subscribeRequest) override;
   void onSubscribeUpdate(SubscribeUpdate subscribeUpdate) override;
   void onSubscribeOk(SubscribeOk subscribeOk) override;
+  void onRequestOk(RequestOk requestOk, FrameType frameType) override;
   void onRequestError(RequestError requestError, FrameType frameType) override;
   void onUnsubscribe(Unsubscribe unsubscribe) override;
   void onPublish(PublishRequest publish) override;
@@ -409,12 +420,9 @@ class MoQSession : public Subscriber,
 
   // Announcement callback methods - default implementations for simple clients
   void onAnnounce(Announce announce) override;
-  void onAnnounceOk(AnnounceOk announceOk) override;
   void onUnannounce(Unannounce unannounce) override;
   void onAnnounceCancel(AnnounceCancel announceCancel) override;
   void onSubscribeAnnounces(SubscribeAnnounces subscribeAnnounces) override;
-  void onSubscribeAnnouncesOk(
-      SubscribeAnnouncesOk subscribeAnnouncesOk) override;
   void onUnsubscribeAnnounces(
       UnsubscribeAnnounces unsubscribeAnnounces) override;
   void removeSubscriptionState(TrackAlias alias, RequestID id);
@@ -426,14 +434,19 @@ class MoQSession : public Subscriber,
   // Get the max requestID from the setup params. If MAX_REQUEST_ID key
   // is not present, we default to 0 as specified. 0 means that the peer
   // MUST NOT create any subscriptions
-  static uint64_t getMaxRequestIDIfPresent(
-      const std::vector<SetupParameter>& params);
+  static uint64_t getMaxRequestIDIfPresent(const SetupParameters& params);
   static uint64_t getMaxAuthTokenCacheSizeIfPresent(
-      const std::vector<SetupParameter>& params);
+      const SetupParameters& params);
   static folly::Optional<std::string> getMoQTImplementationIfPresent(
-      const std::vector<SetupParameter>& params);
+      const SetupParameters& params);
   static bool shouldIncludeMoqtImplementationParam(
       const std::vector<uint64_t>& supportedVersions);
+  void setPublisherPriorityFromParams(
+      const TrackRequestParameters& params,
+      const std::shared_ptr<TrackPublisherImpl>& trackPublisher);
+  void setPublisherPriorityFromParams(
+      const TrackRequestParameters& params,
+      const std::shared_ptr<SubscribeTrackReceiveState>& trackPublisher);
 
  protected:
   // Protected members and methods for MoQRelaySession subclass access
@@ -472,7 +485,7 @@ class MoQSession : public Subscriber,
   }
   void deliverBufferedData(TrackAlias trackAlias);
   void aliasifyAuthTokens(
-      std::vector<Parameter>& params,
+      Parameters& params,
       const folly::Optional<uint64_t>& forceVersion = folly::none);
   RequestID getNextRequestID();
   void setRequestSession() {
@@ -600,22 +613,30 @@ class MoQSession : public Subscriber,
                                             : nullptr;
     }
 
-    FrameType getFrameType() const {
+    FrameType getFrameType(bool ok) const {
       switch (type_) {
         case Type::SUBSCRIBE_TRACK:
-          return FrameType::SUBSCRIBE_ERROR;
+          return ok ? FrameType::SUBSCRIBE_OK : FrameType::SUBSCRIBE_ERROR;
         case Type::PUBLISH:
-          return FrameType::PUBLISH_ERROR;
+          return ok ? FrameType::PUBLISH_OK : FrameType::PUBLISH_ERROR;
         case Type::TRACK_STATUS:
-          return FrameType::TRACK_STATUS;
+          return ok ? FrameType::TRACK_STATUS_OK : FrameType::TRACK_STATUS;
         case Type::FETCH:
-          return FrameType::FETCH_ERROR;
+          return ok ? FrameType::FETCH_OK : FrameType::FETCH_ERROR;
         case Type::ANNOUNCE:
-          return FrameType::ANNOUNCE_ERROR;
+          return ok ? FrameType::ANNOUNCE_OK : FrameType::ANNOUNCE_ERROR;
         case Type::SUBSCRIBE_ANNOUNCES:
-          return FrameType::SUBSCRIBE_ANNOUNCES_ERROR;
+          return ok ? FrameType::SUBSCRIBE_ANNOUNCES_OK
+                    : FrameType::SUBSCRIBE_ANNOUNCES_ERROR;
       }
       folly::assume_unreachable();
+    }
+    FrameType getOkFrameType() const {
+      return getFrameType(true);
+    }
+
+    FrameType getErrorFrameType() const {
+      return getFrameType(false);
     }
 
     virtual folly::Expected<Type, folly::Unit> setError(
@@ -688,7 +709,7 @@ class MoQSession : public Subscriber,
   MoQSessionCloseCallback* closeCallback_{nullptr};
   MoQSettings moqSettings_;
 
-  folly::Optional<uint64_t> negotiatedVersion_{0};
+  folly::Optional<uint64_t> negotiatedVersion_;
   MoQControlCodec controlCodec_;
   MoQTokenCache tokenCache_{1024};
 };

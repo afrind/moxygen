@@ -66,11 +66,12 @@ class MoQRelay : public Publisher,
     explicit AnnounceNode(MoQRelay& relay) : relay_(relay) {}
 
     void unannounce() override {
-      relay_.unannounce(announceOk().trackNamespace, this);
+      relay_.unannounce(trackNamespace_, this);
     }
 
     using Subscriber::AnnounceHandle::setAnnounceOk;
 
+    TrackNamespace trackNamespace_;
     folly::F14FastMap<std::string, std::shared_ptr<AnnounceNode>> children;
 
     // Maps a track name to a the session performing the PUBLISH
@@ -83,6 +84,7 @@ class MoQRelay : public Publisher,
             announcements;
     // The session that ANNOUNCEd this node
     std::shared_ptr<MoQSession> sourceSession;
+    std::shared_ptr<AnnounceCallback> announceCallback;
 
     MoQRelay& relay_;
   };
@@ -111,6 +113,7 @@ class MoQRelay : public Publisher,
   };
 
   void onEmpty(MoQForwarder* forwarder) override;
+  void forwardChanged(MoQForwarder* forwarder) override;
 
   folly::coro::Task<void> announceToSession(
       std::shared_ptr<MoQSession> session,

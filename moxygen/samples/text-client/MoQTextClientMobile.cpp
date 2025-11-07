@@ -46,6 +46,14 @@ DEFINE_bool(
     false,
     "If client will unsubscribe from PUBLISH track after a specified time");
 DEFINE_uint64(unsubscribe_time, 30, "Time to unsubscribe in seconds");
+DEFINE_bool(
+    use_legacy_setup,
+    false,
+    "If true, use only moq-00 ALPN (legacy). If false, use both moqt-15 and moq-00");
+DEFINE_uint64(
+    delivery_timeout,
+    0,
+    "Delivery timeout in milliseconds (0 = disabled)");
 
 namespace {
 using namespace moxygen;
@@ -195,12 +203,19 @@ class MoQTextClientMobile
     auto g =
         folly::makeGuard([func = __func__] { XLOG(INFO) << "exit " << func; });
     try {
+      std::vector<std::string> alpns;
+      if (FLAGS_use_legacy_setup) {
+        alpns = {std::string(kAlpnMoqtLegacy)};
+      } else {
+        alpns = {std::string(kAlpnMoqtDraft15), std::string(kAlpnMoqtLegacy)};
+      }
       co_await moqClient_->setupMoQSession(
           std::chrono::milliseconds(FLAGS_connect_timeout),
           std::chrono::seconds(FLAGS_transaction_timeout),
           /*publishHandler=*/nullptr,
           /*subscribeHandler=*/shared_from_this(),
-          quic::TransportSettings());
+          quic::TransportSettings(),
+          alpns);
 
       if (FLAGS_publish) {
         SubscribeAnnounces subAnn{
@@ -324,8 +339,7 @@ class MoQTextClientMobile
     // text client doesn't expect server or relay to announce anything,
     // but announce OK anyways
     return folly::coro::makeTask<AnnounceResult>(
-        std::make_shared<AnnounceHandle>(AnnounceOk{
-            announce.requestID, std::move(announce.trackNamespace)}));
+        std::make_shared<AnnounceHandle>(AnnounceOk{announce.requestID, {}}));
   }
 
   void goaway(Goaway goaway) override {
@@ -398,17 +412,26 @@ int main(int argc, char* argv[]) {
       moqEvb, std::move(url), moxygen::FullTrackName({ns, FLAGS_track_name}));
 
   auto subParams = flags2params();
+  TrackRequestParameters params;
+  if (FLAGS_delivery_timeout > 0) {
+    params.insertParam(
+        {folly::to_underlying(TrackRequestParamKey::DELIVERY_TIMEOUT),
+         "",
+         FLAGS_delivery_timeout,
+         {}});
+  }
   co_withExecutor(
       moqEvb.get(),
-      textClient->run(SubscribeRequest::make(
-          moxygen::FullTrackName({std::move(ns), FLAGS_track_name}),
-          0,
-          GroupOrder::OldestFirst,
-          FLAGS_forward,
-          subParams.locType,
-          subParams.start,
-          subParams.endGroup,
-          {})))
+      textClient->run(
+          SubscribeRequest::make(
+              moxygen::FullTrackName({std::move(ns), FLAGS_track_name}),
+              0,
+              GroupOrder::OldestFirst,
+              FLAGS_forward,
+              subParams.locType,
+              subParams.start,
+              subParams.endGroup,
+              std::move(params))))
       .start()
       .via(moqEvb.get());
 

@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include <fizz/protocol/CertificateVerifier.h>
 #include <folly/CancellationToken.h>
 #include <folly/io/async/ScopedEventBaseThread.h>
 #include <folly/synchronization/Baton.h>
@@ -46,7 +47,9 @@ class MoQVideoPublisher
   // so that the publisher session can also accept inbound PUBLISH (e.g., echo)
   bool setup(
       const std::string& connectURL,
-      std::shared_ptr<Subscriber> subscriber = nullptr);
+      std::shared_ptr<Subscriber> subscriber = nullptr,
+      bool useLegacySetup = false,
+      std::shared_ptr<fizz::CertificateVerifier> verifier = nullptr);
 
   /**
    * Publishes a single frame of the video stream.

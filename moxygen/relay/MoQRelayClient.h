@@ -20,11 +20,15 @@ class MoQRelayClient {
       : moqClient_(std::move(moqClient)) {}
 
   // Convenience constructor for QUIC transport with relay session
-  MoQRelayClient(std::shared_ptr<MoQExecutor> exec, proxygen::URL url)
-      : moqClient_(std::make_unique<MoQClient>(
-            std::move(exec),
-            std::move(url),
-            MoQRelaySession::createRelaySessionFactory())) {}
+  MoQRelayClient(
+      std::shared_ptr<MoQExecutor> exec,
+      proxygen::URL url,
+      std::shared_ptr<fizz::CertificateVerifier> verifier = nullptr)
+      : moqClient_(
+            std::make_unique<MoQClient>(
+                std::move(exec),
+                std::move(url),
+                MoQRelaySession::createRelaySessionFactory())) {}
 
   folly::coro::Task<void> setup(
       std::shared_ptr<Publisher> publisher,
@@ -32,13 +36,15 @@ class MoQRelayClient {
       std::chrono::milliseconds connectTimeout = std::chrono::seconds(5),
       std::chrono::milliseconds transactionTimeout = std::chrono::seconds(60),
       const quic::TransportSettings& transportSettings =
-          quic::TransportSettings()) {
+          quic::TransportSettings(),
+      const std::vector<std::string>& alpns = {}) {
     co_await moqClient_->setupMoQSession(
         connectTimeout,
         transactionTimeout,
         std::move(publisher),
         std::move(subscriber),
-        transportSettings);
+        transportSettings,
+        alpns);
   }
 
   folly::coro::Task<void> run(

@@ -47,12 +47,13 @@ std::shared_ptr<MoQRelay::AnnounceNode> MoQRelay::findNamespaceNode(
 
 folly::coro::Task<Subscriber::AnnounceResult> MoQRelay::announce(
     Announce ann,
-    std::shared_ptr<Subscriber::AnnounceCallback>) {
+    std::shared_ptr<Subscriber::AnnounceCallback> callback) {
   XLOG(DBG1) << __func__ << " ns=" << ann.trackNamespace;
   // check auth
   if (!ann.trackNamespace.startsWith(allowedNamespacePrefix_)) {
-    co_return folly::makeUnexpected(AnnounceError{
-        ann.requestID, AnnounceErrorCode::UNINTERESTED, "bad namespace"});
+    co_return folly::makeUnexpected(
+        AnnounceError{
+            ann.requestID, AnnounceErrorCode::UNINTERESTED, "bad namespace"});
   }
   std::vector<std::shared_ptr<MoQSession>> sessions;
   auto nodePtr = findNamespaceNode(
@@ -61,10 +62,40 @@ folly::coro::Task<Subscriber::AnnounceResult> MoQRelay::announce(
       MatchType::Exact,
       &sessions);
 
+  // Log if there is already a session that has announced this track
+  if (nodePtr->sourceSession) {
+    XLOG(WARNING) << "Announce: Existing session ("
+                  << nodePtr->sourceSession.get()
+                  << ") has already announced trackNamespace="
+                  << ann.trackNamespace;
+    // Since we don't fully support multiple publishers -- cancel the old
+    // announcement and remove ongoing subscriptions to this publisher
+    // in that namespace.  Note: it could have announced a more specific
+    // namespace which hasn't been overridden by the new publisher, but
+    // for now we don't support that.
+    nodePtr->announceCallback->announceCancel(
+        AnnounceErrorCode::CANCELLED, "New publisher");
+    nodePtr->announceCallback.reset();
+    for (auto it = subscriptions_.begin(); it != subscriptions_.end();) {
+      // Check if the subscription's FullTrackName is in this namespace
+      if (it->first.trackNamespace.startsWith(ann.trackNamespace) &&
+          it->second.upstream == nodePtr->sourceSession) {
+        XLOG(DBG4) << "Erasing subscription to " << it->first;
+        it = subscriptions_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+
+    nodePtr->sourceSession.reset();
+  }
+
   // TODO: store auth for forwarding on future SubscribeAnnounces?
   auto session = MoQSession::getRequestSession();
   nodePtr->sourceSession = std::move(session);
-  nodePtr->setAnnounceOk({ann.requestID, ann.trackNamespace});
+  nodePtr->announceCallback = std::move(callback);
+  nodePtr->trackNamespace_ = ann.trackNamespace;
+  nodePtr->setAnnounceOk({ann.requestID, {}});
   for (auto& outSession : sessions) {
     if (outSession != session) {
       auto exec = outSession->getExecutor();
@@ -94,6 +125,7 @@ void MoQRelay::unannounce(const TrackNamespace& trackNamespace, AnnounceNode*) {
   auto nodePtr = findNamespaceNode(trackNamespace);
   XCHECK(nodePtr);
   nodePtr->sourceSession = nullptr;
+  nodePtr->announceCallback.reset();
   for (auto& announcement : nodePtr->announcements) {
     auto exec = announcement.first->getExecutor();
     exec->add([announceHandle = announcement.second] {
@@ -109,8 +141,9 @@ Subscriber::PublishResult MoQRelay::publish(
     std::shared_ptr<Publisher::SubscriptionHandle> handle) {
   XLOG(DBG1) << __func__ << " ns=" << pub.fullTrackName.trackNamespace;
   if (!pub.fullTrackName.trackNamespace.startsWith(allowedNamespacePrefix_)) {
-    return folly::makeUnexpected(PublishError{
-        pub.requestID, PublishErrorCode::UNINTERESTED, "bad namespace"});
+    return folly::makeUnexpected(
+        PublishError{
+            pub.requestID, PublishErrorCode::UNINTERESTED, "bad namespace"});
   }
 
   if (pub.fullTrackName.trackNamespace.empty()) {
@@ -142,6 +175,7 @@ Subscriber::PublishResult MoQRelay::publish(
          SubscribeDoneStatusCode::SUBSCRIPTION_ENDED,
          0, // filled in by session
          "upstream disconnect"});
+    XLOG(DBG4) << "Erasing subscription to " << it->first;
     subscriptions_.erase(it);
   }
   auto session = MoQSession::getRequestSession();
@@ -154,6 +188,13 @@ Subscriber::PublishResult MoQRelay::publish(
 
   // Set Forwarder Params
   forwarder->setGroupOrder(pub.groupOrder);
+
+  // Extract delivery timeout from publish request params and store in forwarder
+  auto deliveryTimeout = MoQSession::getDeliveryTimeoutIfPresent(
+      pub.params, session->getNegotiatedVersion().value());
+  if (deliveryTimeout && *deliveryTimeout > 0) {
+    forwarder->setDeliveryTimeout(*deliveryTimeout);
+  }
 
   auto subRes = subscriptions_.emplace(
       std::piecewise_construct,
@@ -228,6 +269,19 @@ folly::coro::Task<void> MoQRelay::publishToSession(
   subscriber->range =
       toSubscribeRange(pubOk.start, end, pubOk.locType, forwarder->largest());
   subscriber->shouldForward = pubOk.forward;
+
+  // Extract delivery timeout from upstream PUBLISH_OK and propagate to
+  // subscriber
+  auto deliveryTimeout = MoQSession::getDeliveryTimeoutIfPresent(
+      pubOk.params, session->getNegotiatedVersion().value());
+  if (deliveryTimeout && *deliveryTimeout > 0) {
+    forwarder->setDeliveryTimeout(*deliveryTimeout);
+    subscriber->setParam(
+        {folly::to_underlying(TrackRequestParamKey::DELIVERY_TIMEOUT),
+         "",
+         *deliveryTimeout,
+         {}});
+  }
 }
 
 class MoQRelay::AnnouncesSubscription
@@ -236,15 +290,16 @@ class MoQRelay::AnnouncesSubscription
   AnnouncesSubscription(
       std::shared_ptr<MoQRelay> relay,
       std::shared_ptr<MoQSession> session,
-      SubscribeAnnouncesOk ok)
+      SubscribeAnnouncesOk ok,
+      TrackNamespace trackNamespacePrefix)
       : Publisher::SubscribeAnnouncesHandle(std::move(ok)),
         relay_(std::move(relay)),
-        session_(std::move(session)) {}
+        session_(std::move(session)),
+        trackNamespacePrefix_(std::move(trackNamespacePrefix)) {}
 
   void unsubscribeAnnounces() override {
     if (relay_) {
-      relay_->unsubscribeAnnounces(
-          subscribeAnnouncesOk_->trackNamespacePrefix, std::move(session_));
+      relay_->unsubscribeAnnounces(trackNamespacePrefix_, std::move(session_));
       relay_.reset();
     }
   }
@@ -252,6 +307,7 @@ class MoQRelay::AnnouncesSubscription
  private:
   std::shared_ptr<MoQRelay> relay_;
   std::shared_ptr<MoQSession> session_;
+  TrackNamespace trackNamespacePrefix_;
 };
 
 folly::coro::Task<Publisher::SubscribeAnnouncesResult>
@@ -259,10 +315,11 @@ MoQRelay::subscribeAnnounces(SubscribeAnnounces subNs) {
   XLOG(DBG1) << __func__ << " nsp=" << subNs.trackNamespacePrefix;
   // check auth
   if (subNs.trackNamespacePrefix.empty()) {
-    co_return folly::makeUnexpected(SubscribeAnnouncesError{
-        subNs.requestID,
-        SubscribeAnnouncesErrorCode::NAMESPACE_PREFIX_UNKNOWN,
-        "empty"});
+    co_return folly::makeUnexpected(
+        SubscribeAnnouncesError{
+            subNs.requestID,
+            SubscribeAnnouncesErrorCode::NAMESPACE_PREFIX_UNKNOWN,
+            "empty"});
   }
   auto session = MoQSession::getRequestSession();
   auto nodePtr = findNamespaceNode(
@@ -328,7 +385,8 @@ MoQRelay::subscribeAnnounces(SubscribeAnnounces subNs) {
   co_return std::make_shared<AnnouncesSubscription>(
       shared_from_this(),
       std::move(session),
-      SubscribeAnnouncesOk{subNs.requestID, subNs.trackNamespacePrefix});
+      SubscribeAnnouncesOk{subNs.requestID, {}},
+      subNs.trackNamespacePrefix);
 }
 
 void MoQRelay::unsubscribeAnnounces(
@@ -412,15 +470,18 @@ folly::coro::Task<Publisher::SubscribeResult> MoQRelay::subscribe(
       auto it = subscriptions_.find(trackName);
       if (it != subscriptions_.end()) {
         it->second.promise.setException(std::runtime_error("failed"));
+        XLOG(DBG4) << "Erasing subscription to " << it->first;
         subscriptions_.erase(it);
       }
     });
     // Add subscriber first in case objects come before subscribe OK.
+    auto sessionVersion = session->getNegotiatedVersion();
     auto subscriber = forwarder->addSubscriber(
         std::move(session), subReq, std::move(consumer));
     // As per the spec, we must set forward = true in the subscribe request
     // to the upstream.
-    subReq.forward = true;
+    // But should we if this is forward=0?
+    subReq.forward = forwarder->numForwardingSubscribers() > 0;
 
     emplaceRes.first->second.requestID = upstreamSession->peekNextRequestID();
     auto subRes = co_await upstreamSession->subscribe(
@@ -432,6 +493,7 @@ folly::coro::Task<Publisher::SubscribeResult> MoQRelay::subscribe(
            folly::to<std::string>(
                "upstream subscribe failed: ", subRes.error().reasonPhrase)}));
     }
+    // is it more correct to co_await folly::coro::co_safe_point here?
     g.dismiss();
     auto largest = subRes.value()->subscribeOk().largest;
     if (largest) {
@@ -440,9 +502,32 @@ folly::coro::Task<Publisher::SubscribeResult> MoQRelay::subscribe(
     }
     auto pubGroupOrder = subRes.value()->subscribeOk().groupOrder;
     forwarder->setGroupOrder(pubGroupOrder);
+
+    // Store upstream delivery timeout in forwarder
+    auto deliveryTimeout = MoQSession::getDeliveryTimeoutIfPresent(
+        subRes.value()->subscribeOk().params, sessionVersion.value());
+
+    // Add delivery timeout to downstream subscriber explicitly as this is the
+    // first subscriber. Forwarder can add it to subsequent subscribers
+    if (deliveryTimeout && *deliveryTimeout > 0) {
+      forwarder->setDeliveryTimeout(*deliveryTimeout);
+      subscriber->setParam(
+          {folly::to_underlying(TrackRequestParamKey::DELIVERY_TIMEOUT),
+           "",
+           *deliveryTimeout,
+           {}});
+    }
+
     subscriber->setPublisherGroupOrder(pubGroupOrder);
     auto it = subscriptions_.find(subReq.fullTrackName);
-    XCHECK(it != subscriptions_.end());
+    // There are cases that remove the subscription like failing to
+    // publish a datagram that was received before the subscribeOK
+    // and then gets flushed
+    if (it == subscriptions_.end()) {
+      XLOG(ERR) << "Subscription is GONE, returning exception";
+      co_yield folly::coro::co_error(
+          std::runtime_error("subscription is gone"));
+    }
     auto& rsub = it->second;
     rsub.requestID = subRes.value()->subscribeOk().requestID;
     rsub.handle = std::move(subRes.value());
@@ -457,14 +542,29 @@ folly::coro::Task<Publisher::SubscribeResult> MoQRelay::subscribe(
     auto& forwarder = subscriptionIt->second.forwarder;
     if (forwarder->largest() && subReq.locType == LocationType::AbsoluteRange &&
         subReq.endGroup < forwarder->largest()->group) {
-      co_return folly::makeUnexpected(SubscribeError{
-          subReq.requestID,
-          SubscribeErrorCode::INVALID_RANGE,
-          "Range in the past, use FETCH"});
+      co_return folly::makeUnexpected(
+          SubscribeError{
+              subReq.requestID,
+              SubscribeErrorCode::INVALID_RANGE,
+              "Range in the past, use FETCH"});
       // start may be in the past, it will get adjusted forward to largest
     }
-    co_return subscriptionIt->second.forwarder->addSubscriber(
+    bool forwarding =
+        subscriptionIt->second.forwarder->numForwardingSubscribers() > 0;
+    auto subscriber = subscriptionIt->second.forwarder->addSubscriber(
         std::move(session), subReq, std::move(consumer));
+    if (!forwarding &&
+        subscriptionIt->second.forwarder->numForwardingSubscribers() > 0) {
+      subscriptionIt->second.handle->subscribeUpdate(
+          {RequestID(0),
+           subscriptionIt->second.handle->subscribeOk().requestID,
+           kLocationMin,
+           kLocationMax.group,
+           kDefaultPriority,
+           /*forward=*/true,
+           {}});
+    }
+    co_return subscriber;
   }
 }
 
@@ -569,8 +669,33 @@ void MoQRelay::onEmpty(MoQForwarder* forwarder) {
       }
     }
     if (!subscription.isPublish) {
+      XLOG(DBG4) << "Erasing subscription to " << subscriptionIt->first;
       subscriptionIt = subscriptions_.erase(subscriptionIt);
     }
+    return;
+  }
+}
+
+void MoQRelay::forwardChanged(MoQForwarder* forwarder) {
+  // TODO: we shouldn't need a linear search if forwarder stores FullTrackName
+  for (auto subscriptionIt = subscriptions_.begin();
+       subscriptionIt != subscriptions_.end();
+       ++subscriptionIt) {
+    auto& subscription = subscriptionIt->second;
+    if (subscription.forwarder.get() != forwarder) {
+      continue;
+    }
+    XLOG(INFO) << "Updating forward for " << subscriptionIt->first
+               << " numForwardingSubs="
+               << forwarder->numForwardingSubscribers();
+    subscription.handle->subscribeUpdate(
+        {RequestID(0),
+         subscription.handle->subscribeOk().requestID,
+         kLocationMin,
+         kLocationMax.group,
+         kDefaultPriority,
+         /*forward=*/forwarder->numForwardingSubscribers() > 0,
+         {}});
     return;
   }
 }
@@ -599,6 +724,7 @@ void MoQRelay::removeSession(const std::shared_ptr<MoQSession>& session) {
     if (nodePtr->sourceSession == session) {
       // This session is unannouncing
       nodePtr->sourceSession = nullptr;
+      nodePtr->announceCallback.reset();
       for (auto& announcement : nodePtr->announcements) {
         auto exec = announcement.first->getExecutor();
         exec->add([announceHandle = announcement.second] {
@@ -638,6 +764,7 @@ void MoQRelay::removeSession(const std::shared_ptr<MoQSession>& session) {
            0, // filled in by session
            "upstream disconnect"});
       if (isPublish) {
+        XLOG(DBG4) << "Erasing subscription to " << curIt->first;
         subscriptions_.erase(curIt);
       }
     } else {

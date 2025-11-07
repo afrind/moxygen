@@ -30,18 +30,24 @@ class MoQClientBase : public proxygen::WebTransportHandler {
       folly::MaybeManagedPtr<proxygen::WebTransport>,
       std::shared_ptr<MoQExecutor>)>;
 
-  MoQClientBase(std::shared_ptr<MoQExecutor> exec, proxygen::URL url)
+  MoQClientBase(
+      std::shared_ptr<MoQExecutor> exec,
+      proxygen::URL url,
+      std::shared_ptr<fizz::CertificateVerifier> verifier = nullptr)
       : exec_(std::move(exec)),
         url_(std::move(url)),
-        sessionFactory_(defaultSessionFactory()) {}
+        sessionFactory_(defaultSessionFactory()),
+        verifier_(std::move(verifier)) {}
 
   MoQClientBase(
       std::shared_ptr<MoQExecutor> exec,
       proxygen::URL url,
-      SessionFactory sessionFactory)
+      SessionFactory sessionFactory,
+      std::shared_ptr<fizz::CertificateVerifier> verifier = nullptr)
       : exec_(std::move(exec)),
         url_(std::move(url)),
-        sessionFactory_(std::move(sessionFactory)) {}
+        sessionFactory_(std::move(sessionFactory)),
+        verifier_(std::move(verifier)) {}
 
   std::shared_ptr<MoQExecutor> getEventBase() {
     return exec_;
@@ -53,7 +59,8 @@ class MoQClientBase : public proxygen::WebTransportHandler {
       std::chrono::milliseconds transaction_timeout,
       std::shared_ptr<Publisher> publishHandler,
       std::shared_ptr<Subscriber> subscribeHandler,
-      const quic::TransportSettings& transportSettings) noexcept;
+      const quic::TransportSettings& transportSettings,
+      const std::vector<std::string>& alpns = {}) noexcept;
 
   void setLogger(const std::shared_ptr<MLogger>& logger);
 
@@ -68,7 +75,7 @@ class MoQClientBase : public proxygen::WebTransportHandler {
       folly::SocketAddress connectAddr,
       std::chrono::milliseconds timeoutMs,
       std::shared_ptr<fizz::CertificateVerifier> verifier,
-      std::string alpn,
+      const std::vector<std::string>& alpns,
       const quic::TransportSettings& transportSettings) = 0;
 
   virtual std::shared_ptr<MoQSession> createSession(
@@ -94,6 +101,8 @@ class MoQClientBase : public proxygen::WebTransportHandler {
   proxygen::URL url_;
   SessionFactory sessionFactory_;
   std::shared_ptr<proxygen::QuicWebTransport> quicWebTransport_;
+  folly::Optional<std::string> negotiatedProtocol_;
+  std::shared_ptr<fizz::CertificateVerifier> verifier_;
 };
 
 } // namespace moxygen
