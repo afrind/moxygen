@@ -20,6 +20,7 @@ include(CMakeFindDependencyMacro)
 find_dependency(folly)
 find_dependency(wangle)
 find_dependency(mvfst)
+find_dependency(picoquic)
 find_dependency(proxygen)
 
 if(NOT TARGET moxygen::moxygen)
