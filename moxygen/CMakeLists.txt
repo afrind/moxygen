@@ -152,6 +152,7 @@ target_link_libraries(
 
 add_subdirectory(mlog)
 add_subdirectory(relay)
+add_subdirectory(transports)
 # TODO: Fails with compiler error in ubuntu P1361252588
 # add_subdirectory(samples/chat)
 add_subdirectory(samples/text-client)
