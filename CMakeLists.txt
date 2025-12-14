@@ -30,6 +30,10 @@ option(BUILD_SHARED_LIBS
   a stable ABI."
   OFF
 )
+option(ENABLE_ASAN
+  "If enabled, build with AddressSanitizer (ASAN) for memory error detection"
+  OFF
+)
 
 # Mark BUILD_SHARED_LIBS as an "advanced" option, since enabling it
 # is generally discouraged.
@@ -88,6 +92,14 @@ endif()
 CHECK_CXX_COMPILER_FLAG(-Wunused-value COMPILER_HAS_W_UNUSED_VALUE)
 if (COMPILER_HAS_W_UNUSED_VALUE)
     list(APPEND _MOXYGEN_COMMON_COMPILE_OPTIONS -Wno-unused-value)
+endif()
+
+# AddressSanitizer support
+if (ENABLE_ASAN)
+    message(STATUS "Building with AddressSanitizer (ASAN) enabled")
+    list(APPEND _MOXYGEN_COMMON_COMPILE_OPTIONS -fsanitize=address -fno-omit-frame-pointer)
+    set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -fsanitize=address")
+    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -fsanitize=address")
 endif()
 
 include(MoxygenTest)
