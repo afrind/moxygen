@@ -2,6 +2,7 @@ add_library(
   moqtransports STATIC
   PicoQuicExecutor.cpp
   PicoQuicWebTransport.cpp
+  MoQPicoQuicServer.cpp
 )
 
 # Filter out non-existent picoquic libraries (e.g., picotls-fusion which may not be built)
