@@ -15,6 +15,7 @@
 #include <moxygen/mlog/FileMLoggerFactory.h>
 #include <moxygen/relay/MoQForwarder.h>
 #include <moxygen/relay/MoQRelayClient.h>
+#include <moxygen/transports/MoQPicoQuicServer.h>
 #include <moxygen/util/InsecureVerifierDangerousDoNotUseInProduction.h>
 #include <moxygen/util/SignalHandler.h>
 #include <iomanip>
@@ -47,6 +48,10 @@ DEFINE_bool(
     false,
     "Use insecure verifier (skip certificate validation)");
 DEFINE_string(mlog_path, "", "Path to mlog file");
+DEFINE_string(
+    server_type,
+    "proxygen",
+    "Server type: 'proxygen' for MoQServer, 'pico' for MoQPicoQuicServer");
 
 namespace {
 using namespace moxygen;
@@ -556,6 +561,31 @@ class MoQDateServer : public MoQServer {
   std::shared_ptr<DatePublisher> publisher_;
 };
 
+// PicoQuicDateServer - Wrapper for MoQPicoQuicServer to manage DatePublisher
+class PicoQuicDateServer : public MoQPicoQuicServer {
+ public:
+  PicoQuicDateServer(
+      const std::string& cert,
+      const std::string& key,
+      const std::string& endpoint,
+      std::shared_ptr<DatePublisher> publisher)
+      : MoQPicoQuicServer(cert, key, endpoint),
+        publisher_(std::move(publisher)) {}
+
+  void onNewSession(std::shared_ptr<MoQSession> clientSession) override {
+    clientSession->setPublishHandler(publisher_);
+  }
+
+  void terminateClientSession(std::shared_ptr<MoQSession> session) override {
+    XLOG(INFO) << __func__;
+    publisher_->removeSubscriber(
+        std::move(session), folly::none, "terminateClientSession");
+  }
+
+ private:
+  std::shared_ptr<DatePublisher> publisher_;
+};
+
 std::unique_ptr<MoQRelayClient> createRelayClient(
     folly::EventBase* workerEvb,
     std::shared_ptr<DatePublisher> publisher,
@@ -649,43 +679,78 @@ int main(int argc, char* argv[]) {
   }
 
   folly::EventBase evb;
-  std::shared_ptr<MoQDateServer> server;
-
-  if (FLAGS_insecure) {
-    server = std::make_shared<MoQDateServer>(
-        quic::samples::createFizzServerContextWithInsecureDefault(
-            []() {
-              std::vector<std::string> alpns = {"h3"};
-              auto moqt = getDefaultMoqtProtocols(!FLAGS_use_legacy_setup);
-              alpns.insert(alpns.end(), moqt.begin(), moqt.end());
-              return alpns;
-            }(),
-            fizz::server::ClientAuthMode::None,
-            "" /* cert */,
-            "" /* key */),
-        "/moq-date",
-        publisher);
-  } else {
-    server = std::make_shared<MoQDateServer>(
-        FLAGS_cert, FLAGS_key, "/moq-date", publisher);
-  }
-
-  if (loggerFactory) {
-    server->setMLoggerFactory(loggerFactory);
-  }
-
   folly::SocketAddress addr("::", FLAGS_port);
-  server->start(addr);
-  server->waitUntilInitialized();
 
-  // Create relay client if relay URL is specified
+  // Server pointer and relay client (for proxygen server)
+  std::shared_ptr<MoQServerBase> server;
   std::unique_ptr<MoQRelayClient> relayClient;
-  if (!FLAGS_relay_url.empty()) {
-    relayClient =
-        createRelayClient(server->getWorkerEvbs()[0], publisher, loggerFactory);
-    if (!relayClient) {
-      return 1;
+
+  if (FLAGS_server_type == "pico") {
+    // PicoQuic server
+    if (!FLAGS_relay_url.empty()) {
+      XLOG(WARN)
+          << "Warning: PicoQuic server does not support relay client mode";
     }
+
+    auto picoServer = std::make_shared<PicoQuicDateServer>(
+        FLAGS_cert, FLAGS_key, "/moq-date", publisher);
+
+    if (loggerFactory) {
+      picoServer->setMLoggerFactory(loggerFactory);
+    }
+
+    server = picoServer;
+    server->start(addr);
+
+    XLOG(INFO) << "PicoQuic server running on port " << FLAGS_port
+               << ". Press Ctrl-C to stop.";
+
+  } else if (FLAGS_server_type == "proxygen") {
+    // Proxygen server
+    std::shared_ptr<MoQDateServer> proxygenServer;
+
+    if (FLAGS_insecure) {
+      proxygenServer = std::make_shared<MoQDateServer>(
+          quic::samples::createFizzServerContextWithInsecureDefault(
+              []() {
+                std::vector<std::string> alpns = {"h3"};
+                auto moqt = getDefaultMoqtProtocols(!FLAGS_use_legacy_setup);
+                alpns.insert(alpns.end(), moqt.begin(), moqt.end());
+                return alpns;
+              }(),
+              fizz::server::ClientAuthMode::None,
+              "" /* cert */,
+              "" /* key */),
+          "/moq-date",
+          publisher);
+    } else {
+      proxygenServer = std::make_shared<MoQDateServer>(
+          FLAGS_cert, FLAGS_key, "/moq-date", publisher);
+    }
+
+    if (loggerFactory) {
+      proxygenServer->setMLoggerFactory(loggerFactory);
+    }
+
+    server = proxygenServer;
+    server->start(addr);
+    proxygenServer->waitUntilInitialized();
+
+    // Create relay client if relay URL is specified
+    if (!FLAGS_relay_url.empty()) {
+      relayClient = createRelayClient(
+          proxygenServer->getWorkerEvbs()[0], publisher, loggerFactory);
+      if (!relayClient) {
+        return 1;
+      }
+    }
+
+    XLOG(INFO) << "Proxygen server running on port " << FLAGS_port;
+
+  } else {
+    XLOG(ERR) << "Invalid server_type: " << FLAGS_server_type
+              << ". Must be 'proxygen' or 'pico'";
+    return 1;
   }
 
   moxygen::SignalHandler handler(
