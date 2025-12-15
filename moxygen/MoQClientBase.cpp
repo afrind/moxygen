@@ -5,6 +5,7 @@
  */
 
 #include <fizz/protocol/CertificateVerifier.h>
+#include <folly/coro/Error.h>
 #include <quic/client/QuicClientTransport.h>
 #include <moxygen/MoQClientBase.h>
 
@@ -26,16 +27,11 @@ folly::coro::Task<void> MoQClientBase::setupMoQSession(
     std::shared_ptr<Publisher> publishHandler,
     std::shared_ptr<Subscriber> subscribeHandler,
     const quic::TransportSettings& transportSettings,
-    const std::vector<std::string>& alpns) noexcept {
+    const std::vector<std::string>& alpns) {
   proxygen::WebTransport* wt = nullptr;
 
-  std::vector<std::string> alpn;
-  if (alpns.empty()) {
-    // Default: use both ALPNs
-    alpn = {std::string(kAlpnMoqtDraft15), std::string(kAlpnMoqtLegacy)};
-  } else {
-    alpn = alpns;
-  }
+  std::vector<std::string> alpn =
+      alpns.empty() ? getDefaultMoqtProtocols(false) : alpns;
   // Establish QUIC connection with multiple ALPN options
   auto quicClient = co_await connectQuic(
       folly::SocketAddress(
@@ -49,7 +45,7 @@ folly::coro::Task<void> MoQClientBase::setupMoQSession(
   auto stdAlpn = quicClient->getAppProtocol();
   if (stdAlpn) {
     negotiatedProtocol_ = *stdAlpn;
-    XLOG(INFO) << "Client: Negotiated ALPN: " << *negotiatedProtocol_;
+    XLOG(DBG1) << "Client: Negotiated ALPN: " << *negotiatedProtocol_;
   }
 
   // Make WebTransport object
@@ -58,11 +54,15 @@ folly::coro::Task<void> MoQClientBase::setupMoQSession(
   quicWebTransport_->setHandler(this);
   wt = quicWebTransport_.get();
 
-  co_await completeSetupMoQSession(
+  auto result = co_await folly::coro::co_awaitTry(completeSetupMoQSession(
       wt,
       url_.getPath(),
       std::move(publishHandler),
-      std::move(subscribeHandler));
+      std::move(subscribeHandler)));
+
+  if (result.hasException()) {
+    co_yield folly::coro::co_error(result.exception());
+  }
 }
 
 folly::coro::Task<ServerSetup> MoQClientBase::completeSetupMoQSession(
@@ -104,18 +104,16 @@ ClientSetup MoQClientBase::getClientSetup(
   ClientSetup clientSetup{
       legacyVersions,
       SetupParameters{
-          {folly::to_underlying(SetupKey::MAX_REQUEST_ID),
-           "",
-           kDefaultMaxRequestID,
-           {}},
-          {folly::to_underlying(SetupKey::MAX_AUTH_TOKEN_CACHE_SIZE),
-           "",
-           kMaxAuthTokenCacheSize,
-           {}}}};
+          Parameter(
+              folly::to_underlying(SetupKey::MAX_REQUEST_ID),
+              kDefaultMaxRequestID),
+          Parameter(
+              folly::to_underlying(SetupKey::MAX_AUTH_TOKEN_CACHE_SIZE),
+              kMaxAuthTokenCacheSize)}};
 
   if (path) {
     clientSetup.params.insertParam(
-        SetupParameter({folly::to_underlying(SetupKey::PATH), *path, 0, {}}));
+        SetupParameter(folly::to_underlying(SetupKey::PATH), *path));
   }
 
   if (shouldSendAuthorityParam(clientSetup.supportedVersions)) {
@@ -127,15 +125,15 @@ ClientSetup MoQClientBase::getClientSetup(
         authority += ":" + std::to_string(url_.getPort());
       }
 
-      clientSetup.params.insertParam(SetupParameter(
-          {folly::to_underlying(SetupKey::AUTHORITY), authority, 0}));
+      clientSetup.params.insertParam(
+          SetupParameter(folly::to_underlying(SetupKey::AUTHORITY), authority));
     }
   }
 
   return clientSetup;
 }
 
-void MoQClientBase::onSessionEnd(folly::Optional<uint32_t> err) {
+void MoQClientBase::onSessionEnd(folly::Optional<uint32_t> err) noexcept {
   if (logger_) {
     logger_->outputLogsToFile();
   }
@@ -144,10 +142,19 @@ void MoQClientBase::onSessionEnd(folly::Optional<uint32_t> err) {
     XLOG(DBG1) << "resetting moqSession_";
     moqSession_.reset();
   }
+  if (quicWebTransport_) {
+    quicWebTransport_->setHandler(nullptr);
+    XLOG(DBG1) << "resetting quicWebTransport_";
+    quicWebTransport_.reset();
+  }
+}
+
+void MoQClientBase::onSessionDrain() noexcept {
+  XLOG(DBG1) << "Received DRAIN_SESSION capsule";
 }
 
 void MoQClientBase::onNewBidiStream(
-    proxygen::WebTransport::BidiStreamHandle bidi) {
+    proxygen::WebTransport::BidiStreamHandle bidi) noexcept {
   XLOG(DBG1) << __func__;
   if (!moqSession_) {
     XLOG(DBG1) << "onNewBidiStream after session reset; ignoring";
@@ -157,7 +164,7 @@ void MoQClientBase::onNewBidiStream(
 }
 
 void MoQClientBase::onNewUniStream(
-    proxygen::WebTransport::StreamReadHandle* stream) {
+    proxygen::WebTransport::StreamReadHandle* stream) noexcept {
   XLOG(DBG1) << __func__;
   if (!moqSession_) {
     XLOG(DBG1) << "onNewUniStream after session reset; ignoring";
@@ -166,7 +173,8 @@ void MoQClientBase::onNewUniStream(
   moqSession_->onNewUniStream(stream);
 }
 
-void MoQClientBase::onDatagram(std::unique_ptr<folly::IOBuf> datagram) {
+void MoQClientBase::onDatagram(
+    std::unique_ptr<folly::IOBuf> datagram) noexcept {
   if (!moqSession_) {
     XLOG(DBG1) << "onDatagram after session reset; ignoring";
     return;

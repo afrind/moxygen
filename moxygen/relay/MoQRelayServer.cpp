@@ -17,21 +17,42 @@ DEFINE_string(key, "", "Key path");
 DEFINE_string(endpoint, "/moq-relay", "End point");
 DEFINE_int32(port, 9668, "Relay Server Port");
 DEFINE_bool(enable_cache, false, "Enable relay cache");
+DEFINE_bool(
+    insecure,
+    false,
+    "Use insecure verifier (skip certificate validation)");
+DEFINE_bool(
+    use_legacy_setup,
+    false,
+    "If true, use only moq-00 ALPN (legacy). If false, use latest draft ALPN with fallback to legacy");
 
 namespace {
 using namespace moxygen;
 
 class MoQRelayServer : public MoQServer {
  public:
-  MoQRelayServer() : MoQServer(FLAGS_cert, FLAGS_key, FLAGS_endpoint) {}
+  // Used when the insecure flag is false
+  MoQRelayServer(const std::string& cert, const std::string& key)
+      : MoQServer(cert, key, FLAGS_endpoint) {}
+
+  // Used when the insecure flag is true
+  MoQRelayServer()
+      : MoQServer(
+            quic::samples::createFizzServerContextWithInsecureDefault(
+                []() {
+                  std::vector<std::string> alpns = {"h3"};
+                  auto moqt = getDefaultMoqtProtocols(!FLAGS_use_legacy_setup);
+                  alpns.insert(alpns.end(), moqt.begin(), moqt.end());
+                  return alpns;
+                }(),
+                fizz::server::ClientAuthMode::None,
+                "" /* cert */,
+                "" /* key */),
+            FLAGS_endpoint) {}
 
   void onNewSession(std::shared_ptr<MoQSession> clientSession) override {
     clientSession->setPublishHandler(relay_);
     clientSession->setSubscribeHandler(relay_);
-  }
-
-  void terminateClientSession(std::shared_ptr<MoQSession> session) override {
-    relay_->removeSession(session);
   }
 
  protected:
@@ -52,9 +73,14 @@ class MoQRelayServer : public MoQServer {
 
 int main(int argc, char* argv[]) {
   folly::Init init(&argc, &argv, true);
-  MoQRelayServer moqRelayServer;
+  std::shared_ptr<MoQRelayServer> moqRelayServer = nullptr;
+  if (FLAGS_insecure) {
+    moqRelayServer = std::make_shared<MoQRelayServer>();
+  } else {
+    moqRelayServer = std::make_shared<MoQRelayServer>(FLAGS_cert, FLAGS_key);
+  }
   folly::SocketAddress addr("::", FLAGS_port);
-  moqRelayServer.start(addr);
+  moqRelayServer->start(addr);
   folly::EventBase evb;
   evb.loopForever();
   return 0;

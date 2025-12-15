@@ -6,11 +6,14 @@
 
 #include <folly/coro/BlockingWait.h>
 #include <folly/coro/Sleep.h>
+#include <folly/io/async/AsyncSignalHandler.h>
+#include <signal.h>
 #include <moxygen/MoQLocation.h>
 #include <moxygen/MoQServer.h>
 #include <moxygen/MoQWebTransportClient.h>
 #include <moxygen/relay/MoQForwarder.h>
 #include <moxygen/relay/MoQRelayClient.h>
+#include <moxygen/util/InsecureVerifierDangerousDoNotUseInProduction.h>
 #include <iomanip>
 
 using namespace quic::samples;
@@ -33,8 +36,13 @@ DEFINE_string(ns, "moq-date", "Namespace for date track");
 DEFINE_bool(
     use_legacy_setup,
     false,
-    "If true, use only moq-00 ALPN (legacy). If false, use both moqt-15 and moq-00");
+    "If true, use only moq-00 ALPN (legacy). If false, use latest draft ALPN with fallback to legacy");
 DEFINE_int32(delivery_timeout, 0, "the delivery timeout in ms for server");
+DEFINE_bool(
+    insecure,
+    false,
+    "Use insecure verifier (skip certificate validation)");
+DEFINE_string(mlog_path, "", "Path to mlog file");
 
 namespace {
 using namespace moxygen;
@@ -56,7 +64,14 @@ class DateSubscriptionHandle : public Publisher::SubscriptionHandle {
   void unsubscribe() override {}
 
   // To Be Implemented
-  void subscribeUpdate(SubscribeUpdate update) override {}
+  folly::coro::Task<folly::Expected<SubscribeUpdateOk, SubscribeUpdateError>>
+  subscribeUpdate(SubscribeUpdate update) override {
+    co_return folly::makeUnexpected(
+        SubscribeUpdateError{
+            update.requestID,
+            SubscribeUpdateErrorCode::NOT_SUPPORTED,
+            "Subscribe update not implemented"});
+  }
 };
 
 class MoQDateServer : public MoQServer,
@@ -65,8 +80,27 @@ class MoQDateServer : public MoQServer,
  public:
   enum class Mode { STREAM_PER_GROUP, STREAM_PER_OBJECT, DATAGRAM };
 
+  // Constructor for the secure version, where we pass in the certificate and
+  // the key.
+  MoQDateServer(Mode mode, const std::string& cert, const std::string& key)
+      : MoQServer(cert, key, "/moq-date"),
+        forwarder_(dateTrackName()),
+        mode_(mode) {}
+
+  // Constructor for the insecure version
   explicit MoQDateServer(Mode mode)
-      : MoQServer(FLAGS_cert, FLAGS_key, "/moq-date"),
+      : MoQServer(
+            quic::samples::createFizzServerContextWithInsecureDefault(
+                []() {
+                  std::vector<std::string> alpns = {"h3"};
+                  auto moqt = getDefaultMoqtProtocols(!FLAGS_use_legacy_setup);
+                  alpns.insert(alpns.end(), moqt.begin(), moqt.end());
+                  return alpns;
+                }(),
+                fizz::server::ClientAuthMode::None,
+                "" /* cert */,
+                "" /* key */),
+            "/moq-date"),
         forwarder_(dateTrackName()),
         mode_(mode) {}
 
@@ -80,19 +114,30 @@ class MoQDateServer : public MoQServer,
     if (!moqEvb_) {
       moqEvb_ = std::make_shared<MoQFollyExecutorImpl>(evb);
     }
+    auto verifier = FLAGS_insecure
+        ? std::make_shared<
+              moxygen::test::InsecureVerifierDangerousDoNotUseInProduction>()
+        : nullptr;
     relayClient_ = std::make_unique<MoQRelayClient>((
-        FLAGS_quic_transport
-            ? std::make_unique<MoQClient>(
-                  moqEvb_, url, MoQRelaySession::createRelaySessionFactory())
-            : std::make_unique<MoQWebTransportClient>(
-                  moqEvb_, url, MoQRelaySession::createRelaySessionFactory())));
+        FLAGS_quic_transport ? std::make_unique<MoQClient>(
+                                   moqEvb_,
+                                   url,
+                                   MoQRelaySession::createRelaySessionFactory(),
+                                   verifier)
+                             : std::make_unique<MoQWebTransportClient>(
+                                   moqEvb_,
+                                   url,
+                                   MoQRelaySession::createRelaySessionFactory(),
+                                   verifier)));
 
-    std::vector<std::string> alpns;
-    if (FLAGS_use_legacy_setup) {
-      alpns = {std::string(kAlpnMoqtLegacy)};
-    } else {
-      alpns = {std::string(kAlpnMoqtDraft15), std::string(kAlpnMoqtLegacy)};
+    if (getLogger()) {
+      relayClient_->setLogger(getLogger());
     }
+
+    // Default to experimental protocols, override to legacy if flag set
+    std::vector<std::string> alpns =
+        getDefaultMoqtProtocols(!FLAGS_use_legacy_setup);
+
     folly::coro::blockingWait(
         relayClient_
             ->setup(
@@ -117,6 +162,9 @@ class MoQDateServer : public MoQServer,
 
   void onNewSession(std::shared_ptr<MoQSession> clientSession) override {
     clientSession->setPublishHandler(shared_from_this());
+    if (getLogger()) {
+      clientSession->setLogger(getLogger());
+    }
   }
 
   std::pair<uint64_t, uint64_t> now() {
@@ -159,7 +207,8 @@ class MoQDateServer : public MoQServer,
         trackStatus.requestID,
         0,
         std::chrono::milliseconds(0),
-        GroupOrder::Default,
+        GroupOrder::OldestFirst, // Use OldestFirst instead of Default for
+                                 // Draft-14 compatibility
         largest,
         {}};
   }
@@ -341,7 +390,7 @@ class MoQDateServer : public MoQServer,
     if (relayClient_ && relayClient_->getSession() == session) {
       // TODO: relay is going away
     } else {
-      forwarder_.removeSession(session);
+      forwarder_.removeSubscriber(session, folly::none, "unsubscribe");
     }
   }
 
@@ -432,14 +481,22 @@ class MoQDateServer : public MoQServer,
       std::shared_ptr<SubgroupConsumer> subConsumer = nullptr) {
     auto cancelToken = co_await folly::coro::co_current_cancellation_token;
     std::shared_ptr<SubgroupConsumer> subgroupPublisher;
+    uint64_t currentMinute = now().first;
     if (subConsumer) {
       subgroupPublisher = subConsumer;
     }
     while (!cancelToken.isCancellationRequested()) {
+      auto [minute, second] = now();
       if (forwarder_.empty()) {
         forwarder_.setLargest(nowLocation());
+        // Reset subgroupPublisher when crossing minute boundary
+        // Otherwise we try to use the same subgroup publisher and publish does
+        // not happen
+        if (minute != currentMinute) {
+          subgroupPublisher.reset();
+          currentMinute = minute;
+        }
       } else {
-        auto [minute, second] = now();
         switch (mode_) {
           case Mode::STREAM_PER_GROUP:
             subgroupPublisher = publishDate(subgroupPublisher, minute, second);
@@ -529,7 +586,7 @@ class MoQDateServer : public MoQServer,
 
   void terminateClientSession(std::shared_ptr<MoQSession> session) override {
     XLOG(INFO) << __func__;
-    forwarder_.removeSession(session);
+    forwarder_.removeSubscriber(session, folly::none, "terminateClientSession");
   }
 
  private:
@@ -542,6 +599,28 @@ class MoQDateServer : public MoQServer,
   bool loopRunning_{false};
   std::shared_ptr<MoQFollyExecutorImpl> moqEvb_;
 };
+
+class SigHandler : public folly::AsyncSignalHandler {
+ public:
+  explicit SigHandler(folly::EventBase* evb, std::function<void(int)> fn)
+      : folly::AsyncSignalHandler(evb), fn_(std::move(fn)) {
+    registerSignalHandler(SIGTERM);
+    registerSignalHandler(SIGINT);
+  }
+  void signalReceived(int signum) noexcept override {
+    fn_(signum);
+    unreg();
+  }
+
+  void unreg() {
+    unregisterSignalHandler(SIGTERM);
+    unregisterSignalHandler(SIGINT);
+  }
+
+ private:
+  std::function<void(int)> fn_;
+};
+
 } // namespace
 int main(int argc, char* argv[]) {
   folly::Init init(&argc, &argv, true);
@@ -557,13 +636,37 @@ int main(int argc, char* argv[]) {
     XLOG(ERR) << "Invalid mode: " << FLAGS_mode;
     return 1;
   }
-  auto server = std::make_shared<MoQDateServer>(mode);
+  std::shared_ptr<MoQDateServer> server = nullptr;
+  if (FLAGS_insecure) {
+    server = std::make_shared<MoQDateServer>(mode);
+  } else {
+    server = std::make_shared<MoQDateServer>(mode, FLAGS_cert, FLAGS_key);
+  }
+
+  if (!FLAGS_mlog_path.empty()) {
+    auto logger =
+        std::make_shared<moxygen::MLogger>(moxygen::VantagePoint::SERVER);
+    logger->setPath(FLAGS_mlog_path);
+    server->setLogger(logger);
+  }
+
   folly::SocketAddress addr("::", FLAGS_port);
   server->start(addr);
   if (!FLAGS_relay_url.empty() && !server->startRelayClient()) {
     return 1;
   }
 
+  SigHandler handler(&evb, [&server, &evb](int) {
+    if (server->getLogger()) {
+      server->getLogger()->outputLogsToFile();
+    }
+    evb.terminateLoopSoon();
+  });
+
   evb.loopForever();
+
+  if (server->getLogger()) {
+    server->getLogger()->outputLogsToFile();
+  }
   return 0;
 }

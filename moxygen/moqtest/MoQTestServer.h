@@ -10,74 +10,70 @@
 
 #include <utility>
 
+#include "moxygen/MoQClient.h"
+#include "moxygen/MoQRelaySession.h"
 #include "moxygen/MoQServer.h"
+#include "moxygen/MoQWebTransportClient.h"
 #include "moxygen/Publisher.h"
+#include "moxygen/events/MoQFollyExecutorImpl.h"
 #include "moxygen/moqtest/Types.h"
 
 namespace moxygen {
-
-class MoQTAnnounceCallback : public Subscriber::AnnounceCallback {
- public:
-  MoQTAnnounceCallback() = default;
-
-  virtual void announceCancel(
-      AnnounceErrorCode errorCode,
-      std::string reasonPhrase) override;
-};
-
 class MoQTestSubscriptionHandle : public Publisher::SubscriptionHandle {
  public:
   MoQTestSubscriptionHandle(
       SubscribeOk ok,
-      folly::CancellationSource* cancellationSource)
+      folly::CancellationSource cancellationSource)
       : Publisher::SubscriptionHandle(std::move(ok)),
-        cancelSource_(cancellationSource) {};
+        cancelSource_(std::move(cancellationSource)) {}
 
   virtual void unsubscribe() override;
-  virtual void subscribeUpdate(SubscribeUpdate subUpdate) override;
+  virtual folly::coro::Task<
+      folly::Expected<SubscribeUpdateOk, SubscribeUpdateError>>
+  subscribeUpdate(SubscribeUpdate update) override;
 
  private:
   SubscribeOk subscribeOk_;
-  folly::CancellationSource* cancelSource_;
-};
-
-class MoQTestSubscribeAnnouncesHandle
-    : public Publisher::SubscribeAnnouncesHandle {
- public:
-  MoQTestSubscribeAnnouncesHandle(SubscribeAnnouncesOk ok)
-      : Publisher::SubscribeAnnouncesHandle(std::move(ok)) {}
-  virtual void unsubscribeAnnounces() override;
+  folly::CancellationSource cancelSource_;
 };
 
 class MoQTestFetchHandle : public Publisher::FetchHandle {
  public:
   MoQTestFetchHandle(
       const FetchOk& ok,
-      folly::CancellationSource* cancellationSource)
+      folly::CancellationSource cancellationSource)
       : Publisher::FetchHandle(ok),
         fetchOk_(ok),
-        cancelSource_(cancellationSource) {};
+        cancelSource_(std::move(cancellationSource)) {}
 
   virtual void fetchCancel() override;
 
  private:
   FetchOk fetchOk_;
-  folly::CancellationSource* cancelSource_;
+  folly::CancellationSource cancelSource_;
 };
 
 class MoQTestServer : public moxygen::Publisher,
                       public moxygen::MoQServer,
                       public std::enable_shared_from_this<MoQTestServer> {
  public:
-  MoQTestServer();
+  MoQTestServer(const std::string& cert = "", const std::string& key = "");
+
   //  Override onNewSession to set publisher handler to be this object
   virtual void onNewSession(
       std::shared_ptr<MoQSession> clientSession) override {
     clientSession->setPublishHandler(shared_from_this());
-    if (logger_) {
-      clientSession->setLogger(logger_);
+    if (getLogger()) {
+      clientSession->setLogger(getLogger());
     }
   }
+
+  // Relay client support
+  bool startRelayClient(
+      const std::string& relayUrl,
+      int32_t connectTimeout,
+      int32_t transactionTimeout,
+      bool useQuicTransport);
 
   // Subscribing Methods
   virtual folly::coro::Task<SubscribeResult> subscribe(
@@ -100,7 +96,7 @@ class MoQTestServer : public moxygen::Publisher,
       MoQTestParameters params,
       std::shared_ptr<TrackConsumer> callback);
 
-  folly::coro::Task<SubscribeResult> sendDatagram(
+  folly::coro::Task<void> sendDatagram(
       SubscribeRequest sub,
       MoQTestParameters params,
       std::shared_ptr<TrackConsumer> callback);
@@ -126,23 +122,23 @@ class MoQTestServer : public moxygen::Publisher,
       MoQTestParameters params,
       std::shared_ptr<FetchConsumer> callback);
 
-  // Methods For Tests in MoQTrackServerTest
-  bool isSubCancelled();
-  bool isFetchCancelled();
-  void initializeCancellationSources() {
-    subCancelSource_ = std::make_shared<folly::CancellationSource>();
-    fetchCancelSource_ = std::make_shared<folly::CancellationSource>();
+  folly::coro::Task<void> fetchDatagram(
+      MoQTestParameters params,
+      std::shared_ptr<FetchConsumer> callback) {
+    co_return co_await fetchOneSubgroupPerObject(params, std::move(callback));
   }
 
-  virtual void goaway(Goaway goaway) override;
-  virtual folly::coro::Task<SubscribeAnnouncesResult> subscribeAnnounces(
-      SubscribeAnnounces subAnn) override;
-
  private:
-  std::shared_ptr<folly::CancellationSource> subCancelSource_;
-  std::shared_ptr<folly::CancellationSource> fetchCancelSource_;
-  std::shared_ptr<MoQSession> subSession_;
-  std::shared_ptr<MoQSession> fetchSession_;
+  folly::coro::Task<void> doRelaySetup(
+      const std::string& relayUrl,
+      int32_t connectTimeout,
+      int32_t transactionTimeout);
+
+  // Relay client connection (if using relay mode)
+  std::unique_ptr<MoQClient> relayClient_;
+  std::shared_ptr<MoQRelaySession> relaySession_;
+  std::shared_ptr<Subscriber::AnnounceHandle> announceHandle_;
+  std::shared_ptr<MoQFollyExecutorImpl> moqEvb_;
 };
 
 } // namespace moxygen

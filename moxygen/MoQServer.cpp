@@ -21,9 +21,12 @@ namespace moxygen {
 MoQServer::MoQServer(std::string cert, std::string key, std::string endpoint)
     : MoQServer(
           quic::samples::createFizzServerContext(
-              {"h3",
-               std::string(kAlpnMoqtDraft15),
-               std::string(kAlpnMoqtLegacy)},
+              []() {
+                std::vector<std::string> alpns = {"h3"};
+                auto moqt = getDefaultMoqtProtocols(false);
+                alpns.insert(alpns.end(), moqt.begin(), moqt.end());
+                return alpns;
+              }(),
               fizz::server::ClientAuthMode::Optional,
               cert,
               key),
@@ -32,21 +35,50 @@ MoQServer::MoQServer(std::string cert, std::string key, std::string endpoint)
 MoQServer::MoQServer(
     std::shared_ptr<const fizz::server::FizzServerContext> fizzContext,
     std::string endpoint)
-    : endpoint_(std::move(endpoint)) {
+    : fizzContext_(std::move(fizzContext)), endpoint_(std::move(endpoint)) {
   params_.serverThreads = 1;
   params_.txnTimeout = std::chrono::seconds(60);
+  params_.transportSettings.defaultCongestionController =
+      quic::CongestionControlType::Copa;
+  params_.transportSettings.copaDeltaParam = 0.05;
+  params_.transportSettings.pacingEnabled = true;
+  params_.transportSettings.experimentalPacer = true;
+  params_.transportSettings.maxCwndInMss = quic::kLargeMaxCwndInMss;
+  params_.transportSettings.batchingMode =
+      quic::QuicBatchingMode::BATCHING_MODE_GSO;
+  params_.transportSettings.maxBatchSize = 48;
+  params_.transportSettings.dataPathType = quic::DataPathType::ContinuousMemory;
+  params_.transportSettings.maxServerRecvPacketsPerLoop = 10;
+  params_.transportSettings.writeConnectionDataPacketsLimit = 48;
 
-  auto factory = std::make_unique<HQServerTransportFactory>(
+  factory_ = std::make_unique<HQServerTransportFactory>(
       params_, [this](HTTPMessage*) { return new Handler(*this); }, nullptr);
-  factory->addAlpnHandler(
-      {std::string(kAlpnMoqtLegacy), std::string(kAlpnMoqtDraft15)},
+
+  // Register all handlers
+  registerAlpnHandler(getDefaultMoqtProtocols(true));
+
+  hqServer_ =
+      std::make_unique<HQServer>(params_, std::move(factory_), fizzContext_);
+}
+
+void MoQServer::registerAlpnHandler(const std::vector<std::string>& alpns) {
+  if (!factory_) {
+    XLOG(INFO) << "Cannot register ALPN handler: factory not initialized";
+    return;
+  }
+
+  if (hqServer_) {
+    XLOG(INFO) << "Cannot register ALPN handler: server already started";
+    return;
+  }
+
+  factory_->addAlpnHandler(
+      alpns,
       [this](
           std::shared_ptr<quic::QuicSocket> quicSocket,
           wangle::ConnectionManager*) {
         createMoQQuicSession(std::move(quicSocket));
       });
-  hqServer_ =
-      std::make_unique<HQServer>(params_, std::move(factory), fizzContext);
 }
 
 void MoQServer::start(
@@ -72,16 +104,10 @@ void MoQServer::createMoQQuicSession(
   folly::Optional<std::string> alpn;
   if (stdAlpn) {
     alpn = *stdAlpn;
-    XLOG(INFO) << "Server: Negotiated ALPN: " << *alpn;
+    XLOG(DBG1) << "Server: Negotiated ALPN: " << *alpn;
   }
 
   auto qevb = quicSocket->getEventBase();
-  auto ts = quicSocket->getTransportSettings();
-  // TODO make this configurable, also have a shared pacing timer per thread.
-  ts.defaultCongestionController = quic::CongestionControlType::Copa;
-  ts.copaDeltaParam = 0.05;
-  ts.pacingEnabled = true;
-  ts.experimentalPacer = true;
   auto quicWebTransport =
       std::make_shared<proxygen::QuicWebTransport>(std::move(quicSocket));
   auto qWtPtr = quicWebTransport.get();
@@ -207,7 +233,7 @@ void MoQServer::setFizzContext(
 folly::Try<ServerSetup> MoQServer::onClientSetup(
     ClientSetup setup,
     const std::shared_ptr<MoQSession>& session) {
-  XLOG(INFO) << "MoQServer::ClientSetup";
+  XLOG(DBG1) << "MoQServer::ClientSetup";
 
   uint64_t negotiatedVersion = 0;
 
@@ -216,7 +242,7 @@ folly::Try<ServerSetup> MoQServer::onClientSetup(
   if (sessionVersion) {
     // ALPN mode: use the ALPN-negotiated version
     negotiatedVersion = *sessionVersion;
-    XLOG(INFO) << "MoQServer::ClientSetup: Using ALPN-negotiated version: moqt-"
+    XLOG(DBG1) << "MoQServer::ClientSetup: Using ALPN-negotiated version: moqt-"
                << getDraftMajorVersion(negotiatedVersion);
   } else if (!setup.supportedVersions.empty()) {
     // Legacy mode: negotiate from version array in CLIENT_SETUP
@@ -250,17 +276,12 @@ folly::Try<ServerSetup> MoQServer::onClientSetup(
   // take in the value from ClientSetup
   static constexpr size_t kDefaultMaxRequestID = 100;
   static constexpr size_t kMaxAuthTokenCacheSize = 1024;
-  ServerSetup serverSetup = ServerSetup({
+  ServerSetup serverSetup{
       negotiatedVersion,
-      {{folly::to_underlying(SetupKey::MAX_REQUEST_ID),
-        "",
-        kDefaultMaxRequestID,
-        {}},
+      {{folly::to_underlying(SetupKey::MAX_REQUEST_ID), kDefaultMaxRequestID},
        {folly::to_underlying(SetupKey::MAX_AUTH_TOKEN_CACHE_SIZE),
-        "",
-        kMaxAuthTokenCacheSize,
-        {}}},
-  });
+        kMaxAuthTokenCacheSize}},
+  };
 
   // Log Server Setup
   if (logger_) {
@@ -290,7 +311,7 @@ void MoQServer::Handler::onHeadersComplete(
   resp.setHTTPVersion(1, 1);
 
   if (req->getPathAsStringPiece() != server_.getEndpoint()) {
-    XLOG(INFO) << req->getPathAsStringPiece();
+    XLOG(DBG0) << req->getPathAsStringPiece();
     req->dumpMessage(0);
     resp.setStatusCode(404);
     txn_->sendHeadersWithEOM(resp);
@@ -304,8 +325,9 @@ void MoQServer::Handler::onHeadersComplete(
   }
   resp.setStatusCode(200);
   resp.getHeaders().add("sec-webtransport-http3-draft", "draft02");
-  std::vector<std::string> supportedProtocols{
-      std::string(kAlpnMoqtDraft15), std::string(kAlpnMoqtLegacy)};
+
+  // Use default MoQT protocols for WebTransport negotiation
+  std::vector<std::string> supportedProtocols = getDefaultMoqtProtocols(false);
   folly::Optional<std::string> negotiatedProtocol;
   if (auto wtAvailableProtocols =
           HTTPWebTransport::getWTAvailableProtocols(*req)) {
@@ -313,7 +335,7 @@ void MoQServer::Handler::onHeadersComplete(
             wtAvailableProtocols.value(), supportedProtocols)) {
       HTTPWebTransport::setWTProtocol(resp, wtProtocol.value());
       negotiatedProtocol = wtProtocol.value();
-      XLOG(INFO) << "WebTransport: Negotiated protocol: " << *wtProtocol;
+      XLOG(DBG1) << "WebTransport: Negotiated protocol: " << *wtProtocol;
     } else {
       VLOG(4) << "Failed to negotiate WebTransport protocol";
       resp.setStatusCode(400);
@@ -342,6 +364,10 @@ void MoQServer::Handler::onHeadersComplete(
 
 void MoQServer::setLogger(std::shared_ptr<MLogger> logger) {
   logger_ = std::move(logger);
+}
+
+std::shared_ptr<MLogger> MoQServer::getLogger() const {
+  return logger_;
 }
 
 void MoQServer::setQuicStatsFactory(

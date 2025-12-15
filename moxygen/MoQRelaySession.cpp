@@ -100,7 +100,17 @@ class MoQRelaySession::SubscribeAnnouncesHandle
 
   void unsubscribeAnnounces() override {
     if (session_) {
-      session_->unsubscribeAnnounces({trackNamespacePrefix_});
+      UnsubscribeAnnounces msg;
+
+      // v15+: Send requestID
+      if (getDraftMajorVersion(*session_->getNegotiatedVersion()) >= 15) {
+        msg.requestID = subscribeAnnouncesOk_->requestID;
+      } else {
+        // <v15: Send namespace
+        msg.trackNamespacePrefix = trackNamespacePrefix_;
+      }
+
+      session_->unsubscribeAnnounces(msg);
       session_.reset();
     }
   }
@@ -234,6 +244,21 @@ void MoQRelaySession::cleanup() {
   }
   subscriberAnnounces_.clear();
 
+  // Clean up subscribeAnnounces handles for both maps
+  for (auto& subAnn : reqIdToSubscribeAnnounces_) {
+    if (subAnn.second) {
+      subAnn.second->unsubscribeAnnounces();
+    }
+  }
+  reqIdToSubscribeAnnounces_.clear();
+
+  for (auto& subAnn : trackNsTosubscribeAnnounces_) {
+    if (subAnn.second) {
+      subAnn.second->unsubscribeAnnounces();
+    }
+  }
+  trackNsTosubscribeAnnounces_.clear();
+
   // Call parent cleanup to handle base class cleanup
   MoQSession::cleanup();
 }
@@ -298,6 +323,8 @@ void MoQRelaySession::onRequestOk(RequestOk requestOk, FrameType frameType) {
 
   auto reqID = requestOk.requestID;
   auto reqIt = pendingRequests_.find(reqID);
+  bool shouldErasePendingRequest = true;
+
   if (reqIt == pendingRequests_.end()) {
     // unknown
     XLOG(ERR) << "No matching announce reqID=" << reqID << " sess=" << this;
@@ -308,52 +335,42 @@ void MoQRelaySession::onRequestOk(RequestOk requestOk, FrameType frameType) {
     frameType = reqIt->second->getOkFrameType();
   }
   switch (frameType) {
-    case moxygen::FrameType::ANNOUNCE_OK: {
-      if (logger_) {
-        logger_->logAnnounceOk(
-            requestOk,
-            MOQTByteStringType::STRING_VALUE,
-            ControlMessageType::PARSED);
-      }
-
-      auto* announcePtr =
-          MoQRelayPendingRequestState::tryGetAnnounce(reqIt->second.get());
-      if (!announcePtr) {
-        XLOG(ERR) << "Request ID " << reqID
-                  << " is not an announce request, sess=" << this;
-        close(SessionCloseErrorCode::PROTOCOL_VIOLATION);
-        return;
-      }
-
-      publisherAnnounces_[announcePtr->trackNamespace] =
-          std::move(announcePtr->callback);
-      announcePtr->promise.setValue(std::move(requestOk));
+    case moxygen::FrameType::TRACK_STATUS_OK: {
+      // Use base class helper
+      handleTrackStatusOkFromRequestOk(requestOk);
+      shouldErasePendingRequest = false;
       break;
     }
-    case moxygen::FrameType::SUBSCRIBE_ANNOUNCES_OK: {
-      if (logger_) {
-        logger_->logSubscribeAnnouncesOk(
-            requestOk,
-            MOQTByteStringType::STRING_VALUE,
-            ControlMessageType::PARSED);
+    case moxygen::FrameType::SUBSCRIBE_ANNOUNCES_OK:
+    case moxygen::FrameType::REQUEST_OK: {
+      // ANNOUNCE_OK is an alias for REQUEST_OK (both = 0x7)
+      switch (reqIt->second->getType()) {
+        case PendingRequestState::Type::ANNOUNCE:
+          handleAnnounceOkFromRequestOk(requestOk, reqIt);
+          break;
+        case PendingRequestState::Type::SUBSCRIBE_ANNOUNCES:
+          handleSubscribeAnnouncesOkFromRequestOk(requestOk, reqIt);
+          break;
+        case PendingRequestState::Type::SUBSCRIBE_UPDATE:
+          // Use base class helper
+          handleSubscribeUpdateOkFromRequestOk(requestOk, reqIt);
+          shouldErasePendingRequest = false;
+          break;
+        default:
+          XLOG(ERR) << "Unexpected REQUEST_OK for type "
+                    << folly::to_underlying(reqIt->second->getType())
+                    << ", sess=" << this;
+          close(SessionCloseErrorCode::PROTOCOL_VIOLATION);
+          break;
       }
-      auto* subscribeAnnouncesPtr =
-          MoQRelayPendingRequestState::tryGetSubscribeAnnounces(
-              reqIt->second.get());
-      if (!subscribeAnnouncesPtr) {
-        XLOG(ERR) << "Request ID " << reqID
-                  << " is not a subscribe announces request, sess=" << this;
-        close(SessionCloseErrorCode::PROTOCOL_VIOLATION);
-        return;
-      }
-
-      subscribeAnnouncesPtr->setValue(std::move(requestOk));
       break;
     }
     default:
       break;
   }
-  pendingRequests_.erase(reqIt);
+  if (shouldErasePendingRequest) {
+    pendingRequests_.erase(reqIt);
+  }
 }
 
 void MoQRelaySession::onAnnounceCancel(AnnounceCancel announceCancel) {
@@ -372,8 +389,11 @@ void MoQRelaySession::onAnnounceCancel(AnnounceCancel announceCancel) {
   if (it == publisherAnnounces_.end()) {
     XLOG(ERR) << "Invalid announce cancel ns=" << announceCancel.trackNamespace;
   } else {
-    it->second->announceCancel(
-        announceCancel.errorCode, std::move(announceCancel.reasonPhrase));
+    auto& cb = it->second;
+    if (cb) {
+      cb->announceCancel(
+          announceCancel.errorCode, std::move(announceCancel.reasonPhrase));
+    }
     publisherAnnounces_.erase(it);
   }
 }
@@ -576,8 +596,16 @@ MoQRelaySession::subscribeAnnounces(SubscribeAnnounces sa) {
 
 void MoQRelaySession::unsubscribeAnnounces(
     const UnsubscribeAnnounces& unsubAnn) {
-  XLOG(DBG1) << __func__ << " prefix=" << unsubAnn.trackNamespacePrefix
-             << " sess=" << this;
+  // Log the appropriate field based on what's present
+  if (unsubAnn.trackNamespacePrefix.hasValue()) {
+    XLOG(DBG1) << __func__
+               << " prefix=" << unsubAnn.trackNamespacePrefix.value()
+               << " sess=" << this;
+  } else if (unsubAnn.requestID.hasValue()) {
+    XLOG(DBG1) << __func__ << " requestID=" << unsubAnn.requestID.value()
+               << " sess=" << this;
+  }
+
   MOQ_SUBSCRIBER_STATS(subscriberStatsCallback_, onUnsubscribeAnnounces);
   auto res =
       moqFrameWriter_.writeUnsubscribeAnnounces(controlWriteBuf_, unsubAnn);
@@ -644,7 +672,15 @@ folly::coro::Task<void> MoQRelaySession::handleSubscribeAnnounces(
     auto handle = std::move(subAnnResult->value());
     auto subAnnOk = handle->subscribeAnnouncesOk();
     subscribeAnnouncesOk(subAnnOk);
-    subscribeAnnounces_[subAnn.trackNamespacePrefix] = std::move(handle);
+
+    if (getDraftMajorVersion(*getNegotiatedVersion()) >= 15) {
+      // v15 and + only: Store Request ID lookup
+      reqIdToSubscribeAnnounces_[subAnn.requestID] = std::move(handle);
+    } else {
+      // Remove when we drop <v15 support
+      trackNsTosubscribeAnnounces_[subAnn.trackNamespacePrefix] =
+          std::move(handle);
+    }
   }
 }
 
@@ -665,8 +701,6 @@ void MoQRelaySession::subscribeAnnouncesOk(const SubscribeAnnouncesOk& saOk) {
 }
 
 void MoQRelaySession::onUnsubscribeAnnounces(UnsubscribeAnnounces unsub) {
-  XLOG(DBG1) << __func__ << " prefix=" << unsub.trackNamespacePrefix
-             << " sess=" << this;
   if (logger_) {
     logger_->logUnsubscribeAnnounces(
         unsub, MOQTByteStringType::STRING_VALUE, ControlMessageType::PARSED);
@@ -676,17 +710,104 @@ void MoQRelaySession::onUnsubscribeAnnounces(UnsubscribeAnnounces unsub) {
     XLOG(DBG1) << __func__ << "No publisher callback set";
     return;
   }
-  // TODO: also search pendingRequests_?
-  auto saIt = subscribeAnnounces_.find(unsub.trackNamespacePrefix);
-  if (saIt == subscribeAnnounces_.end()) {
-    XLOG(ERR) << "Invalid unsub announce nsp=" << unsub.trackNamespacePrefix;
+
+  // Version-based lookup
+  std::shared_ptr<Publisher::SubscribeAnnouncesHandle> handle;
+  RequestID requestID;
+  TrackNamespace ns;
+
+  if (getDraftMajorVersion(*getNegotiatedVersion()) >= 15) {
+    // v15+: Direct lookup by Request ID
+    if (!unsub.requestID.hasValue()) {
+      XLOG(ERR) << __func__ << " missing requestID for v15+, sess=" << this;
+      return;
+    }
+    requestID = unsub.requestID.value();
+    XLOG(DBG1) << __func__ << " requestID=" << requestID << " sess=" << this;
+
+    auto saIt = reqIdToSubscribeAnnounces_.find(requestID);
+    if (saIt == reqIdToSubscribeAnnounces_.end()) {
+      XLOG(ERR) << "Invalid unsub announce requestID=" << requestID;
+      return;
+    }
+    handle = saIt->second;
   } else {
-    folly::RequestContextScopeGuard guard;
-    setRequestSession();
-    saIt->second->unsubscribeAnnounces();
-    subscribeAnnounces_.erase(saIt);
-    retireRequestID(/*signalWriteLoop=*/true);
+    // <v15: Two-step lookup via namespace
+    if (!unsub.trackNamespacePrefix.hasValue()) {
+      XLOG(ERR) << __func__
+                << " missing trackNamespacePrefix for <v15, sess=" << this;
+      return;
+    }
+    ns = unsub.trackNamespacePrefix.value();
+    XLOG(DBG1) << __func__ << " prefix=" << ns << " sess=" << this;
+
+    auto nsIt = trackNsTosubscribeAnnounces_.find(ns);
+    if (nsIt == trackNsTosubscribeAnnounces_.end()) {
+      XLOG(ERR) << "Invalid unsub announce nsp=" << ns;
+      return;
+    }
+    handle = nsIt->second;
   }
+
+  // Process unsubscribe
+  folly::RequestContextScopeGuard guard;
+  setRequestSession();
+  handle->unsubscribeAnnounces();
+  if (getDraftMajorVersion(*getNegotiatedVersion()) >= 15) {
+    reqIdToSubscribeAnnounces_.erase(requestID);
+  } else {
+    trackNsTosubscribeAnnounces_.erase(ns);
+  }
+
+  retireRequestID(/*signalWriteLoop=*/true);
+}
+
+// Helper methods for handling RequestOk
+void MoQRelaySession::handleAnnounceOkFromRequestOk(
+    const RequestOk& requestOk,
+    PendingRequestIterator reqIt) {
+  XLOG(DBG1) << __func__ << " reqID=" << requestOk.requestID
+             << " sess=" << this;
+
+  if (logger_) {
+    logger_->logAnnounceOk(requestOk, ControlMessageType::PARSED);
+  }
+
+  auto* announcePtr =
+      MoQRelayPendingRequestState::tryGetAnnounce(reqIt->second.get());
+  if (!announcePtr) {
+    XLOG(ERR) << "Request ID " << requestOk.requestID
+              << " is not an announce request, sess=" << this;
+    close(SessionCloseErrorCode::PROTOCOL_VIOLATION);
+    return;
+  }
+
+  publisherAnnounces_[announcePtr->trackNamespace] =
+      std::move(announcePtr->callback);
+  announcePtr->promise.setValue(requestOk);
+}
+
+void MoQRelaySession::handleSubscribeAnnouncesOkFromRequestOk(
+    const RequestOk& requestOk,
+    PendingRequestIterator reqIt) {
+  XLOG(DBG1) << __func__ << " reqID=" << requestOk.requestID
+             << " sess=" << this;
+
+  if (logger_) {
+    logger_->logSubscribeAnnouncesOk(requestOk, ControlMessageType::PARSED);
+  }
+
+  auto* subscribeAnnouncesPtr =
+      MoQRelayPendingRequestState::tryGetSubscribeAnnounces(
+          reqIt->second.get());
+  if (!subscribeAnnouncesPtr) {
+    XLOG(ERR) << "Request ID " << requestOk.requestID
+              << " is not a subscribe announces request, sess=" << this;
+    close(SessionCloseErrorCode::PROTOCOL_VIOLATION);
+    return;
+  }
+
+  subscribeAnnouncesPtr->setValue(requestOk);
 }
 
 } // namespace moxygen

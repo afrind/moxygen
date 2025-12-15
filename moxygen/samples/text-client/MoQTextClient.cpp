@@ -12,6 +12,7 @@
 #include <signal.h>
 #include <moxygen/MoQWebTransportClient.h>
 #include <moxygen/ObjectReceiver.h>
+#include <moxygen/mlog/MLogger.h>
 #include <moxygen/relay/MoQRelayClient.h>
 #include <moxygen/util/InsecureVerifierDangerousDoNotUseInProduction.h>
 
@@ -45,7 +46,7 @@ DEFINE_uint64(unsubscribe_time, 30, "Time to unsubscribe in seconds");
 DEFINE_bool(
     use_legacy_setup,
     false,
-    "If true, use only moq-00 ALPN (legacy). If false, use both moqt-15 and moq-00");
+    "If true, use only moq-00 ALPN (legacy). If false, use latest draft ALPN with fallback to legacy");
 DEFINE_uint64(
     delivery_timeout,
     0,
@@ -54,6 +55,10 @@ DEFINE_bool(
     insecure,
     false,
     "Use insecure verifier (skip certificate validation)");
+DEFINE_string(
+    mlog_path,
+    "",
+    "If non-empty, write MoQ logs to the specified file path");
 
 namespace {
 using namespace moxygen;
@@ -157,7 +162,8 @@ class MoQTextClient : public Subscriber,
       std::shared_ptr<MoQFollyExecutorImpl> evb,
       proxygen::URL url,
       FullTrackName ftn,
-      std::shared_ptr<fizz::CertificateVerifier> verifier = nullptr)
+      std::shared_ptr<fizz::CertificateVerifier> verifier = nullptr,
+      std::shared_ptr<MLogger> logger = nullptr)
       : moqClient_(
             FLAGS_quic_transport
                 ? std::make_unique<MoQClient>(
@@ -170,7 +176,12 @@ class MoQTextClient : public Subscriber,
                       std::move(url),
                       MoQRelaySession::createRelaySessionFactory(),
                       verifier)),
-        fullTrackName_(std::move(ftn)) {}
+        fullTrackName_(std::move(ftn)),
+        logger_(logger) {
+    if (logger) {
+      moqClient_.setLogger(logger);
+    }
+  }
 
   folly::coro::Task<MoQSession::SubscribeAnnouncesResult> subscribeAnnounces(
       SubscribeAnnounces subAnn) {
@@ -214,12 +225,9 @@ class MoQTextClient : public Subscriber,
     auto g =
         folly::makeGuard([func = __func__] { XLOG(INFO) << "exit " << func; });
     try {
-      std::vector<std::string> alpns;
-      if (FLAGS_use_legacy_setup) {
-        alpns = {std::string(kAlpnMoqtLegacy)};
-      } else {
-        alpns = {std::string(kAlpnMoqtDraft15), std::string(kAlpnMoqtLegacy)};
-      }
+      // Default to experimental protocols, override to legacy if flag set
+      std::vector<std::string> alpns =
+          getDefaultMoqtProtocols(!FLAGS_use_legacy_setup);
       co_await moqClient_.setup(
           /*publisher=*/nullptr,
           /*subscriber=*/shared_from_this(),
@@ -375,6 +383,7 @@ class MoQTextClient : public Subscriber,
 
   MoQRelayClient moqClient_;
   FullTrackName fullTrackName_;
+  std::shared_ptr<MLogger> logger_;
   std::shared_ptr<Publisher::SubscriptionHandle> subscription_;
   std::shared_ptr<TextHandler> subTextHandler_{
       std::make_shared<TextHandler>(/*fetch=*/false)};
@@ -396,6 +405,11 @@ int main(int argc, char* argv[]) {
   folly::Init init(&argc, &argv, false);
   folly::EventBase eventBase;
   proxygen::URL url(FLAGS_connect_url);
+  std::shared_ptr<MLogger> logger;
+  if (!FLAGS_mlog_path.empty()) {
+    logger = std::make_shared<MLogger>(VantagePoint::CLIENT);
+    logger->setPath(FLAGS_mlog_path);
+  }
   if (!url.isValid() || !url.hasHost()) {
     XLOG(ERR) << "Invalid url: " << FLAGS_connect_url;
   }
@@ -416,7 +430,8 @@ int main(int argc, char* argv[]) {
       moqEvb,
       std::move(url),
       moxygen::FullTrackName({ns, FLAGS_track_name}),
-      verifier);
+      verifier,
+      logger);
 
   class SigHandler : public folly::AsyncSignalHandler {
    public:
@@ -442,6 +457,9 @@ int main(int argc, char* argv[]) {
   SigHandler handler(&eventBase, [&textClient](int) mutable {
     textClient->stop();
     textClient->moqClient_.shutdown();
+    if (textClient->logger_) {
+      textClient->logger_->outputLogsToFile();
+    }
   });
 
   auto subParams = flags2params();
@@ -449,9 +467,7 @@ int main(int argc, char* argv[]) {
   if (FLAGS_delivery_timeout > 0) {
     params.insertParam(
         {folly::to_underlying(TrackRequestParamKey::DELIVERY_TIMEOUT),
-         "",
-         FLAGS_delivery_timeout,
-         {}});
+         FLAGS_delivery_timeout});
   }
   co_withExecutor(
       &eventBase,
@@ -467,6 +483,11 @@ int main(int argc, char* argv[]) {
               std::move(params))))
       .start()
       .via(&eventBase)
-      .thenTry([&handler](auto) { handler.unreg(); });
+      .thenTry([&handler, &textClient](const auto&) {
+        handler.unreg();
+        if (textClient->logger_) {
+          textClient->logger_->outputLogsToFile();
+        }
+      });
   eventBase.loop();
 }

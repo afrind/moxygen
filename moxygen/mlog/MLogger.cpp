@@ -46,20 +46,6 @@ void MLogger::addObjectDatagramParsedLog(MOQTObjectDatagramParsed req) {
   logs_.push_back(std::move(log));
 }
 
-void MLogger::addObjectDatagramStatusCreatedLog(
-    MOQTObjectDatagramStatusCreated req) {
-  auto log = eventCreator_.createObjectDatagramStatusCreatedEvent(
-      vantagePoint_, std::move(req));
-  logs_.push_back(std::move(log));
-}
-
-void MLogger::addObjectDatagramStatusParsedLog(
-    MOQTObjectDatagramStatusParsed req) {
-  auto log = eventCreator_.createObjectDatagramStatusParsedEvent(
-      vantagePoint_, std::move(req));
-  logs_.push_back(std::move(log));
-}
-
 void MLogger::addSubgroupHeaderCreatedLog(MOQTSubgroupHeaderCreated req) {
   auto log = eventCreator_.createSubgroupHeaderCreatedEvent(
       vantagePoint_, std::move(req));
@@ -160,14 +146,6 @@ folly::dynamic MLogger::formatLog(const MLogEvent& log) {
     const MOQTObjectDatagramParsed& msg =
         std::get<MOQTObjectDatagramParsed>(log.data_);
     logObject["data"] = msg.toDynamic();
-  } else if (log.name_ == kObjectDatagramStatusCreatedName) {
-    const MOQTObjectDatagramStatusCreated& msg =
-        std::get<MOQTObjectDatagramStatusCreated>(log.data_);
-    logObject["data"] = msg.toDynamic();
-  } else if (log.name_ == kObjectDatagramStatusParsedName) {
-    const MOQTObjectDatagramStatusParsed& msg =
-        std::get<MOQTObjectDatagramStatusParsed>(log.data_);
-    logObject["data"] = msg.toDynamic();
   } else if (log.name_ == kSubgroupHeaderCreatedName) {
     const MOQTSubgroupHeaderCreated& msg =
         std::get<MOQTSubgroupHeaderCreated>(log.data_);
@@ -248,9 +226,7 @@ void MLogger::logSubscribe(
     const MOQTByteStringType& type,
     ControlMessageType controlType) {
   auto baseMsg = std::make_unique<MOQTSubscribe>();
-  baseMsg->subscribeId = req.requestID.value;
-  baseMsg->trackAlias =
-      req.trackAlias ? req.trackAlias->value : req.requestID.value;
+  baseMsg->requestId = req.requestID.value;
   baseMsg->trackNamespace = convertTrackNamespaceToByteStringFormat(
       req.fullTrackName.trackNamespace.trackNamespace, type);
   baseMsg->trackName =
@@ -259,8 +235,10 @@ void MLogger::logSubscribe(
   baseMsg->groupOrder = static_cast<uint8_t>(req.groupOrder);
   baseMsg->filterType = static_cast<uint8_t>(req.locType);
   if (req.start.hasValue()) {
-    baseMsg->startGroup = req.start.value().group;
-    baseMsg->startObject = req.start.value().object;
+    MOQTLocation loc;
+    loc.group = req.start.value().group;
+    loc.object = req.start.value().object;
+    baseMsg->startLocation = loc;
   }
   baseMsg->endGroup = req.endGroup;
   baseMsg->numberOfParameters = req.params.size();
@@ -275,13 +253,18 @@ void MLogger::logSubscribeUpdate(
     ControlMessageType controlType) {
   auto baseMsg = std::make_unique<MOQTSubscribeUpdate>();
   baseMsg->requestId = req.requestID.value;
-  baseMsg->subscribeId = req.subscriptionRequestID.value;
-  baseMsg->startGroup = req.start.group;
-  baseMsg->startObject = req.start.object;
-  baseMsg->endGroup = req.endGroup;
-  baseMsg->numberOfParameters = req.params.size();
+  baseMsg->subscriptionRequestId = req.subscriptionRequestID.value;
+  if (req.start.has_value()) {
+    baseMsg->startLocation.group = req.start->group;
+    baseMsg->startLocation.object = req.start->object;
+  }
+  if (req.endGroup.has_value()) {
+    baseMsg->endGroup = req.endGroup.value();
+  }
   baseMsg->subscriberPriority = req.priority;
-  baseMsg->subscribeParameters = convertTrackParamsToMoQTParams(req.params);
+  baseMsg->forward = req.forward.value_or(false) ? 1 : 0;
+  baseMsg->numberOfParameters = req.params.size();
+  baseMsg->parameters = convertTrackParamsToMoQTParams(req.params);
 
   logControlMessage(
       controlType, kFirstBidiStreamId, folly::none, std::move(baseMsg));
@@ -302,33 +285,41 @@ void MLogger::logFetch(
     const MOQTByteStringType& type,
     ControlMessageType controlType) {
   auto baseMsg = std::make_unique<MOQTFetch>();
-  baseMsg->subscribeId = req.requestID.value;
+  baseMsg->requestId = req.requestID.value;
   baseMsg->subscriberPriority = req.priority;
   baseMsg->groupOrder = static_cast<uint8_t>(req.groupOrder);
 
   auto [standalone, joining] = fetchType(req);
   if (joining) {
-    baseMsg->fetchType = static_cast<uint64_t>(joining->fetchType);
-    baseMsg->joiningSubscribeId =
+    if (joining->fetchType == FetchType::RELATIVE_JOINING) {
+      baseMsg->fetchType = "relative_joining";
+    } else {
+      baseMsg->fetchType = "absolute_joining";
+    }
+    MOQTJoiningFetch joiningFetchMsg;
+    joiningFetchMsg.joiningRequestId =
         std::get<JoiningFetch>(req.args).joiningRequestID.value;
-    baseMsg->precedingGroupOffset =
+    joiningFetchMsg.joiningStart =
         std::get<JoiningFetch>(req.args).joiningStart;
+    baseMsg->joiningFetch = std::move(joiningFetchMsg);
   } else if (standalone) {
-    baseMsg->fetchType = static_cast<uint64_t>(FetchType::STANDALONE);
-    baseMsg->startGroup = std::get<StandaloneFetch>(req.args).start.group;
-    baseMsg->startObject = std::get<StandaloneFetch>(req.args).start.object;
-    baseMsg->endGroup = std::get<StandaloneFetch>(req.args).end.group;
-    baseMsg->endObject = std::get<StandaloneFetch>(req.args).end.object;
-  }
-
-  baseMsg->trackNamespace = convertTrackNamespaceToByteStringFormat(
-      req.fullTrackName.trackNamespace.trackNamespace, type);
-  if (req.fullTrackName.trackName != "") {
-    baseMsg->trackName =
+    baseMsg->fetchType = "standalone";
+    MOQTStandaloneFetch standaloneFetchMsg;
+    standaloneFetchMsg.trackNamespace = convertTrackNamespaceToByteStringFormat(
+        req.fullTrackName.trackNamespace.trackNamespace, type);
+    standaloneFetchMsg.trackName =
         convertTrackNameToByteStringFormat(req.fullTrackName.trackName);
+    standaloneFetchMsg.startLocation.group =
+        std::get<StandaloneFetch>(req.args).start.group;
+    standaloneFetchMsg.startLocation.object =
+        std::get<StandaloneFetch>(req.args).start.object;
+    standaloneFetchMsg.endLocation.group =
+        std::get<StandaloneFetch>(req.args).end.group;
+    standaloneFetchMsg.endLocation.object =
+        std::get<StandaloneFetch>(req.args).end.object;
+    baseMsg->standaloneFetch = std::move(standaloneFetchMsg);
   }
 
-  baseMsg->numberOfParameters = req.params.size();
   baseMsg->parameters = convertTrackParamsToMoQTParams(req.params);
 
   logControlMessage(
@@ -339,7 +330,7 @@ void MLogger::logFetchCancel(
     const FetchCancel& req,
     ControlMessageType controlType) {
   auto baseMsg = std::make_unique<MOQTFetchCancel>();
-  baseMsg->subscribeId = req.requestID.value;
+  baseMsg->requestId = req.requestID.value;
 
   logControlMessage(
       controlType, kFirstBidiStreamId, folly::none, std::move(baseMsg));
@@ -347,13 +338,9 @@ void MLogger::logFetchCancel(
 
 void MLogger::logAnnounceOk(
     const AnnounceOk& req,
-    const MOQTByteStringType& type,
     ControlMessageType controlType) {
   auto baseMsg = std::make_unique<MOQTAnnounceOk>();
-  // TODO
-  TrackNamespace ns;
-  baseMsg->trackNamespace =
-      convertTrackNamespaceToByteStringFormat(ns.trackNamespace, type);
+  baseMsg->requestId = req.requestID.value;
 
   logControlMessage(
       controlType, kFirstBidiStreamId, folly::none, std::move(baseMsg));
@@ -361,12 +348,9 @@ void MLogger::logAnnounceOk(
 
 void MLogger::logAnnounceError(
     const AnnounceError& req,
-    const TrackNamespace& trackNamespace,
-    const MOQTByteStringType& type,
     ControlMessageType controlType) {
   auto baseMsg = std::make_unique<MOQTAnnounceError>();
-  baseMsg->trackNamespace = convertTrackNamespaceToByteStringFormat(
-      trackNamespace.trackNamespace, type);
+  baseMsg->requestId = req.requestID.value;
   baseMsg->errorCode = static_cast<uint64_t>(req.errorCode);
 
   if (isHexstring(req.reasonPhrase)) {
@@ -403,10 +387,26 @@ void MLogger::logTrackStatus(
     const MOQTByteStringType& type,
     ControlMessageType controlType) {
   auto baseMsg = std::make_unique<MOQTTrackStatus>();
+  baseMsg->requestId = req.requestID.value;
   baseMsg->trackNamespace = convertTrackNamespaceToByteStringFormat(
       req.fullTrackName.trackNamespace.trackNamespace, type);
   baseMsg->trackName =
       convertTrackNameToByteStringFormat(req.fullTrackName.trackName, type);
+  baseMsg->subscriberPriority = req.priority;
+  baseMsg->groupOrder = static_cast<uint8_t>(req.groupOrder);
+  baseMsg->forward = req.forward;
+  baseMsg->filterType = 0;
+  if (req.start.has_value()) {
+    MOQTLocation loc;
+    loc.group = req.start.value().group;
+    loc.object = req.start.value().object;
+    baseMsg->startLocation = loc;
+  }
+  if (req.endGroup != 0) {
+    baseMsg->endGroup = req.endGroup;
+  }
+  baseMsg->numberOfParameters = req.params.size();
+  baseMsg->parameters = convertTrackParamsToMoQTParams(req.params);
 
   logControlMessage(
       controlType, kFirstBidiStreamId, folly::none, std::move(baseMsg));
@@ -417,7 +417,8 @@ void MLogger::logSubscribeAnnounces(
     const MOQTByteStringType& type,
     ControlMessageType controlType) {
   auto baseMsg = std::make_unique<MOQTSubscribeAnnounces>();
-  baseMsg->trackNamespace = convertTrackNamespaceToByteStringFormat(
+  baseMsg->requestId = req.requestID.value;
+  baseMsg->trackNamespacePrefix = convertTrackNamespaceToByteStringFormat(
       req.trackNamespacePrefix.trackNamespace, type);
   baseMsg->numberOfParameters = req.params.size();
   baseMsg->parameters = convertTrackParamsToMoQTParams(req.params);
@@ -431,8 +432,14 @@ void MLogger::logUnsubscribeAnnounces(
     const MOQTByteStringType& type,
     ControlMessageType controlType) {
   auto baseMsg = std::make_unique<MOQTUnsubscribeAnnounces>();
-  baseMsg->trackNamespace = convertTrackNamespaceToByteStringFormat(
-      req.trackNamespacePrefix.trackNamespace, type);
+  if (req.trackNamespacePrefix.has_value()) {
+    baseMsg->trackNamespace = convertTrackNamespaceToByteStringFormat(
+        req.trackNamespacePrefix.value().trackNamespace, type);
+  }
+
+  if (req.requestID.has_value()) {
+    baseMsg->requestID = req.requestID->value;
+  }
 
   logControlMessage(
       controlType, kFirstBidiStreamId, folly::none, std::move(baseMsg));
@@ -442,20 +449,23 @@ void MLogger::logSubscribeOk(
     const SubscribeOk& req,
     ControlMessageType controlType) {
   auto baseMsg = std::make_unique<MOQTSubscribeOk>();
-  baseMsg->subscribeId = req.requestID.value;
+  baseMsg->requestId = req.requestID.value;
+  baseMsg->trackAlias = req.trackAlias.value;
   baseMsg->expires = req.expires.count();
   baseMsg->groupOrder = static_cast<uint8_t>(req.groupOrder);
 
   if (req.largest.has_value()) {
     baseMsg->contentExists = 1;
-    baseMsg->largestGroupId = req.largest.value().group;
-    baseMsg->largestObjectId = req.largest.value().object;
+    MOQTLocation loc;
+    loc.group = req.largest.value().group;
+    loc.object = req.largest.value().object;
+    baseMsg->largestLocation = loc;
   } else {
     baseMsg->contentExists = 0;
   }
 
   baseMsg->numberOfParameters = req.params.size();
-  baseMsg->subscribeParameters = convertTrackParamsToMoQTParams(req.params);
+  baseMsg->parameters = convertTrackParamsToMoQTParams(req.params);
 
   logControlMessage(
       controlType, kFirstBidiStreamId, folly::none, std::move(baseMsg));
@@ -465,7 +475,7 @@ void MLogger::logSubscribeError(
     const SubscribeError& req,
     ControlMessageType controlType) {
   auto baseMsg = std::make_unique<MOQTSubscribeError>();
-  baseMsg->subscribeId = req.requestID.value;
+  baseMsg->requestId = req.requestID.value;
   baseMsg->errorCode = static_cast<uint64_t>(req.errorCode);
 
   if (isHexstring(req.reasonPhrase)) {
@@ -481,13 +491,13 @@ void MLogger::logSubscribeError(
 
 void MLogger::logFetchOk(const FetchOk& req, ControlMessageType controlType) {
   auto baseMsg = std::make_unique<MOQTFetchOk>();
-  baseMsg->subscribeId = req.requestID.value;
+  baseMsg->requestId = req.requestID.value;
   baseMsg->groupOrder = static_cast<uint8_t>(req.groupOrder);
   baseMsg->endOfTrack = req.endOfTrack;
-  baseMsg->largestGroupId = req.endLocation.group;
-  baseMsg->largestObjectId = req.endLocation.object;
+  baseMsg->endLocation.group = req.endLocation.group;
+  baseMsg->endLocation.object = req.endLocation.object;
   baseMsg->numberOfParameters = req.params.size();
-  baseMsg->subscribeParameters = convertTrackParamsToMoQTParams(req.params);
+  baseMsg->parameters = convertTrackParamsToMoQTParams(req.params);
 
   logControlMessage(
       controlType, kFirstBidiStreamId, folly::none, std::move(baseMsg));
@@ -497,7 +507,7 @@ void MLogger::logFetchError(
     const FetchError& req,
     ControlMessageType controlType) {
   auto baseMsg = std::make_unique<MOQTFetchError>();
-  baseMsg->subscribeId = req.requestID.value;
+  baseMsg->requestId = req.requestID.value;
   baseMsg->errorCode = static_cast<uint64_t>(req.errorCode);
 
   if (isHexstring(req.reasonPhrase)) {
@@ -510,11 +520,11 @@ void MLogger::logFetchError(
       controlType, kFirstBidiStreamId, folly::none, std::move(baseMsg));
 }
 
-void MLogger::logSubscribeDone(
+void MLogger::logPublishDone(
     const SubscribeDone& req,
     ControlMessageType controlType) {
-  auto baseMsg = std::make_unique<MOQTSubscribeDone>();
-  baseMsg->subscribeId = req.requestID.value;
+  auto baseMsg = std::make_unique<MOQTPublishDone>();
+  baseMsg->requestId = req.requestID.value;
   baseMsg->statusCode = static_cast<uint64_t>(req.statusCode);
   baseMsg->streamCount = req.streamCount;
 
@@ -523,16 +533,6 @@ void MLogger::logSubscribeDone(
   } else {
     baseMsg->reason = req.reasonPhrase;
   }
-
-  logControlMessage(
-      controlType, kFirstBidiStreamId, folly::none, std::move(baseMsg));
-}
-
-void MLogger::logMaxSubscribeId(
-    const uint64_t maxRequestID,
-    ControlMessageType controlType) {
-  auto baseMsg = std::make_unique<MOQTMaxSubscribeId>();
-  baseMsg->subscribeId = maxRequestID;
 
   logControlMessage(
       controlType, kFirstBidiStreamId, folly::none, std::move(baseMsg));
@@ -556,19 +556,24 @@ void MLogger::logTrackStatusOk(
     ControlMessageType controlType) {
   auto baseMsg = std::make_unique<MOQTTrackStatusOk>();
   baseMsg->requestId = req.requestID.value;
+  if (req.trackAlias.value != 0) {
+    baseMsg->trackAlias = req.trackAlias.value;
+  }
   baseMsg->expires = req.expires.count();
   baseMsg->groupOrder = static_cast<uint8_t>(req.groupOrder);
 
   if (req.largest.has_value()) {
     baseMsg->contentExists = 1;
-    baseMsg->largestGroupId = req.largest.value().group;
-    baseMsg->largestObjectId = req.largest.value().object;
+    MOQTLocation loc;
+    loc.group = req.largest.value().group;
+    loc.object = req.largest.value().object;
+    baseMsg->largestLocation = loc;
   } else {
     baseMsg->contentExists = 0;
   }
 
   baseMsg->numberOfParameters = req.params.size();
-  baseMsg->subscribeParameters = convertTrackParamsToMoQTParams(req.params);
+  baseMsg->parameters = convertTrackParamsToMoQTParams(req.params);
 
   logControlMessage(
       controlType, kFirstBidiStreamId, folly::none, std::move(baseMsg));
@@ -592,11 +597,21 @@ void MLogger::logTrackStatusError(
       controlType, kFirstBidiStreamId, folly::none, std::move(baseMsg));
 }
 
-void MLogger::logSubscribesBlocked(
-    const uint64_t maxRequestID,
+void MLogger::logMaxRequestId(
+    const uint64_t requestId,
     ControlMessageType controlType) {
-  auto baseMsg = std::make_unique<MOQTSubscribesBlocked>();
-  baseMsg->maximumSubscribeId = maxRequestID;
+  auto baseMsg = std::make_unique<MOQTMaxRequestId>();
+  baseMsg->requestId = requestId;
+
+  logControlMessage(
+      controlType, kFirstBidiStreamId, folly::none, std::move(baseMsg));
+}
+
+void MLogger::logRequestsBlocked(
+    const uint64_t maximumRequestId,
+    ControlMessageType controlType) {
+  auto baseMsg = std::make_unique<MOQTRequestsBlocked>();
+  baseMsg->maximumRequestId = maximumRequestId;
 
   logControlMessage(
       controlType, kFirstBidiStreamId, folly::none, std::move(baseMsg));
@@ -607,6 +622,7 @@ void MLogger::logAnnounce(
     const MOQTByteStringType& type,
     ControlMessageType controlType) {
   auto baseMsg = std::make_unique<MOQTAnnounce>();
+  baseMsg->requestId = req.requestID.value;
   baseMsg->trackNamespace = convertTrackNamespaceToByteStringFormat(
       req.trackNamespace.trackNamespace, type);
   baseMsg->numberOfParameters = req.params.size();
@@ -618,13 +634,9 @@ void MLogger::logAnnounce(
 
 void MLogger::logSubscribeAnnouncesOk(
     const SubscribeAnnouncesOk& req,
-    const MOQTByteStringType& type,
     ControlMessageType controlType) {
   auto baseMsg = std::make_unique<MOQTSubscribeAnnouncesOk>();
-  // TODO
-  TrackNamespace ns;
-  baseMsg->trackNamespace =
-      convertTrackNamespaceToByteStringFormat(ns.trackNamespace, type);
+  baseMsg->requestId = req.requestID.value;
 
   logControlMessage(
       controlType, kFirstBidiStreamId, folly::none, std::move(baseMsg));
@@ -632,12 +644,76 @@ void MLogger::logSubscribeAnnouncesOk(
 
 void MLogger::logSubscribeAnnouncesError(
     const SubscribeAnnouncesError& req,
-    const TrackNamespace& trackNamespace,
-    const MOQTByteStringType& type,
     ControlMessageType controlType) {
   auto baseMsg = std::make_unique<MOQTSubscribeAnnouncesError>();
+  baseMsg->requestId = req.requestID.value;
+  baseMsg->errorCode = static_cast<uint64_t>(req.errorCode);
+
+  if (isHexstring(req.reasonPhrase)) {
+    baseMsg->reasonBytes = req.reasonPhrase;
+  } else {
+    baseMsg->reason = req.reasonPhrase;
+  }
+
+  logControlMessage(
+      controlType, kFirstBidiStreamId, folly::none, std::move(baseMsg));
+}
+
+void MLogger::logPublish(
+    const PublishRequest& req,
+    const MOQTByteStringType& type,
+    ControlMessageType controlType) {
+  auto baseMsg = std::make_unique<MOQTPublish>();
+  baseMsg->requestId = req.requestID.value;
   baseMsg->trackNamespace = convertTrackNamespaceToByteStringFormat(
-      trackNamespace.trackNamespace, type);
+      req.fullTrackName.trackNamespace.trackNamespace, type);
+  baseMsg->trackName =
+      convertTrackNameToByteStringFormat(req.fullTrackName.trackName, type);
+  baseMsg->trackAlias = req.trackAlias.value;
+  baseMsg->groupOrder = static_cast<uint8_t>(req.groupOrder);
+  baseMsg->contentExists = req.largest.has_value() ? 1 : 0;
+  if (req.largest.has_value()) {
+    MOQTLocation loc;
+    loc.group = req.largest.value().group;
+    loc.object = req.largest.value().object;
+    baseMsg->largest = loc;
+  }
+  baseMsg->forward = req.forward ? 1 : 0;
+  baseMsg->numberOfParameters = req.params.size();
+  baseMsg->parameters = convertTrackParamsToMoQTParams(req.params);
+
+  logControlMessage(
+      controlType, kFirstBidiStreamId, folly::none, std::move(baseMsg));
+}
+
+void MLogger::logPublishOk(
+    const PublishOk& req,
+    ControlMessageType controlType) {
+  auto baseMsg = std::make_unique<MOQTPublishOk>();
+  baseMsg->requestId = req.requestID.value;
+  baseMsg->forward = req.forward ? 1 : 0;
+  baseMsg->subscriberPriority = req.subscriberPriority;
+  baseMsg->groupOrder = static_cast<uint8_t>(req.groupOrder);
+  baseMsg->filterType = static_cast<uint64_t>(req.locType);
+  if (req.start.has_value()) {
+    MOQTLocation loc;
+    loc.group = req.start.value().group;
+    loc.object = req.start.value().object;
+    baseMsg->start = loc;
+  }
+  baseMsg->endGroup = req.endGroup;
+  baseMsg->numberOfParameters = req.params.size();
+  baseMsg->parameters = convertTrackParamsToMoQTParams(req.params);
+
+  logControlMessage(
+      controlType, kFirstBidiStreamId, folly::none, std::move(baseMsg));
+}
+
+void MLogger::logPublishError(
+    const PublishError& req,
+    ControlMessageType controlType) {
+  auto baseMsg = std::make_unique<MOQTPublishError>();
+  baseMsg->requestId = req.requestID.value;
   baseMsg->errorCode = static_cast<uint64_t>(req.errorCode);
 
   if (isHexstring(req.reasonPhrase)) {
@@ -759,10 +835,18 @@ void MLogger::logObjectDatagramCreated(
   baseMsg.groupId = header.group;
   baseMsg.objectId = header.id;
   baseMsg.publisherPriority = header.priority.value_or(kDefaultPriority);
-  baseMsg.extensionHeadersLength = header.extensions.size();
+  if (header.extensions.size() > 0) {
+    baseMsg.extensionHeadersLength = header.extensions.size();
+  }
   baseMsg.extensionHeaders = convertExtensionToMoQTExtensionHeaders(
       header.extensions.getMutableExtensions());
-  baseMsg.objectPayload = payload->clone();
+  if (header.status != ObjectStatus::NORMAL) {
+    baseMsg.objectStatus = static_cast<uint64_t>(header.status);
+  }
+  if (payload) {
+    baseMsg.objectPayload = payload->clone();
+  }
+  baseMsg.endOfGroup = false; // TODO: Extract from datagram type when available
   addObjectDatagramCreatedLog(std::move(baseMsg));
 }
 
@@ -775,43 +859,21 @@ void MLogger::logObjectDatagramParsed(
   baseMsg.groupId = header.group;
   baseMsg.objectId = header.id;
   baseMsg.publisherPriority = header.priority.value_or(kDefaultPriority);
-  baseMsg.extensionHeadersLength = header.extensions.size();
+  if (header.extensions.size() > 0) {
+    baseMsg.extensionHeadersLength = header.extensions.size();
+  }
   baseMsg.extensionHeaders = convertExtensionToMoQTExtensionHeaders(
       header.extensions.getMutableExtensions());
-  std::unique_ptr<folly::IOBuf> objPayload =
-      folly::IOBuf::copyBuffer({payload->data(), payload->length()});
-  baseMsg.objectPayload = std::move(objPayload);
+  if (header.status != ObjectStatus::NORMAL) {
+    baseMsg.objectStatus = static_cast<uint64_t>(header.status);
+  }
+  if (payload) {
+    std::unique_ptr<folly::IOBuf> objPayload =
+        folly::IOBuf::copyBuffer({payload->data(), payload->length()});
+    baseMsg.objectPayload = std::move(objPayload);
+  }
+  baseMsg.endOfGroup = false; // TODO: Extract from datagram type when available
   addObjectDatagramParsedLog(std::move(baseMsg));
-}
-
-void MLogger::logObjectDatagramStatusCreated(
-    TrackAlias trackAlias,
-    const ObjectHeader& header) {
-  MOQTObjectDatagramStatusCreated baseMsg;
-  baseMsg.trackAlias = trackAlias.value;
-  baseMsg.groupId = header.group;
-  baseMsg.objectId = header.id;
-  baseMsg.publisherPriority = header.priority.value_or(kDefaultPriority);
-  baseMsg.extensionHeadersLength = header.extensions.size();
-  baseMsg.extensionHeaders = convertExtensionToMoQTExtensionHeaders(
-      header.extensions.getMutableExtensions());
-  baseMsg.objectStatus = static_cast<uint64_t>(header.status);
-  addObjectDatagramStatusCreatedLog(std::move(baseMsg));
-}
-
-void MLogger::logObjectDatagramStatusParsed(
-    TrackAlias trackAlias,
-    const ObjectHeader& header) {
-  MOQTObjectDatagramStatusParsed baseMsg;
-  baseMsg.trackAlias = trackAlias.value;
-  baseMsg.groupId = header.group;
-  baseMsg.objectId = header.id;
-  baseMsg.publisherPriority = header.priority.value_or(kDefaultPriority);
-  baseMsg.extensionHeadersLength = header.extensions.size();
-  baseMsg.extensionHeaders = convertExtensionToMoQTExtensionHeaders(
-      header.extensions.getMutableExtensions());
-  baseMsg.objectStatus = static_cast<uint64_t>(header.status);
-  addObjectDatagramStatusParsedLog(std::move(baseMsg));
 }
 
 void MLogger::logSubgroupHeaderCreated(
@@ -819,13 +881,23 @@ void MLogger::logSubgroupHeaderCreated(
     TrackAlias trackAlias,
     uint64_t groupId,
     uint64_t sugroupId,
-    uint8_t publisherPriority) {
+    uint8_t publisherPriority,
+    SubgroupIDFormat format,
+    bool includeExtensions,
+    bool endOfGroup) {
   MOQTSubgroupHeaderCreated baseMsg;
   baseMsg.streamId = streamId;
   baseMsg.trackAlias = trackAlias.value;
   baseMsg.groupId = groupId;
-  baseMsg.subgroupId = sugroupId;
+
+  // Per spec: subgroup_id is omitted if it equals object_id of first object
+  if (format != SubgroupIDFormat::FirstObject) {
+    baseMsg.subgroupId = sugroupId;
+  }
+
   baseMsg.publisherPriority = publisherPriority;
+  baseMsg.containsEndOfGroup = endOfGroup;
+  baseMsg.extensionsPresent = includeExtensions;
   addSubgroupHeaderCreatedLog(std::move(baseMsg));
 }
 
@@ -834,13 +906,19 @@ void MLogger::logSubgroupHeaderParsed(
     TrackAlias trackAlias,
     uint64_t groupId,
     uint64_t sugroupId,
-    uint8_t publisherPriority) {
+    uint8_t publisherPriority,
+    const SubgroupOptions& options) {
   MOQTSubgroupHeaderParsed baseMsg;
   baseMsg.streamId = streamId;
   baseMsg.trackAlias = trackAlias.value;
   baseMsg.groupId = groupId;
-  baseMsg.subgroupId = sugroupId;
+  // Only set subgroupId if it's not using FirstObject format
+  if (options.subgroupIDFormat != SubgroupIDFormat::FirstObject) {
+    baseMsg.subgroupId = sugroupId;
+  }
   baseMsg.publisherPriority = publisherPriority;
+  baseMsg.containsEndOfGroup = options.hasEndOfGroup;
+  baseMsg.extensionsPresent = options.hasExtensions;
   addSubgroupHeaderParsedLog(std::move(baseMsg));
 }
 
@@ -884,19 +962,19 @@ void MLogger::logSubgroupObjectParsed(
 
 void MLogger::logFetchHeaderCreated(
     const uint64_t streamId,
-    const uint64_t subscribeId) {
+    const uint64_t requestId) {
   MOQTFetchHeaderCreated baseMsg;
   baseMsg.streamId = streamId;
-  baseMsg.subscribeId = subscribeId;
+  baseMsg.requestId = requestId;
   addFetchHeaderCreatedLog(std::move(baseMsg));
 }
 
 void MLogger::logFetchHeaderParsed(
     const uint64_t streamId,
-    const uint64_t subscribeId) {
+    const uint64_t requestId) {
   MOQTFetchHeaderParsed baseMsg;
   baseMsg.streamId = streamId;
-  baseMsg.subscribeId = subscribeId;
+  baseMsg.requestId = requestId;
   addFetchHeaderParsedLog(std::move(baseMsg));
 }
 

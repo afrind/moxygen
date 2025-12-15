@@ -11,10 +11,10 @@
 namespace moxygen {
 
 folly::Expected<folly::Unit, std::runtime_error> validateMoQTestParameters(
-    MoQTestParameters* track);
+    const MoQTestParameters& track);
 
 folly::Expected<moxygen::TrackNamespace, std::runtime_error>
-convertMoqTestParamToTrackNamespace(MoQTestParameters* params);
+convertMoqTestParamToTrackNamespace(const MoQTestParameters& params);
 
 folly::Expected<moxygen::MoQTestParameters, std::runtime_error>
 convertTrackNamespaceToMoqTestParam(TrackNamespace* track);
@@ -23,7 +23,7 @@ std::vector<Extension> getExtensions(
     int integerExtensionId,
     int variableExtensionId);
 
-int getObjectSize(int objectId, MoQTestParameters* params);
+int getObjectSize(uint64_t objectId, MoQTestParameters* params);
 
 bool validatePayload(int objectSize, std::string payload);
 

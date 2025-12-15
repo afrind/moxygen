@@ -82,6 +82,7 @@ enum class SubscribeDoneStatusCode : uint32_t {
   GOING_AWAY = 0x4,
   EXPIRED = 0x5,
   TOO_FAR_BEHIND = 0x6,
+  UPDATE_FAILED = 0x8,
   //
   SESSION_CLOSED = std::numeric_limits<uint32_t>::max()
 };
@@ -351,7 +352,7 @@ enum class LocationType : uint8_t {
 std::string toString(LocationType locType);
 
 struct SubscriptionFilter {
-  LocationType filterType;
+  LocationType filterType{LocationType::AbsoluteStart};
   folly::Optional<AbsoluteLocation> location;
   folly::Optional<uint64_t> endGroup;
 
@@ -364,11 +365,62 @@ struct SubscriptionFilter {
 };
 
 struct Parameter {
-  uint64_t key;
+  uint64_t key = 0;
   std::string asString;
-  uint64_t asUint64;
+  uint64_t asUint64 = 0;
   AuthToken asAuthToken;
   SubscriptionFilter asSubscriptionFilter;
+  folly::Optional<AbsoluteLocation> largestObject;
+
+  // Constructors for Parameter for each type, provided the key and the type
+
+  // String parameter
+  Parameter(uint64_t keyIn, const std::string& str)
+      : key(keyIn),
+        asString(str),
+        asUint64(0),
+        asAuthToken(),
+        asSubscriptionFilter(),
+        largestObject() {}
+
+  // uint64_t parameter
+  Parameter(uint64_t keyIn, uint64_t uint64)
+      : key(keyIn),
+        asString(),
+        asUint64(uint64),
+        asAuthToken(),
+        asSubscriptionFilter(),
+        largestObject() {}
+
+  // AuthToken parameter
+  Parameter(uint64_t keyIn, const AuthToken& token)
+      : key(keyIn),
+        asString(),
+        asUint64(0),
+        asAuthToken(token),
+        asSubscriptionFilter(),
+        largestObject() {}
+
+  // SubscriptionFilter parameter
+  Parameter(uint64_t keyIn, const SubscriptionFilter& filter)
+      : key(keyIn),
+        asString(),
+        asUint64(0),
+        asAuthToken(),
+        asSubscriptionFilter(filter),
+        largestObject() {}
+
+  // LargestObject parameter (folly::Optional<AbsoluteLocation>)
+  Parameter(uint64_t keyIn, const folly::Optional<AbsoluteLocation>& loc)
+      : key(keyIn),
+        asString(),
+        asUint64(0),
+        asAuthToken(),
+        asSubscriptionFilter(),
+        largestObject(loc) {}
+
+  // Default constructor
+  Parameter() = default;
 };
 
 using SetupParameter = Parameter;
@@ -379,7 +431,12 @@ enum class TrackRequestParamKey : uint64_t {
   DELIVERY_TIMEOUT = 2,
   MAX_CACHE_DURATION = 4,
   PUBLISHER_PRIORITY = 0x0E,
+  SUBSCRIBER_PRIORITY = 0x20,
   SUBSCRIPTION_FILTER = 0x21,
+  EXPIRES = 8,
+  GROUP_ORDER = 0x22,
+  LARGEST_OBJECT = 0x9,
+  FORWARD = 0x10,
 };
 
 class Parameters {
@@ -501,7 +558,12 @@ constexpr uint64_t kVersionDraftCurrent = kVersionDraft14;
 
 // ALPN constants for version negotiation
 constexpr std::string_view kAlpnMoqtLegacy = "moq-00";
-constexpr std::string_view kAlpnMoqtDraft15 = "moqt-15";
+constexpr std::string_view kAlpnMoqtDraft15Meta00 = "moqt-15-meta-00";
+constexpr std::string_view kAlpnMoqtDraft15Meta01 = "moqt-15-meta-01";
+constexpr std::string_view kAlpnMoqtDraft15Meta02 = "moqt-15-meta-02";
+constexpr std::string_view kAlpnMoqtDraft15Meta03 = "moqt-15-meta-03";
+constexpr std::string_view kAlpnMoqtDraft15Meta04 = "moqt-15-meta-04";
+constexpr std::string_view kAlpnMoqtDraft15Latest = kAlpnMoqtDraft15Meta04;
 
 // In the terminology I'm using for this function, each draft has a "major"
 // and a "minor" version. For example, kVersionDraft08_exp2 has the major
@@ -514,6 +576,11 @@ std::vector<uint64_t> getSupportedLegacyVersions();
 folly::Optional<uint64_t> getVersionFromAlpn(folly::StringPiece alpn);
 folly::Optional<std::string> getAlpnFromVersion(uint64_t version);
 
+// Returns the default list of supported MoQT protocols
+// includeExperimental: if true, includes experimental/draft protocols
+std::vector<std::string> getDefaultMoqtProtocols(
+    bool includeExperimental = false);
+
 constexpr std::array<uint64_t, 3> kSupportedVersions{
     kVersionDraft12,
     kVersionDraft14,
@@ -525,9 +592,18 @@ bool isSupportedVersion(uint64_t version);
 std::string getSupportedVersionsString();
 
 // Helper function to extract an integer parameter by key from a parameter list
+template <class T>
 folly::Optional<uint64_t> getFirstIntParam(
-    const TrackRequestParameters& params,
-    TrackRequestParamKey key);
+    const T& params,
+    TrackRequestParamKey key) {
+  auto keyValue = folly::to_underlying(key);
+  for (const auto& param : params) {
+    if (param.key == keyValue) {
+      return param.asUint64;
+    }
+  }
+  return folly::none;
+}
 
 void writeVarint(
     folly::IOBufQueue& buf,
@@ -941,10 +1017,12 @@ struct SubscribeRequest {
 struct SubscribeUpdate {
   RequestID requestID;
   RequestID subscriptionRequestID;
-  AbsoluteLocation start;
-  uint64_t endGroup;
+  folly::Optional<AbsoluteLocation> start;
+  folly::Optional<uint64_t> endGroup;
   uint8_t priority{kDefaultPriority};
-  bool forward{true}; // Only used in draft-12 and above
+  // Draft 15+: Optional forward field. When absent, existing forward state is
+  // preserved. For earlier drafts, this is always set during parsing.
+  folly::Optional<bool> forward;
   TrackRequestParameters params;
 };
 
@@ -967,7 +1045,7 @@ struct Unsubscribe {
 struct SubscribeDone {
   RequestID requestID;
   SubscribeDoneStatusCode statusCode;
-  uint64_t streamCount;
+  uint64_t streamCount{0};
   std::string reasonPhrase;
 };
 
@@ -1144,16 +1222,23 @@ struct SubscribeAnnounces {
 // SubscribeAnnouncesError is now an alias for RequestError - see below
 
 struct UnsubscribeAnnounces {
-  TrackNamespace trackNamespacePrefix;
+  // Keeping both to maintain compatibility between v15 and v15-
+  folly::Optional<RequestID> requestID;
+  folly::Optional<TrackNamespace> trackNamespacePrefix;
 };
 
 struct RequestOk {
   RequestID requestID;
   TrackRequestParameters params;
+  std::vector<Parameter> requestSpecificParams;
+
+  TrackStatusOk toTrackStatusOk() const;
+  static RequestOk fromTrackStatusOk(const TrackStatusOk& trackStatusOk);
 };
 
 using SubscribeAnnouncesOk = RequestOk;
 using AnnounceOk = RequestOk;
+using SubscribeUpdateOk = RequestOk;
 
 // Consolidated request error structure
 struct RequestError {
@@ -1169,6 +1254,7 @@ using SubscribeAnnouncesError = RequestError;
 using AnnounceError = RequestError;
 using PublishError = RequestError;
 using TrackStatusError = RequestError;
+using SubscribeUpdateError = RequestError;
 
 // Error code aliases
 using SubscribeErrorCode = RequestErrorCode;
@@ -1177,6 +1263,7 @@ using SubscribeAnnouncesErrorCode = RequestErrorCode;
 using AnnounceErrorCode = RequestErrorCode;
 using PublishErrorCode = RequestErrorCode;
 using TrackStatusErrorCode = RequestErrorCode;
+using SubscribeUpdateErrorCode = RequestErrorCode;
 
 inline StreamType getSubgroupStreamType(
     uint64_t version,
@@ -1253,6 +1340,11 @@ folly::Expected<std::string, ErrorCode> parseFixedString(
 
 class MoQFrameParser {
  public:
+  template <typename T>
+  struct ParseResultAndLength {
+    T value;
+    size_t bytesConsumed;
+  };
   folly::Expected<ClientSetup, ErrorCode> parseClientSetup(
       folly::io::Cursor& cursor,
       size_t length) noexcept;
@@ -1267,31 +1359,31 @@ class MoQFrameParser {
       DatagramType datagramType,
       size_t& length) const noexcept;
 
-  folly::Expected<RequestID, ErrorCode> parseFetchHeader(
-      folly::io::Cursor& cursor) const noexcept;
+  folly::Expected<ParseResultAndLength<RequestID>, ErrorCode> parseFetchHeader(
+      folly::io::Cursor& cursor,
+      size_t length) const noexcept;
 
   struct SubgroupHeaderResult {
     TrackAlias trackAlias;
     ObjectHeader objectHeader;
   };
 
-  folly::Expected<SubgroupHeaderResult, ErrorCode> parseSubgroupHeader(
+  folly::Expected<ParseResultAndLength<SubgroupHeaderResult>, ErrorCode>
+  parseSubgroupHeader(
       folly::io::Cursor& cursor,
+      size_t length,
       const SubgroupOptions& options) const noexcept;
 
-  // Parses the stream header and if it's a subgroup type,
-  // parses and returns the Track Alias.  For non-subgroups,
-  // returns folly::none.
-  folly::Expected<folly::Optional<TrackAlias>, ErrorCode>
-  parseSubgroupTypeAndAlias(folly::io::Cursor& cursor, size_t length)
-      const noexcept;
-
-  folly::Expected<ObjectHeader, ErrorCode> parseFetchObjectHeader(
+  folly::Expected<ParseResultAndLength<ObjectHeader>, ErrorCode>
+  parseFetchObjectHeader(
       folly::io::Cursor& cursor,
+      size_t length,
       const ObjectHeader& headerTemplate) const noexcept;
 
-  folly::Expected<ObjectHeader, ErrorCode> parseSubgroupObjectHeader(
+  folly::Expected<ParseResultAndLength<ObjectHeader>, ErrorCode>
+  parseSubgroupObjectHeader(
       folly::io::Cursor& cursor,
+      size_t length,
       const ObjectHeader& headerTemplate,
       const SubgroupOptions& options) const noexcept;
 
@@ -1419,12 +1511,30 @@ class MoQFrameParser {
   // Test only
   void reset() {
     previousObjectID_ = folly::none;
+    previousFetchGroup_ = folly::none;
+    previousFetchSubgroup_ = folly::none;
+    previousFetchPriority_ = folly::none;
   }
 
  private:
+  // Legacy FETCH object parser (draft <= 14)
+  folly::Expected<ObjectHeader, ErrorCode> parseFetchObjectHeaderLegacy(
+      folly::io::Cursor& cursor,
+      size_t& length,
+      const ObjectHeader& headerTemplate) const noexcept;
+
+  // Draft-15+ FETCH object parser with Serialization Flags
+  folly::Expected<ObjectHeader, ErrorCode> parseFetchObjectDraft15(
+      folly::io::Cursor& cursor,
+      size_t& length,
+      const ObjectHeader& headerTemplate) const noexcept;
+
+  // Reset fetch context at start of new FETCH stream
+  void resetFetchContext() const noexcept;
+
   folly::Expected<folly::Unit, ErrorCode> parseObjectStatusAndLength(
       folly::io::Cursor& cursor,
-      size_t length,
+      size_t& length,
       ObjectHeader& objectHeader) const noexcept;
 
   folly::Expected<folly::Unit, ErrorCode> parseTrackRequestParams(
@@ -1466,16 +1576,50 @@ class MoQFrameParser {
       const std::vector<Parameter>& requestSpecificParams) const noexcept;
 
   void handleRequestSpecificParams(
+      SubscribeOk& subscribeOk,
+      const std::vector<Parameter>& requestSpecificParams) const noexcept;
+
+  void handleRequestSpecificParams(
       SubscribeUpdate& subscribeUpdate,
+      const std::vector<Parameter>& requestSpecificParams) const noexcept;
+
+  void handleRequestSpecificParams(
+      PublishRequest& publishRequest,
       const std::vector<Parameter>& requestSpecificParams) const noexcept;
 
   void handleRequestSpecificParams(
       PublishOk& publishOk,
       const std::vector<Parameter>& requestSpecificParams) const noexcept;
 
+  void handleRequestSpecificParams(
+      Fetch& fetchRequest,
+      const std::vector<Parameter>& requestSpecificParams) const noexcept;
+
+  void handleGroupOrderParam(
+      GroupOrder& groupOrderField,
+      const std::vector<Parameter>& requestSpecificParams,
+      GroupOrder defaultGroupOrder) const noexcept;
+
+  void handleSubscriberPriorityParam(
+      uint8_t& priorityField,
+      const std::vector<Parameter>& requestSpecificParams) const noexcept;
+
+  void handleForwardParam(
+      bool& forwardField,
+      const std::vector<Parameter>& requestSpecificParams) const noexcept;
+
+  // Overload for Optional<bool> - used by SubscribeUpdate
+  void handleForwardParam(
+      folly::Optional<bool>& forwardField,
+      const std::vector<Parameter>& requestSpecificParams) const noexcept;
+
   folly::Optional<uint64_t> version_;
   mutable MoQTokenCache tokenCache_;
   mutable folly::Optional<uint64_t> previousObjectID_;
+  // Context for FETCH object delta encoding (draft-15+)
+  mutable folly::Optional<uint64_t> previousFetchGroup_;
+  mutable folly::Optional<uint64_t> previousFetchSubgroup_;
+  mutable folly::Optional<uint8_t> previousFetchPriority_;
 };
 
 //// Egress ////
@@ -1694,8 +1838,28 @@ class MoQFrameWriter {
       folly::IOBufQueue& writeBuf,
       const SubscribeRequest& subscribeRequest) const noexcept;
 
+  // Legacy FETCH object writer (draft <= 14)
+  void writeFetchObjectHeaderLegacy(
+      folly::IOBufQueue& writeBuf,
+      const ObjectHeader& objectHeader,
+      size_t& size,
+      bool& error) const noexcept;
+
+  // Draft-15+ FETCH object writer with Serialization Flags
+  void writeFetchObjectDraft15(
+      folly::IOBufQueue& writeBuf,
+      const ObjectHeader& objectHeader,
+      size_t& size,
+      bool& error) const noexcept;
+
+  void resetWriterFetchContext() const noexcept;
+
   folly::Optional<uint64_t> version_;
   mutable folly::Optional<uint64_t> previousObjectID_;
+  // Context for FETCH object delta encoding (draft-15+)
+  mutable folly::Optional<uint64_t> previousFetchGroup_;
+  mutable folly::Optional<uint64_t> previousFetchSubgroup_;
+  mutable folly::Optional<uint8_t> previousFetchPriority_;
 };
 
 } // namespace moxygen

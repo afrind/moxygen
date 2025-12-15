@@ -49,6 +49,13 @@ class MoQClientBase : public proxygen::WebTransportHandler {
         sessionFactory_(std::move(sessionFactory)),
         verifier_(std::move(verifier)) {}
 
+  ~MoQClientBase() override {
+    if (moqSession_) {
+      moqSession_->close(SessionCloseErrorCode::NO_ERROR);
+      moqSession_.reset();
+    }
+  }
+
   std::shared_ptr<MoQExecutor> getEventBase() {
     return exec_;
   }
@@ -60,7 +67,7 @@ class MoQClientBase : public proxygen::WebTransportHandler {
       std::shared_ptr<Publisher> publishHandler,
       std::shared_ptr<Subscriber> subscribeHandler,
       const quic::TransportSettings& transportSettings,
-      const std::vector<std::string>& alpns = {}) noexcept;
+      const std::vector<std::string>& alpns = {});
 
   void setLogger(const std::shared_ptr<MLogger>& logger);
 
@@ -90,12 +97,13 @@ class MoQClientBase : public proxygen::WebTransportHandler {
       std::shared_ptr<Subscriber> subscribeHandler);
   ClientSetup getClientSetup(const folly::Optional<std::string>& path);
 
-  void onSessionEnd(folly::Optional<uint32_t>) override;
+  void onSessionEnd(folly::Optional<uint32_t>) noexcept override;
+  void onSessionDrain() noexcept override;
   void onNewBidiStream(
-      proxygen::WebTransport::BidiStreamHandle handle) override;
+      proxygen::WebTransport::BidiStreamHandle handle) noexcept override;
   void onNewUniStream(
-      proxygen::WebTransport::StreamReadHandle* handle) override;
-  void onDatagram(std::unique_ptr<folly::IOBuf>) override;
+      proxygen::WebTransport::StreamReadHandle* handle) noexcept override;
+  void onDatagram(std::unique_ptr<folly::IOBuf>) noexcept override;
 
   std::shared_ptr<MoQExecutor> exec_;
   proxygen::URL url_;

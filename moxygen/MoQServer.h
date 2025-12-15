@@ -47,8 +47,8 @@ class MoQServer : public MoQSession::ServerSetupCallback {
     return hqServer_->getWorkerEvbs();
   }
 
-  std::shared_ptr<MLogger> logger_;
   void setLogger(std::shared_ptr<MLogger> logger);
+  std::shared_ptr<MLogger> getLogger() const;
 
   // QUIC stats factory setter
   void setQuicStatsFactory(
@@ -99,6 +99,9 @@ class MoQServer : public MoQSession::ServerSetupCallback {
   virtual std::shared_ptr<MoQSession> createSession(
       folly::MaybeManagedPtr<proxygen::WebTransport> wt,
       std::shared_ptr<MoQExecutor> executor);
+
+  // Register ALPN handlers for direct QUIC connections (internal use)
+  void registerAlpnHandler(const std::vector<std::string>& alpns);
 
  private:
   // AUTHORITY parameter validation methods
@@ -173,7 +176,10 @@ class MoQServer : public MoQSession::ServerSetupCallback {
   std::string cert_;
   std::string key_;
   quic::samples::HQServerParams params_;
+  std::shared_ptr<const fizz::server::FizzServerContext> fizzContext_;
+  std::unique_ptr<quic::samples::HQServerTransportFactory> factory_;
   std::unique_ptr<quic::samples::HQServer> hqServer_;
   std::string endpoint_;
+  std::shared_ptr<MLogger> logger_;
 };
 } // namespace moxygen

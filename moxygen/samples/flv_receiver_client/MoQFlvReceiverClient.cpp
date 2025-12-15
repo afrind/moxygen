@@ -12,6 +12,7 @@
 #include <folly/init/Init.h>
 #include <folly/io/async/AsyncSignalHandler.h>
 #include <signal.h>
+#include <moxygen/util/InsecureVerifierDangerousDoNotUseInProduction.h>
 #include "moxygen/dejitter/DeJitter.h"
 #include "moxygen/flv_parser/FlvWriter.h"
 #include "moxygen/moq_mi/MoQMi.h"
@@ -44,7 +45,11 @@ DEFINE_string(auth, "secret", "MOQ subscription auth string");
 DEFINE_bool(
     use_legacy_setup,
     false,
-    "If true, use only moq-00 ALPN (legacy). If false, use both moqt-15 and moq-00");
+    "If true, use only moq-00 ALPN (legacy). If false, use latest draft ALPN with fallback to legacy");
+DEFINE_bool(
+    insecure,
+    false,
+    "Use insecure verifier (skip certificate validation)");
 
 namespace {
 using namespace moxygen;
@@ -373,12 +378,17 @@ class MoQFlvReceiverClient
       public std::enable_shared_from_this<MoQFlvReceiverClient> {
  public:
   MoQFlvReceiverClient(
-      folly::EventBase* evb,
+      std::shared_ptr<MoQFollyExecutorImpl> evb,
       proxygen::URL url,
       bool useQuic,
-      const std::string& flvOutPath)
-      : moqExecutor_(std::make_shared<MoQFollyExecutorImpl>(evb)),
-        moqClient_(makeMoQClient(moqExecutor_, std::move(url), useQuic)),
+      const std::string& flvOutPath,
+      std::shared_ptr<fizz::CertificateVerifier> verifier = nullptr)
+      : moqClient_(
+            useQuic ? std::make_unique<MoQClient>(evb, std::move(url), verifier)
+                    : std::make_unique<MoQWebTransportClient>(
+                          evb,
+                          std::move(url),
+                          verifier)),
         flvOutPath_(flvOutPath) {}
 
   folly::coro::Task<void> run() noexcept {
@@ -386,12 +396,9 @@ class MoQFlvReceiverClient
     auto g =
         folly::makeGuard([func = __func__] { XLOG(INFO) << "exit " << func; });
     try {
-      std::vector<std::string> alpns;
-      if (FLAGS_use_legacy_setup) {
-        alpns = {std::string(kAlpnMoqtLegacy)};
-      } else {
-        alpns = {std::string(kAlpnMoqtDraft15), std::string(kAlpnMoqtLegacy)};
-      }
+      // Default to experimental protocols, override to legacy if flag set
+      std::vector<std::string> alpns =
+          getDefaultMoqtProtocols(!FLAGS_use_legacy_setup);
       co_await moqClient_->setupMoQSession(
           std::chrono::milliseconds(FLAGS_connect_timeout),
           std::chrono::seconds(FLAGS_transaction_timeout),
@@ -412,9 +419,7 @@ class MoQFlvReceiverClient
       if (FLAGS_delivery_timeout > 0) {
         params.insertParam(
             {folly::to_underlying(TrackRequestParamKey::DELIVERY_TIMEOUT),
-             "",
-             FLAGS_delivery_timeout,
-             {}});
+             FLAGS_delivery_timeout});
       }
 
       auto subAudio = SubscribeRequest::make(
@@ -524,7 +529,6 @@ class MoQFlvReceiverClient
   }
 
  private:
-  std::shared_ptr<MoQFollyExecutorImpl> moqExecutor_;
   std::unique_ptr<MoQClient> moqClient_;
   std::shared_ptr<Publisher::SubscriptionHandle> audioSubscribeHandle_;
   std::shared_ptr<Publisher::SubscriptionHandle> videoSubscribeHandle_;
@@ -555,8 +559,20 @@ int main(int argc, char* argv[]) {
 
   XLOGF(INFO, "Starting consumer from URL: {}", FLAGS_connect_url);
 
+  std::shared_ptr<MoQFollyExecutorImpl> moqEvb =
+      std::make_shared<MoQFollyExecutorImpl>(&eventBase);
+  std::shared_ptr<fizz::CertificateVerifier> verifier = nullptr;
+  if (FLAGS_insecure) {
+    verifier = std::make_shared<
+        moxygen::test::InsecureVerifierDangerousDoNotUseInProduction>();
+  }
+
   auto flvReceiverClient = std::make_shared<MoQFlvReceiverClient>(
-      &eventBase, std::move(url), FLAGS_quic_transport, FLAGS_flv_outpath);
+      moqEvb,
+      std::move(url),
+      FLAGS_quic_transport,
+      FLAGS_flv_outpath,
+      verifier);
 
   class SigHandler : public folly::AsyncSignalHandler {
    public:

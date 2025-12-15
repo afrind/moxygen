@@ -42,18 +42,19 @@ enum AdjustedExpectedResult : int {
 
 class MoQTestClient {
  public:
-  MoQTestClient(folly::EventBase* evb, proxygen::URL url);
+  MoQTestClient(
+      folly::EventBase* evb,
+      proxygen::URL url,
+      bool useQuicTransport);
 
   ~MoQTestClient() {}
 
   MoQTestClient(const MoQTestClient&) = delete;
   MoQTestClient& operator=(const MoQTestClient&) = delete;
   MoQTestClient(MoQTestClient&&) = default;
-  MoQTestClient& operator=(MoQTestClient&&) = default;
+  MoQTestClient& operator=(MoQTestClient&&) = delete;
 
   folly::coro::Task<void> connect(folly::EventBase* evb);
-
-  void initialize();
 
   folly::coro::Task<moxygen::TrackNamespace> subscribe(
       MoQTestParameters params);
@@ -66,6 +67,9 @@ class MoQTestClient {
   void subscribeUpdate(SubscribeUpdate update);
 
  private:
+  folly::coro::Task<void> doSubscribeUpdate(
+      std::shared_ptr<Publisher::SubscriptionHandle> handle,
+      SubscribeUpdate update);
   // An ObjectReceiverCallback implementation that forwards calls to a
   // MoQTestClient.
   class ObjectReceiverCallback : public moxygen::ObjectReceiverCallback {

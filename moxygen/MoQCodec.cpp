@@ -16,7 +16,9 @@ void MoQCodec::onIngressStart(std::unique_ptr<folly::IOBuf> data) {
   ingress_.append(std::move(data));
 }
 
-void MoQControlCodec::onIngress(std::unique_ptr<folly::IOBuf> data, bool eom) {
+MoQCodec::ParseResult MoQControlCodec::onIngress(
+    std::unique_ptr<folly::IOBuf> data,
+    bool eom) {
   onIngressStart(std::move(data));
   size_t remainingLength = ingress_.chainLength();
   folly::io::Cursor cursor(ingress_.front());
@@ -116,6 +118,11 @@ void MoQControlCodec::onIngress(std::unique_ptr<folly::IOBuf> data, bool eom) {
     }
   }
   onIngressEnd(remainingLength, eom, callback_);
+
+  if (connError_) {
+    return ParseResult::ERROR_TERMINATE;
+  }
+  return ParseResult::CONTINUE;
 }
 
 void MoQCodec::onIngressEnd(
@@ -136,42 +143,55 @@ void MoQCodec::onIngressEnd(
   ingress_.move();
 }
 
-folly::Expected<folly::Optional<TrackAlias>, ErrorCode>
-MoQObjectStreamCodec::parseSubgroupTypeAndAlias(
-    std::unique_ptr<folly::IOBuf> data,
-    bool eom) noexcept {
-  XCHECK(data || eom);
-  ingress_.append(std::move(data));
-  folly::IOBuf empty;
-  folly::io::Cursor cursor(ingress_.empty() ? &empty : ingress_.front());
-  auto res =
-      moqFrameParser_.parseSubgroupTypeAndAlias(cursor, ingress_.chainLength());
-  if (res.hasError() && res.error() == ErrorCode::PARSE_UNDERFLOW && eom) {
-    return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
-  }
-  return res;
-}
-
-void MoQObjectStreamCodec::onIngress(
+MoQCodec::ParseResult MoQObjectStreamCodec::onIngress(
     std::unique_ptr<folly::IOBuf> data,
     bool endOfStream) {
   onIngressStart(std::move(data));
-  folly::io::Cursor cursor(ingress_.front());
+  folly::IOBuf empty;
+  folly::io::Cursor cursor(ingress_.empty() ? &empty : ingress_.front());
+  size_t totalBytesConsumed = 0;
 
-  while (!connError_ &&
-         ((ingress_.chainLength() > 0 && !cursor.isAtEnd())/* ||
-          (endOfStream && parseState_ == ParseState::OBJECT_PAYLOAD_NO_LENGTH)*/)) {
+  auto trimStart = [&]() {
+    if (totalBytesConsumed > 0) {
+      ingress_.trimStart(totalBytesConsumed);
+      totalBytesConsumed = 0;
+    }
+  };
+
+  auto splitAndResetCursor = [&](size_t size) {
+    std::unique_ptr<folly::IOBuf> payload;
+    if (size == ingress_.chainLength()) {
+      payload = ingress_.move();
+      cursor = folly::io::Cursor(&empty);
+    } else {
+      if (size > 0) {
+        payload = ingress_.split(size);
+      }
+      // Reset cursor after split (or after trimStart if size == 0)
+      cursor = folly::io::Cursor(ingress_.front());
+    }
+    return payload;
+  };
+
+  auto availableForObject = [&](uint64_t objectLength) {
+    return std::min(
+        ingress_.chainLength(),
+        static_cast<size_t>(std::min(
+            objectLength,
+            static_cast<uint64_t>(std::numeric_limits<size_t>::max()))));
+  };
+
+  while (!connError_ && ingress_.chainLength() > totalBytesConsumed) {
     switch (parseState_) {
       case ParseState::STREAM_HEADER_TYPE: {
-        auto newCursor = cursor;
-        auto type = quic::follyutils::decodeQuicInteger(newCursor);
+        auto type = quic::follyutils::decodeQuicInteger(cursor);
         if (!type) {
           XLOG(DBG6) << __func__ << " underflow";
           connError_ = ErrorCode::PARSE_UNDERFLOW;
           break;
         }
+        totalBytesConsumed += type->second;
         auto version = moqFrameParser_.getVersion();
-        cursor = newCursor;
         streamType_ = StreamType(type->first);
         if (streamType_ == StreamType::FETCH_HEADER) {
           parseState_ = ParseState::FETCH_HEADER;
@@ -180,7 +200,6 @@ void MoQObjectStreamCodec::onIngress(
           subgroupOptions_ = getSubgroupOptions(*version, streamType_);
           streamType_ = StreamType::SUBGROUP_HEADER_SG;
         } else {
-          // Invalid stream type encountered
           XLOG(ERR) << "Invalid stream type: 0x" << std::setfill('0')
                     << std::setw(sizeof(uint64_t) * 2) << std::hex
                     << (uint64_t)type->first << " on streamID=" << streamId_;
@@ -190,69 +209,86 @@ void MoQObjectStreamCodec::onIngress(
         break;
       }
       case ParseState::FETCH_HEADER: {
-        auto newCursor = cursor;
-        auto res = moqFrameParser_.parseFetchHeader(newCursor);
+        size_t remainingLength = ingress_.chainLength() - totalBytesConsumed;
+        auto res = moqFrameParser_.parseFetchHeader(cursor, remainingLength);
         if (res.hasError()) {
-          XLOG(DBG6) << __func__ << " " << uint32_t(res.error());
+          XLOG(DBG4) << __func__ << " " << uint32_t(res.error());
           connError_ = res.error();
           break;
         }
-        auto requestID = res.value();
+        totalBytesConsumed += res->bytesConsumed;
+        auto requestID = res->value;
         if (callback_) {
-          callback_->onFetchHeader(requestID);
+          auto result = callback_->onFetchHeader(requestID);
+          if (result == ParseResult::ERROR_TERMINATE) {
+            XLOG(DBG4) << __func__ << " fetch callback returned terminate";
+            return result;
+          }
         }
         parseState_ = ParseState::MULTI_OBJECT_HEADER;
-        cursor = newCursor;
         break;
       }
       case ParseState::OBJECT_STREAM: {
-        auto newCursor = cursor;
-        auto res =
-            moqFrameParser_.parseSubgroupHeader(newCursor, subgroupOptions_);
+        size_t remainingLength = ingress_.chainLength() - totalBytesConsumed;
+        auto res = moqFrameParser_.parseSubgroupHeader(
+            cursor, remainingLength, subgroupOptions_);
 
         if (res.hasError()) {
           XLOG(DBG6) << __func__ << " " << uint32_t(res.error());
           connError_ = res.error();
           break;
         }
-        curObjectHeader_ = res->objectHeader;
-        // In non-fetch contexts, trackAlias should be set by the parser
+        totalBytesConsumed += res->bytesConsumed;
+        curObjectHeader_ = res->value.objectHeader;
+        parseState_ = ParseState::MULTI_OBJECT_HEADER;
         XCHECK_EQ(streamType_, StreamType::SUBGROUP_HEADER_SG);
         if (callback_) {
-          callback_->onSubgroup(
-              res->trackAlias,
+          auto result = callback_->onSubgroup(
+              res->value.trackAlias,
               curObjectHeader_.group,
               curObjectHeader_.subgroup,
-              curObjectHeader_.priority);
+              curObjectHeader_.priority,
+              subgroupOptions_);
+          if (result == ParseResult::BLOCKED) {
+            ingress_.trimStart(ingress_.chainLength() - cursor.totalLength());
+            return ParseResult::BLOCKED;
+          } else if (result == ParseResult::ERROR_TERMINATE) {
+            XLOG(DBG) << "subgroup callback returned ERROR_TERIMNATE";
+            return result;
+          }
         }
-        parseState_ = ParseState::MULTI_OBJECT_HEADER;
-        cursor = newCursor;
-        [[fallthrough]];
+        break;
       }
       case ParseState::MULTI_OBJECT_HEADER: {
-        auto newCursor = cursor;
-        folly::Expected<ObjectHeader, ErrorCode> res;
+        size_t remainingLength = ingress_.chainLength() - totalBytesConsumed;
+        folly::Expected<
+            MoQFrameParser::ParseResultAndLength<ObjectHeader>,
+            ErrorCode>
+            res;
         if (streamType_ == StreamType::FETCH_HEADER) {
           res = moqFrameParser_.parseFetchObjectHeader(
-              newCursor, curObjectHeader_);
+              cursor, remainingLength, curObjectHeader_);
         } else {
           DCHECK(streamType_ == StreamType::SUBGROUP_HEADER_SG);
           res = moqFrameParser_.parseSubgroupObjectHeader(
-              newCursor, curObjectHeader_, subgroupOptions_);
+              cursor, remainingLength, curObjectHeader_, subgroupOptions_);
         }
         if (res.hasError()) {
-          XLOG(DBG6) << __func__ << " " << uint32_t(res.error());
+          XLOG(DBG4) << __func__ << " " << uint32_t(res.error());
           connError_ = res.error();
           break;
         }
-        curObjectHeader_ = res.value();
-        cursor = newCursor;
+        totalBytesConsumed += res->bytesConsumed;
+        curObjectHeader_ = res->value;
         if (curObjectHeader_.status == ObjectStatus::NORMAL) {
           XLOG(DBG2) << "Parsing object with length, need="
                      << *curObjectHeader_.length
-                     << " have=" << cursor.totalLength();
+                     << " have=" << ingress_.chainLength() - totalBytesConsumed;
+          trimStart();
+
           std::unique_ptr<folly::IOBuf> payload;
-          auto chunkLen = cursor.cloneAtMost(payload, *curObjectHeader_.length);
+          auto chunkLen = availableForObject(*curObjectHeader_.length);
+          payload = splitAndResetCursor(chunkLen);
           auto endOfObject = chunkLen == *curObjectHeader_.length;
           if (endOfStream && !endOfObject) {
             XLOG(ERR) << "End of stream before end of object";
@@ -261,7 +297,7 @@ void MoQObjectStreamCodec::onIngress(
             break;
           }
           if (callback_) {
-            callback_->onObjectBegin(
+            auto result = callback_->onObjectBegin(
                 curObjectHeader_.group,
                 curObjectHeader_.subgroup,
                 curObjectHeader_.id,
@@ -269,11 +305,20 @@ void MoQObjectStreamCodec::onIngress(
                 *curObjectHeader_.length,
                 std::move(payload),
                 endOfObject,
-                endOfStream && cursor.isAtEnd());
+                endOfStream && ingress_.chainLength() == 0);
+            if (result == ParseResult::BLOCKED) {
+              XLOG(ERR)
+                  << "onObjectBegin returned BLOCKED, converting to ERROR";
+              connError_ = ErrorCode::INTERNAL_ERROR;
+              break;
+            } else if (result == ParseResult::ERROR_TERMINATE) {
+              XLOG(DBG) << "onObjectBegin callback returned ERROR_TERMINATE";
+              return result;
+            }
           }
           *curObjectHeader_.length -= chunkLen;
           if (endOfObject) {
-            if (endOfStream && cursor.isAtEnd()) {
+            if (endOfStream && ingress_.chainLength() == 0) {
               parseState_ = ParseState::STREAM_FIN_DELIVERED;
             } else {
               parseState_ = ParseState::MULTI_OBJECT_HEADER;
@@ -284,13 +329,22 @@ void MoQObjectStreamCodec::onIngress(
           }
         } else {
           if (callback_) {
-            callback_->onObjectStatus(
+            auto result = callback_->onObjectStatus(
                 curObjectHeader_.group,
                 curObjectHeader_.subgroup,
                 curObjectHeader_.id,
                 curObjectHeader_.priority,
                 curObjectHeader_.status,
                 std::move(curObjectHeader_.extensions));
+            if (result == ParseResult::BLOCKED) {
+              XLOG(ERR)
+                  << "onObjectStatus returned BLOCKED, converting to ERROR";
+              connError_ = ErrorCode::INTERNAL_ERROR;
+              break;
+            } else if (result == ParseResult::ERROR_TERMINATE) {
+              XLOG(DBG) << "onObjectStatus callback returned ERROR_TERMINATE";
+              return result;
+            }
           }
           if (curObjectHeader_.status == ObjectStatus::END_OF_TRACK ||
               (streamType_ == StreamType::SUBGROUP_HEADER_SG &&
@@ -304,16 +358,14 @@ void MoQObjectStreamCodec::onIngress(
         [[fallthrough]];
       }
       case ParseState::OBJECT_PAYLOAD: {
-        // need to check for bufLen == 0?
+        trimStart();
+
         std::unique_ptr<folly::IOBuf> payload;
-        // TODO: skip clone and do split
-        uint64_t chunkLen = 0;
         XCHECK(curObjectHeader_.length);
         XLOG(DBG2) << "Parsing object with length, need="
                    << *curObjectHeader_.length;
-        if (ingress_.chainLength() > 0 && cursor.canAdvance(1)) {
-          chunkLen = cursor.cloneAtMost(payload, *curObjectHeader_.length);
-        }
+        auto chunkLen = availableForObject(*curObjectHeader_.length);
+        payload = splitAndResetCursor(chunkLen);
         *curObjectHeader_.length -= chunkLen;
         if (endOfStream && *curObjectHeader_.length != 0) {
           XLOG(ERR) << "End of stream before end of object remaining length="
@@ -323,7 +375,17 @@ void MoQObjectStreamCodec::onIngress(
         }
         bool endOfObject = (*curObjectHeader_.length == 0);
         if (callback_ && (payload || endOfObject)) {
-          callback_->onObjectPayload(std::move(payload), endOfObject);
+          auto result =
+              callback_->onObjectPayload(std::move(payload), endOfObject);
+          if (result == ParseResult::BLOCKED) {
+            XLOG(ERR)
+                << "onObjectPayload returned BLOCKED, converting to ERROR";
+            connError_ = ErrorCode::INTERNAL_ERROR;
+            break;
+          } else if (result == ParseResult::ERROR_TERMINATE) {
+            XLOG(DBG) << "onObjectPayload callback returned ERROR_TERMINATE";
+            return result;
+          }
         }
         if (endOfObject) {
           parseState_ = ParseState::MULTI_OBJECT_HEADER;
@@ -331,22 +393,25 @@ void MoQObjectStreamCodec::onIngress(
         break;
       }
       case ParseState::STREAM_FIN_DELIVERED: {
-        XLOG(DBG2) << "Bytes=" << cursor.totalLength()
+        XLOG(DBG2) << "Bytes=" << ingress_.chainLength()
                    << " remaining in STREAM_FIN_DELIVERED";
         connError_ = ErrorCode::PROTOCOL_VIOLATION;
         break;
       }
     }
   }
-  size_t remainingLength = 0;
-  if (!endOfStream && !cursor.isAtEnd()) {
-    remainingLength = cursor.totalLength(); // must be less than 1 message
-  }
+  trimStart();
+  size_t remainingLength = ingress_.chainLength();
   if (endOfStream && parseState_ != ParseState::STREAM_FIN_DELIVERED &&
       !connError_ && callback_) {
     callback_->onEndOfStream();
   }
   onIngressEnd(remainingLength, endOfStream, callback_);
+
+  if (connError_) {
+    return ParseResult::ERROR_TERMINATE;
+  }
+  return ParseResult::CONTINUE;
 }
 
 folly::Expected<folly::Unit, ErrorCode> MoQControlCodec::parseFrame(
@@ -646,6 +711,13 @@ folly::Expected<folly::Unit, ErrorCode> MoQControlCodec::parseFrame(
       break;
     }
     case FrameType::TRACK_STATUS_OK: {
+      // Version > 14: TRACK_STATUS_OK is deprecated, use REQUEST_OK
+      if (getDraftMajorVersion(*moqFrameParser_.getVersion()) > 14) {
+        XLOG(ERR) << "Received deprecated TRACK_STATUS_OK frame in version="
+                  << getDraftMajorVersion(*moqFrameParser_.getVersion());
+        return folly::makeUnexpected(ErrorCode::PROTOCOL_VIOLATION);
+      }
+
       auto res = moqFrameParser_.parseTrackStatusOk(cursor, curFrameLength_);
       if (res) {
         if (callback_) {

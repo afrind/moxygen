@@ -53,7 +53,7 @@ DEFINE_uint64(
     "Publisher delivery timeout");
 DEFINE_uint64(
     last_object_in_track,
-    FLAGS_objects_per_group + (int)FLAGS_send_end_of_group_markers,
+    moxygen::kLocationMax.object,
     "Last object in track");
 DEFINE_uint64(
     delivery_timeout,
@@ -68,12 +68,16 @@ DEFINE_bool(
     false,
     "Log to mlog file.  Default is false.  If true, will log to mlog file");
 DEFINE_string(mlog_path, moxygen::kDefaultClientFilePath, "Path to mlog file.");
+DEFINE_bool(
+    quic_transport,
+    false,
+    "Use QUIC transport instead of WebTransport");
 
 int main(int argc, char** argv) {
   gflags::ParseCommandLineFlags(&argc, &argv, false);
   folly::Init init(&argc, &argv);
 
-  folly::ScopedEventBaseThread evb;
+  folly::EventBase evb;
   XLOG(INFO) << "Starting MoQTestClient";
 
   // Initialize Client with url and moq params
@@ -95,11 +99,15 @@ int main(int argc, char** argv) {
   defaultMoqParams.testVariableExtension = FLAGS_test_variable_extension;
   defaultMoqParams.publisherDeliveryTimeout = FLAGS_publisher_delivery_timeout;
   defaultMoqParams.deliveryTimeout = FLAGS_delivery_timeout;
-  defaultMoqParams.lastObjectInTrack = FLAGS_last_object_in_track;
+  defaultMoqParams.lastObjectInTrack =
+      FLAGS_last_object_in_track == moxygen::kLocationMax.object
+      ? FLAGS_object_increment *
+          (FLAGS_objects_per_group + (int)FLAGS_send_end_of_group_markers)
+      : FLAGS_last_object_in_track;
 
   auto url = proxygen::URL(FLAGS_url);
   std::shared_ptr<moxygen::MoQTestClient> client =
-      std::make_shared<moxygen::MoQTestClient>(evb.getEventBase(), url);
+      std::make_shared<moxygen::MoQTestClient>(&evb, url, FLAGS_quic_transport);
 
   std::shared_ptr<moxygen::MLogger> logger;
   if (FLAGS_log) {
@@ -107,24 +115,32 @@ int main(int argc, char** argv) {
     logger->setPath(FLAGS_mlog_path);
     client->setLogger(logger);
   }
-  client->initialize();
 
-  // Connect Client to Server
-  XLOG(INFO) << "Connecting to " << url.getHostAndPort();
-  folly::coro::blockingWait(
-      co_withExecutor(evb.getEventBase(), client->connect(evb.getEventBase())));
-
-  if (FLAGS_request == "subscribe") {
-    XLOG(INFO) << "Subscribing to " << url.getHostAndPort();
-    // Test a Subscribe Call
-    folly::coro::blockingWait(co_withExecutor(
-        evb.getEventBase(), client->subscribe(defaultMoqParams)));
-  } else if (FLAGS_request == "fetch") {
-    XLOG(INFO) << "Fetching from " << url.getHostAndPort();
-    // Test a Fetch Call
+  try {
+    // Connect Client to Server
+    XLOG(INFO) << "Connecting to " << url.getHostAndPort();
     folly::coro::blockingWait(
-        co_withExecutor(evb.getEventBase(), client->fetch(defaultMoqParams)));
-  } else {
-    XLOG(ERR) << "Invalid Request Type: " << FLAGS_request;
+        folly::coro::co_withExecutor(&evb, client->connect(&evb)), &evb);
+
+    if (FLAGS_request == "subscribe") {
+      XLOG(INFO) << "Subscribing to " << url.getHostAndPort();
+      // Test a Subscribe Call
+      folly::coro::co_withExecutor(&evb, client->subscribe(defaultMoqParams))
+          .start();
+    } else if (FLAGS_request == "fetch") {
+      XLOG(INFO) << "Fetching from " << url.getHostAndPort();
+      // Test a Fetch Call
+      folly::coro::co_withExecutor(&evb, client->fetch(defaultMoqParams))
+          .start();
+    } else {
+      XLOG(ERR) << "Invalid Request Type: " << FLAGS_request;
+    }
+    // Run the event loop to process events and coroutines
+    evb.loop();
+  } catch (const std::exception& ex) {
+    XLOG(ERR) << "Exception: " << ex.what();
+    evb.loop();
+    return 1;
   }
+  return 0;
 }

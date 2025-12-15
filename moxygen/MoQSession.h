@@ -10,6 +10,7 @@
 #include <moxygen/MoQCodec.h>
 #include <moxygen/events/MoQDeliveryTimer.h>
 #include <moxygen/events/MoQExecutor.h>
+#include <chrono>
 
 #include <folly/MaybeManagedPtr.h>
 #include <folly/Optional.h>
@@ -39,6 +40,15 @@ struct BufferingThresholds {
 
 struct MoQSettings {
   BufferingThresholds bufferingThresholds{};
+  // Timeout for waiting for setup to complete
+  std::chrono::milliseconds setupTimeout{std::chrono::seconds(5)};
+  // Timeout for waiting for version negotiation to complete
+  std::chrono::milliseconds versionNegotiationTimeout{std::chrono::seconds(2)};
+  // Timeout for waiting for unknown alias resolution
+  std::chrono::milliseconds unknownAliasTimeout{std::chrono::seconds(2)};
+  // Timeout for waiting for in-flight streams when SUBSCRIBE_DONE is received
+  std::chrono::milliseconds publishDoneStreamCountTimeout{
+      std::chrono::seconds(2)};
 };
 
 class MoQSession : public Subscriber,
@@ -109,11 +119,11 @@ class MoQSession : public Subscriber,
       PublishRequest pub,
       std::shared_ptr<Publisher::SubscriptionHandle> handle = nullptr) override;
 
-  folly::Optional<uint64_t> getNegotiatedVersion() const {
+  virtual folly::Optional<uint64_t> getNegotiatedVersion() const {
     return negotiatedVersion_;
   }
 
-  [[nodiscard]] folly::Executor* getExecutor() const {
+  [[nodiscard]] MoQExecutor* getExecutor() const {
     return exec_.get();
   }
 
@@ -129,10 +139,21 @@ class MoQSession : public Subscriber,
   }
 
   [[nodiscard]] quic::TransportInfo getTransportInfo() const {
-    if (wt_) {
-      return wt_->getTransportInfo();
+    if (!wt_) {
+      return {};
     }
-    return {};
+
+    // Rate limit getTransportInfo calls to at most once per second
+    auto now = std::chrono::steady_clock::now();
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now - lastTransportInfoUpdate_);
+
+    if (elapsed >= std::chrono::seconds(1)) {
+      cachedTransportInfo_ = wt_->getTransportInfo();
+      lastTransportInfoUpdate_ = now;
+    }
+
+    return cachedTransportInfo_;
   }
 
   ~MoQSession() override;
@@ -246,6 +267,10 @@ class MoQSession : public Subscriber,
       groupOrder_ = groupOrder;
     }
 
+    GroupOrder getGroupOrder() const {
+      return groupOrder_;
+    }
+
     folly::Optional<uint8_t> getPublisherPriority() const {
       return publisherPriority_;
     }
@@ -303,6 +328,14 @@ class MoQSession : public Subscriber,
       return nullptr;
     }
 
+    std::shared_ptr<MoQExecutor> getExecutor() const {
+      return session_ ? session_->exec_ : nullptr;
+    }
+
+    quic::TransportInfo getTransportInfo() const {
+      return session_ ? session_->getTransportInfo() : quic::TransportInfo();
+    }
+
    protected:
     MoQSession* session_{nullptr};
     FullTrackName fullTrackName_;
@@ -316,15 +349,20 @@ class MoQSession : public Subscriber,
     folly::Optional<uint8_t> publisherPriority_;
   };
 
-  void onNewUniStream(proxygen::WebTransport::StreamReadHandle* rh) override;
-  void onNewBidiStream(proxygen::WebTransport::BidiStreamHandle bh) override;
-  void onDatagram(std::unique_ptr<folly::IOBuf> datagram) override;
-  void onSessionEnd(folly::Optional<uint32_t> err) override {
+  void onNewUniStream(
+      proxygen::WebTransport::StreamReadHandle* rh) noexcept override;
+  void onNewBidiStream(
+      proxygen::WebTransport::BidiStreamHandle bh) noexcept override;
+  void onDatagram(std::unique_ptr<folly::IOBuf> datagram) noexcept override;
+  void onSessionEnd(folly::Optional<uint32_t> err) noexcept override {
     XLOG(DBG1) << __func__ << "err="
                << (err ? folly::to<std::string>(*err) : std::string("none"))
                << " sess=" << this;
     // The peer closed us, but we can close with NO_ERROR
     close(SessionCloseErrorCode::NO_ERROR);
+  }
+  void onSessionDrain() noexcept override {
+    XLOG(DBG1) << __func__ << " sess=" << this;
   }
 
   class TrackReceiveStateBase;
@@ -355,10 +393,6 @@ class MoQSession : public Subscriber,
       proxygen::WebTransport::StreamWriteHandle* writeHandle);
   folly::coro::Task<void> controlReadLoop(
       proxygen::WebTransport::StreamReadHandle* readHandle);
-  folly::coro::Task<folly::Expected<bool, MoQPublishError>> headerParsed(
-      MoQObjectStreamCodec& codec,
-      detail::ObjectStreamCallback& callback,
-      proxygen::WebTransport::StreamData& streamData);
 
   folly::coro::Task<void> unidirectionalReadLoop(
       std::shared_ptr<MoQSession> session,
@@ -378,6 +412,10 @@ class MoQSession : public Subscriber,
   void subscribeError(const SubscribeError& subErr);
   void unsubscribe(const Unsubscribe& unsubscribe);
   void subscribeUpdate(const SubscribeUpdate& subUpdate);
+  void subscribeUpdateOk(const RequestOk& requestOk);
+  void subscribeUpdateError(
+      const SubscribeUpdateError& requestError,
+      RequestID subscriptionRequestID);
   void sendSubscribeDone(const SubscribeDone& subDone);
 
   folly::coro::Task<void> handleFetch(
@@ -522,6 +560,7 @@ class MoQSession : public Subscriber,
       PUBLISH,
       TRACK_STATUS,
       FETCH,
+      SUBSCRIBE_UPDATE,
       // Announcement types - only handled by MoQRelaySession subclass
       ANNOUNCE,
       SUBSCRIBE_ANNOUNCES
@@ -540,6 +579,9 @@ class MoQSession : public Subscriber,
       folly::coro::Promise<folly::Expected<TrackStatusOk, TrackStatusError>>
           trackStatus_;
       std::shared_ptr<FetchTrackReceiveState> fetchTrack_;
+      folly::coro::Promise<
+          folly::Expected<SubscribeUpdateOk, SubscribeUpdateError>>
+          subscribeUpdate_;
     } storage_;
 
    public:
@@ -578,6 +620,15 @@ class MoQSession : public Subscriber,
       return result;
     }
 
+    static std::unique_ptr<PendingRequestState> makeSubscribeUpdate(
+        folly::coro::Promise<
+            folly::Expected<SubscribeUpdateOk, SubscribeUpdateError>> promise) {
+      auto result = std::make_unique<PendingRequestState>();
+      result->type_ = Type::SUBSCRIBE_UPDATE;
+      new (&result->storage_.subscribeUpdate_) auto(std::move(promise));
+      return result;
+    }
+
     // Delete copy/move operations as this is held in unique_ptr
     PendingRequestState(const PendingRequestState&) = delete;
     PendingRequestState(PendingRequestState&&) = delete;
@@ -599,6 +650,9 @@ class MoQSession : public Subscriber,
         case Type::FETCH:
           // If FETCH storage is added, destroy it here, e.g.:
           storage_.fetchTrack_.~shared_ptr<FetchTrackReceiveState>();
+          break;
+        case Type::SUBSCRIBE_UPDATE:
+          storage_.subscribeUpdate_.~Promise();
           break;
         case Type::ANNOUNCE:
         case Type::SUBSCRIBE_ANNOUNCES:
@@ -623,6 +677,8 @@ class MoQSession : public Subscriber,
           return ok ? FrameType::TRACK_STATUS_OK : FrameType::TRACK_STATUS;
         case Type::FETCH:
           return ok ? FrameType::FETCH_OK : FrameType::FETCH_ERROR;
+        case Type::SUBSCRIBE_UPDATE:
+          return ok ? FrameType::REQUEST_OK : FrameType::REQUEST_ERROR;
         case Type::ANNOUNCE:
           return ok ? FrameType::ANNOUNCE_OK : FrameType::ANNOUNCE_ERROR;
         case Type::SUBSCRIBE_ANNOUNCES:
@@ -663,6 +719,13 @@ class MoQSession : public Subscriber,
       return type_ == Type::FETCH ? &storage_.fetchTrack_ : nullptr;
     }
 
+    folly::coro::Promise<
+        folly::Expected<SubscribeUpdateOk, SubscribeUpdateError>>*
+    tryGetSubscribeUpdate() {
+      return type_ == Type::SUBSCRIBE_UPDATE ? &storage_.subscribeUpdate_
+                                             : nullptr;
+    }
+
     Type getType() const {
       return type_;
     }
@@ -679,9 +742,21 @@ class MoQSession : public Subscriber,
       RequestID::hash>
       pendingRequests_;
 
+  // Type alias for pending request iterator
+  using PendingRequestIterator = folly::F14FastMap<
+      RequestID,
+      std::unique_ptr<PendingRequestState>,
+      RequestID::hash>::iterator;
+
+  void handleTrackStatusOkFromRequestOk(const RequestOk& requestOk);
+  void handleSubscribeUpdateOkFromRequestOk(
+      const RequestOk& requestOk,
+      PendingRequestIterator reqIt);
+
  private:
   // Private implementation methods
   void initializeNegotiatedVersion(uint64_t negotiatedVersion);
+  void removeBufferedSubgroupBaton(TrackAlias alias, TimedBaton* baton);
 
   // Private session state
   folly::F14FastMap<RequestID, std::shared_ptr<PublisherImpl>, RequestID::hash>
@@ -712,5 +787,9 @@ class MoQSession : public Subscriber,
   folly::Optional<uint64_t> negotiatedVersion_;
   MoQControlCodec controlCodec_;
   MoQTokenCache tokenCache_{1024};
+
+  // Cached transport info to avoid expensive getTransportInfo calls
+  mutable quic::TransportInfo cachedTransportInfo_;
+  mutable std::chrono::steady_clock::time_point lastTransportInfoUpdate_{};
 };
 } // namespace moxygen

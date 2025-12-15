@@ -54,13 +54,17 @@ class MockMoQCodecCallback : public MoQControlCodec::ControlCallback,
   MOCK_METHOD(void, onGoaway, (Goaway goaway));
   MOCK_METHOD(void, onConnectionError, (ErrorCode error));
 
-  MOCK_METHOD(void, onFetchHeader, (RequestID));
+  MOCK_METHOD(MoQCodec::ParseResult, onFetchHeader, (RequestID));
   MOCK_METHOD(
-      void,
+      MoQCodec::ParseResult,
       onSubgroup,
-      (TrackAlias, uint64_t, uint64_t, folly::Optional<uint8_t>));
+      (TrackAlias,
+       uint64_t,
+       uint64_t,
+       folly::Optional<uint8_t>,
+       const SubgroupOptions&));
   MOCK_METHOD(
-      void,
+      MoQCodec::ParseResult,
       onObjectBegin,
       (uint64_t,
        uint64_t,
@@ -71,7 +75,7 @@ class MockMoQCodecCallback : public MoQControlCodec::ControlCallback,
        bool,
        bool));
   MOCK_METHOD(
-      void,
+      MoQCodec::ParseResult,
       onObjectStatus,
       (uint64_t,
        uint64_t,
@@ -79,7 +83,7 @@ class MockMoQCodecCallback : public MoQControlCodec::ControlCallback,
        folly::Optional<uint8_t>,
        ObjectStatus,
        Extensions));
-  MOCK_METHOD(void, onObjectPayload, (Payload, bool));
+  MOCK_METHOD(MoQCodec::ParseResult, onObjectPayload, (Payload, bool));
   MOCK_METHOD(void, onEndOfStream, ());
 };
 
@@ -244,7 +248,21 @@ class MockSubscriptionHandle : public SubscriptionHandle {
       : SubscriptionHandle(std::move(ok)) {}
 
   MOCK_METHOD(void, unsubscribe, (), (override));
-  MOCK_METHOD(void, subscribeUpdate, (SubscribeUpdate), (override));
+
+  // For async methods like subscribeUpdate, we can't use MOCK_METHOD directly
+  // Instead, provide a delegating implementation
+  folly::coro::Task<folly::Expected<SubscribeUpdateOk, SubscribeUpdateError>>
+  subscribeUpdate(SubscribeUpdate update) override {
+    subscribeUpdateCalled(update);
+    co_return subscribeUpdateResult();
+  }
+
+  // Mock these instead
+  MOCK_METHOD(void, subscribeUpdateCalled, (SubscribeUpdate));
+  MOCK_METHOD(
+      (folly::Expected<SubscribeUpdateOk, SubscribeUpdateError>),
+      subscribeUpdateResult,
+      ());
 };
 
 class MockFetchHandle : public Publisher::FetchHandle {

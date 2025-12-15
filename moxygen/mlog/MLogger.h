@@ -40,8 +40,6 @@ class MLogger {
   void addStreamTypeSetLog(MOQTStreamTypeSet req);
   void addObjectDatagramCreatedLog(MOQTObjectDatagramCreated req);
   void addObjectDatagramParsedLog(MOQTObjectDatagramParsed req);
-  void addObjectDatagramStatusCreatedLog(MOQTObjectDatagramStatusCreated req);
-  void addObjectDatagramStatusParsedLog(MOQTObjectDatagramStatusParsed req);
   void addSubgroupHeaderCreatedLog(MOQTSubgroupHeaderCreated req);
   void addSubgroupHeaderParsedLog(MOQTSubgroupHeaderParsed req);
   void addSubgroupObjectCreatedLog(MOQTSubgroupObjectCreated req);
@@ -81,12 +79,9 @@ class MLogger {
       ControlMessageType controlType = ControlMessageType::CREATED);
   void logAnnounceOk(
       const AnnounceOk& req,
-      const MOQTByteStringType& type = MOQTByteStringType::STRING_VALUE,
       ControlMessageType controlType = ControlMessageType::CREATED);
   void logAnnounceError(
       const AnnounceError& req,
-      const TrackNamespace& trackNamespace,
-      const MOQTByteStringType& type = MOQTByteStringType::STRING_VALUE,
       ControlMessageType controlType = ControlMessageType::CREATED);
   void logAnnounceCancel(
       const AnnounceCancel& req,
@@ -116,14 +111,14 @@ class MLogger {
   void logFetchError(
       const FetchError& req,
       ControlMessageType controlType = ControlMessageType::CREATED);
-  void logSubscribeDone(
+  void logPublishDone(
       const SubscribeDone& req,
       ControlMessageType controlType = ControlMessageType::CREATED);
-  void logMaxSubscribeId(
-      const uint64_t maxRequestID,
+  void logMaxRequestId(
+      const uint64_t requestId,
       ControlMessageType controlType = ControlMessageType::CREATED);
-  void logSubscribesBlocked(
-      const uint64_t maxRequestID,
+  void logRequestsBlocked(
+      const uint64_t maximumRequestId,
       ControlMessageType controlType = ControlMessageType::CREATED);
   void logAnnounce(
       const Announce& req,
@@ -143,12 +138,19 @@ class MLogger {
       ControlMessageType controlType = ControlMessageType::CREATED);
   void logSubscribeAnnouncesOk(
       const SubscribeAnnouncesOk& req,
-      const MOQTByteStringType& type = MOQTByteStringType::STRING_VALUE,
       ControlMessageType controlType = ControlMessageType::CREATED);
   void logSubscribeAnnouncesError(
       const SubscribeAnnouncesError& req,
-      const TrackNamespace& trackNamespace,
+      ControlMessageType controlType = ControlMessageType::CREATED);
+  void logPublish(
+      const PublishRequest& req,
       const MOQTByteStringType& type = MOQTByteStringType::STRING_VALUE,
+      ControlMessageType controlType = ControlMessageType::CREATED);
+  void logPublishOk(
+      const PublishOk& req,
+      ControlMessageType controlType = ControlMessageType::CREATED);
+  void logPublishError(
+      const PublishError& req,
       ControlMessageType controlType = ControlMessageType::CREATED);
 
   void logStreamTypeSet(
@@ -163,24 +165,22 @@ class MLogger {
       TrackAlias trackAlias,
       const ObjectHeader& header,
       const Payload& payload);
-  void logObjectDatagramStatusCreated(
-      TrackAlias trackAlias,
-      const ObjectHeader& header);
-  void logObjectDatagramStatusParsed(
-      TrackAlias trackAlias,
-      const ObjectHeader& header);
   void logSubgroupHeaderCreated(
       uint64_t streamId,
       TrackAlias trackAlias,
       uint64_t groupId,
       uint64_t sugroupId,
-      uint8_t publisherPriority);
+      uint8_t publisherPriority,
+      SubgroupIDFormat format,
+      bool includeExtensions,
+      bool endOfGroup);
   void logSubgroupHeaderParsed(
       uint64_t streamId,
       TrackAlias trackAlias,
       uint64_t groupId,
       uint64_t sugroupId,
-      uint8_t publisherPriority);
+      uint8_t publisherPriority,
+      const SubgroupOptions& options);
   void logSubgroupObjectCreated(
       uint64_t streamId,
       TrackAlias trackAlias,
@@ -191,12 +191,8 @@ class MLogger {
       TrackAlias trackAlias,
       const ObjectHeader& objHeader,
       Payload payload);
-  void logFetchHeaderCreated(
-      const uint64_t streamId,
-      const uint64_t subscribeId);
-  void logFetchHeaderParsed(
-      const uint64_t streamId,
-      const uint64_t subscribeId);
+  void logFetchHeaderCreated(const uint64_t streamId, const uint64_t requestId);
+  void logFetchHeaderParsed(const uint64_t streamId, const uint64_t requestId);
   void logFetchObjectCreated(
       const uint64_t streamId,
       const ObjectHeader& header,

@@ -12,6 +12,12 @@ namespace moxygen {
 
 class MoQCodec {
  public:
+  enum class ParseResult {
+    CONTINUE,
+    BLOCKED,
+    ERROR_TERMINATE,
+  };
+
   virtual ~MoQCodec() = default;
 
   class Callback {
@@ -33,7 +39,10 @@ class MoQCodec {
     moqFrameParser_.setTokenCacheMaxSize(size);
   }
 
-  virtual void onIngress(std::unique_ptr<folly::IOBuf> data, bool eom) = 0;
+  // If ParseResult::BLOCKED is returned, must call onIngress again to restart
+  virtual ParseResult onIngress(
+      std::unique_ptr<folly::IOBuf> data,
+      bool eom) = 0;
 
  protected:
   void onIngressStart(std::unique_ptr<folly::IOBuf> data);
@@ -91,7 +100,8 @@ class MoQControlCodec : public MoQCodec {
     callback_ = callback;
   }
 
-  void onIngress(std::unique_ptr<folly::IOBuf> data, bool eom) override;
+  // If ParseResult::BLOCKED is returned, must call onIngress again to restart
+  ParseResult onIngress(std::unique_ptr<folly::IOBuf> data, bool eom) override;
 
  private:
   bool checkFrameAllowed(FrameType f) {
@@ -156,13 +166,14 @@ class MoQObjectStreamCodec : public MoQCodec {
    public:
     ~ObjectCallback() override = default;
 
-    virtual void onFetchHeader(RequestID requestID) = 0;
-    virtual void onSubgroup(
+    virtual ParseResult onFetchHeader(RequestID requestID) = 0;
+    virtual ParseResult onSubgroup(
         TrackAlias alias,
         uint64_t group,
         uint64_t subgroup,
-        folly::Optional<uint8_t> priority) = 0;
-    virtual void onObjectBegin(
+        folly::Optional<uint8_t> priority,
+        const SubgroupOptions& options) = 0;
+    virtual ParseResult onObjectBegin(
         uint64_t group,
         uint64_t subgroup,
         uint64_t objectID,
@@ -171,14 +182,16 @@ class MoQObjectStreamCodec : public MoQCodec {
         Payload initialPayload,
         bool objectComplete,
         bool subgroupComplete) = 0;
-    virtual void onObjectStatus(
+    virtual ParseResult onObjectStatus(
         uint64_t group,
         uint64_t subgroup,
         uint64_t objectID,
         folly::Optional<uint8_t> priority,
         ObjectStatus status,
         Extensions extensions) = 0;
-    virtual void onObjectPayload(Payload payload, bool objectComplete) = 0;
+    virtual ParseResult onObjectPayload(
+        Payload payload,
+        bool objectComplete) = 0;
     virtual void onEndOfStream() = 0;
   };
 
@@ -188,12 +201,7 @@ class MoQObjectStreamCodec : public MoQCodec {
     callback_ = callback;
   }
 
-  folly::Expected<folly::Optional<TrackAlias>, ErrorCode>
-  parseSubgroupTypeAndAlias(
-      std::unique_ptr<folly::IOBuf> data,
-      bool eom) noexcept;
-
-  void onIngress(std::unique_ptr<folly::IOBuf> data, bool eom) override;
+  ParseResult onIngress(std::unique_ptr<folly::IOBuf> data, bool eom) override;
 
  private:
   enum class ParseState {

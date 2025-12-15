@@ -9,8 +9,14 @@
 
 #include <folly/init/Init.h>
 #include <folly/io/async/EventBase.h>
+#include <folly/portability/GFlags.h>
+#include <moxygen/util/InsecureVerifierDangerousDoNotUseInProduction.h>
 
 DEFINE_string(connect_url, "", "URL for webtransport server");
+DEFINE_bool(
+    insecure,
+    false,
+    "Use insecure verifier (skip certificate validation)");
 DEFINE_string(chat_id, "", "ID for the chat to join");
 DEFINE_string(username, "", "Username to join chat");
 DEFINE_string(device, "12345", "Device ID");
@@ -19,7 +25,7 @@ DEFINE_int32(transaction_timeout, 120, "Transaction timeout (s)");
 DEFINE_bool(
     use_legacy_setup,
     false,
-    "If true, use only moq-00 ALPN (legacy). If false, use both moqt-15 and moq-00");
+    "If true, use only moq-00 ALPN (legacy). If false, use latest draft ALPN with fallback to legacy");
 
 namespace moxygen {
 
@@ -36,19 +42,23 @@ MoQChatClient::MoQChatClient(
           folly::to<std::string>(std::chrono::system_clock::to_time_t(
               std::chrono::system_clock::now()))),
       executor_(std::make_shared<MoQFollyExecutorImpl>(evb)),
-      moqClient_(executor_, std::move(url)) {}
+      moqClient_(
+          executor_,
+          std::move(url),
+          FLAGS_insecure
+              ? std::make_shared<
+                    moxygen::test::
+                        InsecureVerifierDangerousDoNotUseInProduction>()
+              : nullptr) {}
 
 folly::coro::Task<void> MoQChatClient::run() noexcept {
   XLOG(INFO) << __func__;
   auto g =
       folly::makeGuard([func = __func__] { XLOG(INFO) << "exit " << func; });
   try {
-    std::vector<std::string> alpns;
-    if (FLAGS_use_legacy_setup) {
-      alpns = {std::string(kAlpnMoqtLegacy)};
-    } else {
-      alpns = {std::string(kAlpnMoqtDraft15), std::string(kAlpnMoqtLegacy)};
-    }
+    // Default to experimental protocols, override to legacy if flag set
+    std::vector<std::string> alpns =
+        getDefaultMoqtProtocols(!FLAGS_use_legacy_setup);
     co_await moqClient_.setup(
         /*publisher=*/shared_from_this(),
         /*subscriber=*/shared_from_this(),

@@ -158,8 +158,14 @@ class MoQFramerTest : public ::testing::TestWithParam<uint64_t> {
     testUnderflowResult(r14a);
 
     skip(cursor, 1);
-    auto r14b = parser_.parseTrackStatusOk(cursor, frameLength(cursor));
-    testUnderflowResult(r14b);
+    if (getDraftMajorVersion(GetParam()) < 15) {
+      auto r14b = parser_.parseTrackStatusOk(cursor, frameLength(cursor));
+      testUnderflowResult(r14b);
+    } else {
+      auto r14b = parser_.parseRequestOk(
+          cursor, frameLength(cursor), FrameType::REQUEST_OK);
+      testUnderflowResult(r14b);
+    }
 
     skip(cursor, 1);
     auto r14 = parser_.parseGoaway(cursor, frameLength(cursor));
@@ -201,64 +207,69 @@ class MoQFramerTest : public ::testing::TestWithParam<uint64_t> {
 
     auto streamType = parseStreamType(cursor);
     SubgroupOptions options = getSubgroupOptions(GetParam(), streamType);
-    auto res = parser_.parseSubgroupHeader(cursor, options);
+    auto res =
+        parser_.parseSubgroupHeader(cursor, cursor.totalLength(), options);
     testUnderflowResult(res);
-    EXPECT_EQ(res->objectHeader.group, 2);
+    EXPECT_EQ(res->value.objectHeader.group, 2);
 
-    auto r15 =
-        parser_.parseSubgroupObjectHeader(cursor, res->objectHeader, options);
+    auto r15 = parser_.parseSubgroupObjectHeader(
+        cursor, cursor.totalLength(), res->value.objectHeader, options);
     testUnderflowResult(r15);
-    EXPECT_EQ(r15.value().id, 4);
-    skip(cursor, *r15.value().length);
+    EXPECT_EQ(r15->value.id, 4);
+    skip(cursor, *r15->value.length);
 
-    auto r15a =
-        parser_.parseSubgroupObjectHeader(cursor, res->objectHeader, options);
+    auto r15a = parser_.parseSubgroupObjectHeader(
+        cursor, cursor.totalLength(), res->value.objectHeader, options);
     testUnderflowResult(r15a);
-    EXPECT_EQ(r15a.value().id, 5);
+    EXPECT_EQ(r15a->value.id, 5);
     EXPECT_EQ(
-        r15a.value().extensions, Extensions(test::getTestExtensions(), {}));
-    skip(cursor, *r15a.value().length);
+        r15a->value.extensions, Extensions(test::getTestExtensions(), {}));
+    skip(cursor, *r15a->value.length);
 
-    auto r20 =
-        parser_.parseSubgroupObjectHeader(cursor, res->objectHeader, options);
+    auto r20 = parser_.parseSubgroupObjectHeader(
+        cursor, cursor.totalLength(), res->value.objectHeader, options);
     testUnderflowResult(r20);
-    EXPECT_EQ(r20.value().status, ObjectStatus::OBJECT_NOT_EXIST);
+    EXPECT_EQ(r20->value.status, ObjectStatus::OBJECT_NOT_EXIST);
 
-    auto r20a =
-        parser_.parseSubgroupObjectHeader(cursor, res->objectHeader, options);
+    auto r20a = parser_.parseSubgroupObjectHeader(
+        cursor, cursor.totalLength(), res->value.objectHeader, options);
     testUnderflowResult(r20a);
     EXPECT_EQ(
-        r20a.value().extensions, Extensions(test::getTestExtensions(), {}));
-    EXPECT_EQ(r20a.value().status, ObjectStatus::END_OF_TRACK);
+        r20a->value.extensions, Extensions(test::getTestExtensions(), {}));
+    EXPECT_EQ(r20a->value.status, ObjectStatus::END_OF_TRACK);
 
     skip(cursor, 1);
-    auto r21 = parser_.parseFetchHeader(cursor);
+    auto r21 = parser_.parseFetchHeader(cursor, cursor.totalLength());
     testUnderflowResult(r21);
-    EXPECT_EQ(r21.value(), RequestID(1));
+    EXPECT_EQ(r21->value, RequestID(1));
 
     ObjectHeader obj;
     // Fetch context uses placeholder TrackAlias(0)
-    auto r22 = parser_.parseFetchObjectHeader(cursor, obj);
+    auto r22 =
+        parser_.parseFetchObjectHeader(cursor, cursor.totalLength(), obj);
     testUnderflowResult(r22);
-    EXPECT_EQ(r22.value().id, 4);
-    skip(cursor, *r22.value().length);
+    EXPECT_EQ(r22->value.id, 4);
+    skip(cursor, *r22->value.length);
 
-    auto r22a = parser_.parseFetchObjectHeader(cursor, obj);
+    auto r22a =
+        parser_.parseFetchObjectHeader(cursor, cursor.totalLength(), obj);
     testUnderflowResult(r22a);
-    EXPECT_EQ(r22a.value().id, 5);
+    EXPECT_EQ(r22a->value.id, 5);
     EXPECT_EQ(
-        r22a.value().extensions, Extensions(test::getTestExtensions(), {}));
-    skip(cursor, *r22a.value().length);
+        r22a->value.extensions, Extensions(test::getTestExtensions(), {}));
+    skip(cursor, *r22a->value.length);
 
-    auto r23 = parser_.parseFetchObjectHeader(cursor, obj);
+    auto r23 =
+        parser_.parseFetchObjectHeader(cursor, cursor.totalLength(), obj);
     testUnderflowResult(r23);
-    EXPECT_EQ(r23.value().status, ObjectStatus::END_OF_GROUP);
+    EXPECT_EQ(r23->value.status, ObjectStatus::END_OF_GROUP);
 
-    auto r23a = parser_.parseFetchObjectHeader(cursor, obj);
+    auto r23a =
+        parser_.parseFetchObjectHeader(cursor, cursor.totalLength(), obj);
     testUnderflowResult(r23a);
     EXPECT_EQ(
-        r23a.value().extensions, Extensions(test::getTestExtensions(), {}));
-    EXPECT_EQ(r23a.value().status, ObjectStatus::END_OF_GROUP);
+        r23a->value.extensions, Extensions(test::getTestExtensions(), {}));
+    EXPECT_EQ(r23a->value.status, ObjectStatus::END_OF_GROUP);
   }
 
  protected:
@@ -415,6 +426,86 @@ TEST(MoQFramerTest, ParseServerSetupLengthParseParam) {
   folly::io::Cursor cursor(buf.get());
   MoQFrameParser parser;
   parser.parseServerSetup(cursor, sizeToGive);
+}
+
+TEST(MoQFramerTest, ParseClientSetupWithUnknownAndSupportedVersions) {
+  // Compose a CLIENT_SETUP with both supported and unknown versions, and extra
+  // params
+  // Compose a CLIENT_SETUP with two supported versions (one valid, one
+  // unknown/unsupported)
+  ClientSetup clientSetup{
+      .supportedVersions = {kVersionDraftCurrent, kVersionDraftCurrent},
+      .params =
+          {
+              {
+                  folly::to_underlying(SetupKey::MAX_REQUEST_ID),
+                  42,
+              },
+              {
+                  folly::to_underlying(SetupKey::PATH),
+                  "/foo/bar",
+              },
+          },
+  };
+
+  folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
+  auto resultWrite =
+      writeClientSetup(writeBuf, clientSetup, kVersionDraftCurrent);
+  EXPECT_TRUE(resultWrite.hasValue()) << "Failed to write CLIENT_SETUP";
+
+  // Coalesce the buffer so we can index into it
+  auto buffer = writeBuf.move();
+  buffer->coalesce();
+
+  // Overwrite the second version with kVersionDraft03 (unsupported) by splicing
+  // in a new IOBuf Layout: [1 byte frame type][2 byte length][1 byte
+  // num_versions][varint][varint] So offset = 1 (frame type) + 2 (length) + 1
+  // (num_versions) + <size of first version>
+  size_t offset = 1 + 2 + 1;
+  size_t firstVersionSize = *quic::getQuicIntegerSize(kVersionDraftCurrent);
+  size_t secondVersionOffset = offset + firstVersionSize;
+  size_t secondVersionSize = *quic::getQuicIntegerSize(kVersionDraftCurrent);
+
+  // Create a new IOBuf with kVersionDraft03 encoded as a quic varint
+  folly::IOBufQueue patchBuf{folly::IOBufQueue::cacheChainLength()};
+  folly::io::QueueAppender appender(&patchBuf, kMaxFrameHeaderSize);
+  XCHECK(quic::encodeQuicInteger(kVersionDraft03, [&](auto val) {
+    appender.writeBE(val);
+  }));
+  auto patchIOBuf = patchBuf.move();
+
+  // Splice: [head][patch][tail]
+  auto head = buffer->cloneOne();
+  head->trimEnd(buffer->length() - secondVersionOffset);
+  auto tail = buffer->cloneOne();
+  tail->trimStart(secondVersionOffset + secondVersionSize);
+
+  // Build new buffer chain: head -> patchIOBuf -> tail
+  head->appendToChain(std::move(patchIOBuf));
+  head->appendToChain(std::move(tail));
+  buffer = std::move(head);
+
+  folly::io::Cursor cursor(buffer.get());
+
+  MoQFrameParser parser;
+  parser.initializeVersion(kVersionDraftCurrent);
+
+  cursor.skip(3);
+  auto length = buffer->computeChainDataLength() - 3;
+  auto result = parser.parseClientSetup(cursor, length);
+  EXPECT_TRUE(result.hasValue())
+      << "Parsing CLIENT_SETUP with mixed versions should succeed";
+  // Check only supported versions are present in the parsed setup
+  ASSERT_EQ(result->supportedVersions.size(), 1);
+  EXPECT_EQ(result->supportedVersions[0], kVersionDraftCurrent);
+  // Check parameters
+  ASSERT_EQ(result->params.size(), 2);
+  auto it = result->params.begin();
+  EXPECT_EQ(it->key, folly::to_underlying(SetupKey::MAX_REQUEST_ID));
+  EXPECT_EQ(it->asUint64, 42);
+  ++it;
+  EXPECT_EQ(it->key, folly::to_underlying(SetupKey::PATH));
+  EXPECT_EQ(it->asString, "/foo/bar");
 }
 
 ObjectHeader MoQFramerTest::testUnderflowDatagramHelper(
@@ -603,29 +694,36 @@ TEST_P(MoQFramerTest, ParseStreamHeader) {
   folly::io::Cursor cursor(serialized.get());
   EXPECT_EQ(parseStreamType(cursor), streamType);
   auto sgOptions = getSubgroupOptions(GetParam(), streamType);
-  auto parseStreamHeaderResult = parser_.parseSubgroupHeader(cursor, sgOptions);
+  auto parseStreamHeaderResult =
+      parser_.parseSubgroupHeader(cursor, cursor.totalLength(), sgOptions);
   EXPECT_TRUE(parseStreamHeaderResult.hasValue());
   auto parseResult = parser_.parseSubgroupObjectHeader(
-      cursor, parseStreamHeaderResult->objectHeader, sgOptions);
+      cursor,
+      cursor.totalLength(),
+      parseStreamHeaderResult->value.objectHeader,
+      sgOptions);
   EXPECT_TRUE(parseResult.hasValue());
   // trackAlias is no longer part of ObjectHeader, validated by function call
   // context
-  EXPECT_EQ(parseResult->group, 33);
-  EXPECT_EQ(parseResult->id, 44);
-  EXPECT_EQ(parseResult->priority, 55);
-  EXPECT_EQ(parseResult->status, ObjectStatus::NORMAL);
-  EXPECT_EQ(*parseResult->length, 4);
-  cursor.skip(*parseResult->length);
+  EXPECT_EQ(parseResult->value.group, 33);
+  EXPECT_EQ(parseResult->value.id, 44);
+  EXPECT_EQ(parseResult->value.priority, 55);
+  EXPECT_EQ(parseResult->value.status, ObjectStatus::NORMAL);
+  EXPECT_EQ(*parseResult->value.length, 4);
+  cursor.skip(*parseResult->value.length);
 
   parseResult = parser_.parseSubgroupObjectHeader(
-      cursor, parseStreamHeaderResult->objectHeader, sgOptions);
+      cursor,
+      cursor.totalLength(),
+      parseStreamHeaderResult->value.objectHeader,
+      sgOptions);
   EXPECT_TRUE(parseResult.hasValue());
   // trackAlias is no longer part of ObjectHeader, validated by function call
   // context
-  EXPECT_EQ(parseResult->group, 33);
-  EXPECT_EQ(parseResult->id, 45);
-  EXPECT_EQ(parseResult->priority, 55);
-  EXPECT_EQ(parseResult->status, ObjectStatus::OBJECT_NOT_EXIST);
+  EXPECT_EQ(parseResult->value.group, 33);
+  EXPECT_EQ(parseResult->value.id, 45);
+  EXPECT_EQ(parseResult->value.priority, 55);
+  EXPECT_EQ(parseResult->value.status, ObjectStatus::OBJECT_NOT_EXIST);
 }
 
 TEST_P(MoQFramerTest, ParseFetchHeader) {
@@ -659,24 +757,27 @@ TEST_P(MoQFramerTest, ParseFetchHeader) {
   folly::io::Cursor cursor(serialized.get());
 
   EXPECT_EQ(parseStreamType(cursor), StreamType::FETCH_HEADER);
-  auto parseStreamHeaderResult = parser_.parseFetchHeader(cursor);
+  auto parseStreamHeaderResult =
+      parser_.parseFetchHeader(cursor, cursor.totalLength());
   EXPECT_TRUE(parseStreamHeaderResult.hasValue());
   ObjectHeader headerTemplate;
-  auto parseResult = parser_.parseFetchObjectHeader(cursor, headerTemplate);
+  auto parseResult = parser_.parseFetchObjectHeader(
+      cursor, cursor.totalLength(), headerTemplate);
   EXPECT_TRUE(parseResult.hasValue());
-  EXPECT_EQ(parseResult->group, 33);
-  EXPECT_EQ(parseResult->id, 44);
-  EXPECT_EQ(parseResult->priority, 55);
-  EXPECT_EQ(parseResult->status, ObjectStatus::NORMAL);
-  EXPECT_EQ(*parseResult->length, 4);
-  cursor.skip(*parseResult->length);
+  EXPECT_EQ(parseResult->value.group, 33);
+  EXPECT_EQ(parseResult->value.id, 44);
+  EXPECT_EQ(parseResult->value.priority, 55);
+  EXPECT_EQ(parseResult->value.status, ObjectStatus::NORMAL);
+  EXPECT_EQ(*parseResult->value.length, 4);
+  cursor.skip(*parseResult->value.length);
 
-  parseResult = parser_.parseFetchObjectHeader(cursor, headerTemplate);
+  parseResult = parser_.parseFetchObjectHeader(
+      cursor, cursor.totalLength(), headerTemplate);
   EXPECT_TRUE(parseResult.hasValue());
-  EXPECT_EQ(parseResult->group, 33);
-  EXPECT_EQ(parseResult->id, 44);
-  EXPECT_EQ(parseResult->priority, 55);
-  EXPECT_EQ(parseResult->status, ObjectStatus::OBJECT_NOT_EXIST);
+  EXPECT_EQ(parseResult->value.group, 33);
+  EXPECT_EQ(parseResult->value.id, 44);
+  EXPECT_EQ(parseResult->value.priority, 55);
+  EXPECT_EQ(parseResult->value.status, ObjectStatus::OBJECT_NOT_EXIST);
 }
 
 TEST_P(MoQFramerTest, ParseClientSetupForMaxRequestID) {
@@ -693,10 +794,8 @@ TEST_P(MoQFramerTest, ParseClientSetupForMaxRequestID) {
   for (auto maxRequestID : kTestMaxRequestIDs) {
     auto clientSetup = ClientSetup{
         .supportedVersions = {kVersionDraftCurrent},
-        .params =
-            {{{.key = folly::to_underlying(SetupKey::MAX_REQUEST_ID),
-               .asString = "",
-               .asUint64 = maxRequestID}}},
+        .params = {Parameter(
+            folly::to_underlying(SetupKey::MAX_REQUEST_ID), maxRequestID)},
     };
 
     folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
@@ -915,19 +1014,23 @@ TEST_P(MoQFramerTest, SingleObjectStream) {
       << GetParam() << " " << folly::to_underlying(parsedST) << " "
       << folly::to_underlying(streamType);
   auto sgOptions = getSubgroupOptions(GetParam(), streamType);
-  auto parseStreamHeaderResult = parser_.parseSubgroupHeader(cursor, sgOptions);
+  auto parseStreamHeaderResult =
+      parser_.parseSubgroupHeader(cursor, cursor.totalLength(), sgOptions);
   EXPECT_TRUE(parseStreamHeaderResult.hasValue());
   auto parseResult = parser_.parseSubgroupObjectHeader(
-      cursor, parseStreamHeaderResult->objectHeader, sgOptions);
+      cursor,
+      cursor.totalLength(),
+      parseStreamHeaderResult->value.objectHeader,
+      sgOptions);
   EXPECT_TRUE(parseResult.hasValue());
   // trackAlias is no longer part of ObjectHeader, validated by function call
   // context
-  EXPECT_EQ(parseResult->group, 33);
-  EXPECT_EQ(parseResult->id, 44);
-  EXPECT_EQ(parseResult->priority, 55);
-  EXPECT_EQ(parseResult->status, ObjectStatus::NORMAL);
-  EXPECT_EQ(*parseResult->length, 4);
-  cursor.skip(*parseResult->length);
+  EXPECT_EQ(parseResult->value.group, 33);
+  EXPECT_EQ(parseResult->value.id, 44);
+  EXPECT_EQ(parseResult->value.priority, 55);
+  EXPECT_EQ(parseResult->value.status, ObjectStatus::NORMAL);
+  EXPECT_EQ(*parseResult->value.length, 4);
+  cursor.skip(*parseResult->value.length);
 }
 
 TEST_P(MoQFramerTest, ParseTrackStatus) {
@@ -936,16 +1039,11 @@ TEST_P(MoQFramerTest, ParseTrackStatus) {
       TrackStatus::make(FullTrackName({TrackNamespace({"hello"}), "world"}));
   ts.locType = LocationType::LargestObject;
   // Add some parameters to the TrackStatus.
-  ts.params.insertParam(
-      {folly::to_underlying(TrackRequestParamKey::AUTHORIZATION_TOKEN),
-       writer_.encodeTokenValue(0, "stampolli"),
-       0,
-       {}});
-  ts.params.insertParam(
-      {folly::to_underlying(TrackRequestParamKey::DELIVERY_TIMEOUT),
-       "",
-       999,
-       {}});
+  ts.params.insertParam(Parameter(
+      folly::to_underlying(TrackRequestParamKey::AUTHORIZATION_TOKEN),
+      writer_.encodeTokenValue(0, "stampolli")));
+  ts.params.insertParam(Parameter(
+      folly::to_underlying(TrackRequestParamKey::DELIVERY_TIMEOUT), 999));
   auto writeResult = writer_.writeTrackStatus(writeBuf, ts);
   EXPECT_TRUE(writeResult.hasValue());
 
@@ -981,16 +1079,11 @@ TEST_P(MoQFramerTest, ParseTrackStatusOk) {
   trackStatusOk.groupOrder = GroupOrder::OldestFirst;
   TrackRequestParameters params;
   // Add some parameters to the TrackStatus.
-  params.insertParam(
-      {folly::to_underlying(TrackRequestParamKey::AUTHORIZATION_TOKEN),
-       writer_.encodeTokenValue(0, "stampolli"),
-       0,
-       {}});
-  params.insertParam(
-      {folly::to_underlying(TrackRequestParamKey::DELIVERY_TIMEOUT),
-       "",
-       999,
-       {}});
+  params.insertParam(Parameter(
+      folly::to_underlying(TrackRequestParamKey::AUTHORIZATION_TOKEN),
+      writer_.encodeTokenValue(0, "stampolli")));
+  params.insertParam(Parameter(
+      folly::to_underlying(TrackRequestParamKey::DELIVERY_TIMEOUT), 999));
   trackStatusOk.params = params;
   auto writeResult = writer_.writeTrackStatusOk(writeBuf, trackStatusOk);
   EXPECT_TRUE(writeResult.hasValue());
@@ -998,9 +1091,19 @@ TEST_P(MoQFramerTest, ParseTrackStatusOk) {
   auto serialized = writeBuf.move();
   folly::io::Cursor cursor(serialized.get());
   auto frameType = quic::follyutils::decodeQuicInteger(cursor);
-  EXPECT_EQ(frameType->first, folly::to_underlying(FrameType::TRACK_STATUS_OK));
-  auto parseResult = parser_.parseTrackStatusOk(cursor, frameLength(cursor));
-  EXPECT_TRUE(parseResult.hasValue());
+  folly::Expected<TrackStatusOk, ErrorCode> parseResult;
+  if (getDraftMajorVersion(GetParam()) < 15) {
+    EXPECT_EQ(
+        frameType->first, folly::to_underlying(FrameType::TRACK_STATUS_OK));
+    parseResult = parser_.parseTrackStatusOk(cursor, frameLength(cursor));
+    EXPECT_TRUE(parseResult.hasValue());
+  } else {
+    EXPECT_EQ(frameType->first, folly::to_underlying(FrameType::REQUEST_OK));
+    auto result = parser_.parseRequestOk(
+        cursor, frameLength(cursor), FrameType::REQUEST_OK);
+    EXPECT_TRUE(result.hasValue());
+    parseResult = result->toTrackStatusOk();
+  }
   EXPECT_EQ(parseResult->requestID, 7);
   EXPECT_EQ(parseResult->largest->group, 19);
   EXPECT_EQ(parseResult->largest->object, 77);
@@ -1058,11 +1161,9 @@ static size_t writeSubscribeRequestWithAuthToken(
 
   auto encodedToken =
       encodeToken(writer, aliasType, alias, tokenType, tokenValue);
-  req.params.insertParam(
-      {folly::to_underlying(TrackRequestParamKey::AUTHORIZATION_TOKEN),
-       encodedToken,
-       0,
-       {}});
+  req.params.insertParam(Parameter(
+      folly::to_underlying(TrackRequestParamKey::AUTHORIZATION_TOKEN),
+      encodedToken));
   auto writeResult = writer.writeSubscribeRequest(writeBuf, req);
   EXPECT_TRUE(writeResult.hasValue());
   return encodedToken.size();
@@ -1212,10 +1313,19 @@ TEST_P(MoQFramerAuthTest, AuthTokenUnderflowTest) {
   tokenLengths.push_back(len);
 
   for (int j = 0; j < 4; ++j) {
+    /*
+     * The five buffer operations in AuthTokenUnderflowTest carve the serialized
+     * SUBSCRIBE frame into pieces so the test can fiddle with the token-length
+     * field while keeping the rest of the frame intact:
+     */
     auto frameHeader = writeBufs[j].split(3);
     // Version 15+ don't have the filter within the request, but in the
     // parameters
-    uint32_t frontLength = (getDraftMajorVersion(GetParam()) >= 15) ? 16 : 19;
+    const uint32_t kDraft15PreambleLength = 13;
+    const uint32_t kDraft14PreambleLength = 19;
+    uint32_t frontLength = (getDraftMajorVersion(GetParam()) >= 15)
+        ? kDraft15PreambleLength
+        : kDraft14PreambleLength;
     auto front = writeBufs[j].split(frontLength);
     auto origTokenLengthBytes = tokenLengths[j] > 64 ? 2 : 1;
     auto tokenLengthBuf = writeBufs[j].split(origTokenLengthBytes);
@@ -1332,11 +1442,59 @@ TEST_P(MoQFramerTest, SubscribeUpdateWithSubscribeReqIDSerialization) {
         0); // Not set by parser for v<14
   }
 
-  EXPECT_EQ(parseResult->start.group, 10);
-  EXPECT_EQ(parseResult->start.object, 20);
+  EXPECT_EQ(parseResult->start->group, 10);
+  EXPECT_EQ(parseResult->start->object, 20);
   EXPECT_EQ(parseResult->endGroup, 30);
   EXPECT_EQ(parseResult->priority, 5);
-  EXPECT_EQ(parseResult->forward, true);
+  EXPECT_TRUE(parseResult->forward.hasValue());
+  EXPECT_EQ(*parseResult->forward, true);
+}
+
+TEST(MoQFramerTest, SubscribeUpdateDraft15ForwardUnset) {
+  // Test that in draft 15+, a SUBSCRIBE_UPDATE without forward parameter
+  // is correctly serialized and parsed with forward field unset
+  MoQFrameWriter writer;
+  writer.initializeVersion(kVersionDraft15);
+  MoQFrameParser parser;
+  parser.initializeVersion(kVersionDraft15);
+
+  folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
+
+  SubscribeUpdate subscribeUpdate;
+  subscribeUpdate.requestID = RequestID(123);
+  subscribeUpdate.subscriptionRequestID = RequestID(456);
+  subscribeUpdate.start = AbsoluteLocation{0, 0};
+  subscribeUpdate.endGroup = 0; // Open-ended subscription
+  subscribeUpdate.priority = kDefaultPriority;
+  // forward field intentionally left unset (folly::none)
+  subscribeUpdate.params = {};
+
+  auto writeResult = writer.writeSubscribeUpdate(writeBuf, subscribeUpdate);
+  EXPECT_TRUE(writeResult.hasValue()) << "Failed to write SUBSCRIBE_UPDATE";
+
+  auto buffer = writeBuf.move();
+  folly::io::Cursor cursor(buffer.get());
+
+  // Skip frame type
+  auto frameType = quic::follyutils::decodeQuicInteger(cursor);
+  EXPECT_EQ(
+      frameType->first, folly::to_underlying(FrameType::SUBSCRIBE_UPDATE));
+
+  // Skip frame length
+  size_t frameLength = cursor.readBE<uint16_t>();
+
+  // Parse the SUBSCRIBE_UPDATE
+  auto parseResult = parser.parseSubscribeUpdate(cursor, frameLength);
+  EXPECT_TRUE(parseResult.hasValue()) << "Failed to parse SUBSCRIBE_UPDATE";
+
+  EXPECT_EQ(parseResult->requestID.value, 123);
+  EXPECT_EQ(parseResult->subscriptionRequestID.value, 456);
+  EXPECT_EQ(parseResult->start->group, 0);
+  EXPECT_EQ(parseResult->start->object, 0);
+  EXPECT_EQ(parseResult->endGroup, 0);
+  EXPECT_EQ(parseResult->priority, kDefaultPriority);
+  // Verify forward field is NOT set (preserves existing state per draft 15+)
+  EXPECT_FALSE(parseResult->forward.hasValue());
 }
 
 TEST_P(MoQFramerTest, OddExtensionLengthVarintBoundary) {
@@ -1370,16 +1528,17 @@ TEST_P(MoQFramerTest, OddExtensionLengthVarintBoundary) {
       GetParam(), SubgroupIDFormat::Present, true, /*endOfGroup=*/false);
   EXPECT_EQ(parseStreamType(cursor), streamType);
   auto sgOptions = getSubgroupOptions(GetParam(), streamType);
-  auto hdrRes = parser_.parseSubgroupHeader(cursor, sgOptions);
+  auto hdrRes =
+      parser_.parseSubgroupHeader(cursor, cursor.totalLength(), sgOptions);
   EXPECT_TRUE(hdrRes.hasValue());
   auto objRes = parser_.parseSubgroupObjectHeader(
-      cursor, hdrRes->objectHeader, sgOptions);
+      cursor, cursor.totalLength(), hdrRes->value.objectHeader, sgOptions);
   EXPECT_TRUE(objRes.hasValue());
-  ASSERT_EQ(objRes->extensions.size(), 1);
-  EXPECT_TRUE(objRes->extensions.getMutableExtensions()[0].isOddType());
-  EXPECT_EQ(objRes->extensions.getMutableExtensions()[0].type, 13);
+  ASSERT_EQ(objRes->value.extensions.size(), 1);
+  EXPECT_TRUE(objRes->value.extensions.getMutableExtensions()[0].isOddType());
+  EXPECT_EQ(objRes->value.extensions.getMutableExtensions()[0].type, 13);
   EXPECT_EQ(
-      objRes->extensions.getMutableExtensions()[0]
+      objRes->value.extensions.getMutableExtensions()[0]
           .arrayValue->computeChainDataLength(),
       64);
 }
@@ -1434,6 +1593,38 @@ TEST_P(MoQFramerTest, SubscribeRequestEncodeDecode) {
   EXPECT_EQ(parseRes->params.size(), req.params.size());
 }
 
+TEST_P(MoQFramerTest, ParseSubscriptionFilterLargestGroup) {
+  folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
+
+  // Build a SubscribeRequest with LargestGroup location type
+  FullTrackName ftn{TrackNamespace({"ns"}), "track"};
+  auto req = SubscribeRequest::make(
+      ftn,
+      /*priority*/ kDefaultPriority,
+      /*groupOrder*/ GroupOrder::Default,
+      /*forward*/ true,
+      /*locType*/ LocationType::LargestGroup,
+      /*start*/ folly::none,
+      /*endGroup*/ 0,
+      /*params*/ {});
+
+  auto writeRes = writer_.writeSubscribeRequest(writeBuf, req);
+  EXPECT_TRUE(writeRes.hasValue());
+
+  auto serialized = writeBuf.move();
+  folly::io::Cursor cursor(serialized.get());
+
+  // Verify frame type and parse
+  auto frameType = quic::follyutils::decodeQuicInteger(cursor);
+  EXPECT_EQ(frameType->first, folly::to_underlying(FrameType::SUBSCRIBE));
+  auto parseRes = parser_.parseSubscribeRequest(cursor, frameLength(cursor));
+  EXPECT_TRUE(parseRes.hasValue());
+
+  // Check that parsed SubscribeRequest matches the original
+  EXPECT_EQ(parseRes->locType, LocationType::LargestGroup);
+  EXPECT_FALSE(parseRes->start.has_value());
+}
+
 INSTANTIATE_TEST_SUITE_P(
     MoQFramerTest,
     MoQFramerTest,
@@ -1466,9 +1657,13 @@ TEST(MoQFramerTestUtils, GetVersionFromAlpn) {
   auto legacyVersion = getVersionFromAlpn("moq-00");
   EXPECT_FALSE(legacyVersion.hasValue());
 
-  auto draft15 = getVersionFromAlpn("moqt-15");
-  ASSERT_TRUE(draft15.hasValue());
-  EXPECT_EQ(*draft15, 0xff00000f);
+  auto draft15Meta = getVersionFromAlpn("moqt-15-meta-01");
+  ASSERT_TRUE(draft15Meta.hasValue());
+  EXPECT_EQ(*draft15Meta, 0xff00000f);
+
+  auto draft15Meta02 = getVersionFromAlpn("moqt-15-meta-02");
+  ASSERT_TRUE(draft15Meta02.hasValue());
+  EXPECT_EQ(*draft15Meta02, 0xff00000f);
 
   auto invalidAlpn1 = getVersionFromAlpn("h3");
   EXPECT_FALSE(invalidAlpn1.hasValue());
@@ -1494,22 +1689,7 @@ TEST(MoQFramerTestUtils, GetAlpnFromVersion) {
 
   auto alpnDraft15 = getAlpnFromVersion(0xff00000f);
   ASSERT_TRUE(alpnDraft15.hasValue());
-  EXPECT_EQ(*alpnDraft15, "moqt-15");
-}
-
-TEST(MoQFramerTestUtils, AlpnRoundTrip) {
-  auto testRoundTrip = [](const std::string& alpn) {
-    auto version = getVersionFromAlpn(alpn);
-    ASSERT_TRUE(version.hasValue()) << "Failed to parse ALPN: " << alpn;
-    auto alpnBack = getAlpnFromVersion(*version);
-    ASSERT_TRUE(alpnBack.hasValue())
-        << "Failed to convert version back to ALPN";
-    EXPECT_EQ(*alpnBack, alpn) << "Round trip failed for ALPN: " << alpn;
-  };
-
-  testRoundTrip("moqt-15");
-  testRoundTrip("moqt-16");
-  testRoundTrip("moqt-20");
+  EXPECT_EQ(*alpnDraft15, kAlpnMoqtDraft15Latest);
 }
 
 // Test class for immutable extensions feature (draft 14+)
@@ -2348,12 +2528,13 @@ void testSubgroupPriorityRoundTrip(
   auto streamType = StreamType(parsedStreamType->first);
   EXPECT_EQ(streamType, expectedType);
   auto sgOptions = getSubgroupOptions(version, streamType);
-  auto parseResult = parser.parseSubgroupHeader(cursor, sgOptions);
+  auto parseResult =
+      parser.parseSubgroupHeader(cursor, cursor.totalLength(), sgOptions);
   EXPECT_TRUE(parseResult.hasValue());
-  EXPECT_EQ(parseResult->trackAlias, TrackAlias(25));
-  EXPECT_EQ(parseResult->objectHeader.group, 100);
-  EXPECT_EQ(parseResult->objectHeader.subgroup, 50);
-  EXPECT_EQ(parseResult->objectHeader.priority, expectedPriority);
+  EXPECT_EQ(parseResult->value.trackAlias, TrackAlias(25));
+  EXPECT_EQ(parseResult->value.objectHeader.group, 100);
+  EXPECT_EQ(parseResult->value.objectHeader.subgroup, 50);
+  EXPECT_EQ(parseResult->value.objectHeader.priority, expectedPriority);
 }
 
 // Test round-trip write/read with folly::none priority in subgroup (v15)
@@ -2370,3 +2551,397 @@ TEST(MoQFramerTest, OptionalPrioritySubgroupRoundTripValue) {
   testSubgroupPriorityRoundTrip(
       kVersionDraft15, 80, StreamType::SUBGROUP_HEADER_SG, 80);
 }
+
+// Test class for GroupOrder defaults feature (draft 15+)
+// In v15+, GROUP_ORDER is passed as a parameter and parser uses defaults
+class MoQFramerV15PlusTest : public ::testing::TestWithParam<uint64_t> {
+ public:
+  void SetUp() override {
+    parser_.initializeVersion(GetParam());
+    writer_.initializeVersion(GetParam());
+  }
+
+ protected:
+  MoQFrameParser parser_;
+  MoQFrameWriter writer_;
+
+  size_t frameLength(folly::io::Cursor& cursor, bool checkAdvance = true) {
+    if (!cursor.canAdvance(2)) {
+      throw std::runtime_error("Cannot read frame length");
+    }
+    size_t res = cursor.readBE<uint16_t>();
+    if (checkAdvance && !cursor.canAdvance(res)) {
+      throw std::runtime_error("Frame length exceeds available data");
+    }
+    return res;
+  }
+};
+
+// Test default GroupOrder for SubscribeRequest when param not present
+TEST_P(MoQFramerV15PlusTest, SubscribeRequestDefaultGroupOrder) {
+  folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
+
+  SubscribeRequest req = SubscribeRequest::make(
+      FullTrackName({TrackNamespace({"ns"}), "track"}),
+      /*priority*/ 128,
+      /*groupOrder*/ GroupOrder::Default, // Writer won't write GROUP_ORDER
+                                          // param
+      /*forward*/ true,
+      /*locType*/ LocationType::LargestObject,
+      /*start*/ folly::none,
+      /*endGroup*/ 0,
+      /*params*/ {});
+
+  auto writeResult = writer_.writeSubscribeRequest(writeBuf, req);
+  EXPECT_TRUE(writeResult.hasValue());
+
+  auto serialized = writeBuf.move();
+  folly::io::Cursor cursor(serialized.get());
+
+  auto frameType = quic::follyutils::decodeQuicInteger(cursor);
+  EXPECT_EQ(frameType->first, folly::to_underlying(FrameType::SUBSCRIBE));
+
+  auto parseResult = parser_.parseSubscribeRequest(cursor, frameLength(cursor));
+  EXPECT_TRUE(parseResult.hasValue());
+
+  // When GROUP_ORDER param is not written, parser should set to Default
+  EXPECT_EQ(parseResult->groupOrder, GroupOrder::Default);
+}
+
+// Test explicit GroupOrder param overrides default for SubscribeRequest
+TEST_P(MoQFramerV15PlusTest, SubscribeRequestExplicitGroupOrder) {
+  folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
+
+  SubscribeRequest req = SubscribeRequest::make(
+      FullTrackName({TrackNamespace({"ns"}), "track"}),
+      /*priority*/ 128,
+      /*groupOrder*/ GroupOrder::NewestFirst, // Non-default, writer will write
+                                              // it
+      /*forward*/ true,
+      /*locType*/ LocationType::LargestObject,
+      /*start*/ folly::none,
+      /*endGroup*/ 0,
+      /*params*/ {});
+
+  auto writeResult = writer_.writeSubscribeRequest(writeBuf, req);
+  EXPECT_TRUE(writeResult.hasValue());
+
+  auto serialized = writeBuf.move();
+  folly::io::Cursor cursor(serialized.get());
+
+  auto frameType = quic::follyutils::decodeQuicInteger(cursor);
+  EXPECT_EQ(frameType->first, folly::to_underlying(FrameType::SUBSCRIBE));
+
+  auto parseResult = parser_.parseSubscribeRequest(cursor, frameLength(cursor));
+  EXPECT_TRUE(parseResult.hasValue());
+
+  // Explicit value should be preserved
+  EXPECT_EQ(parseResult->groupOrder, GroupOrder::NewestFirst);
+}
+
+// Test default GroupOrder for SubscribeOk when param not present
+TEST_P(MoQFramerV15PlusTest, SubscribeOkDefaultGroupOrder) {
+  folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
+
+  SubscribeOk subscribeOk;
+  subscribeOk.requestID = RequestID(42);
+  subscribeOk.trackAlias = TrackAlias(1);
+  subscribeOk.expires = std::chrono::milliseconds(1000);
+  subscribeOk.groupOrder =
+      GroupOrder::Default; // Writer won't write GROUP_ORDER param
+  subscribeOk.largest = AbsoluteLocation{10, 20};
+  subscribeOk.params = {};
+
+  auto writeResult = writer_.writeSubscribeOk(writeBuf, subscribeOk);
+  EXPECT_TRUE(writeResult.hasValue());
+
+  auto serialized = writeBuf.move();
+  folly::io::Cursor cursor(serialized.get());
+
+  auto frameType = quic::follyutils::decodeQuicInteger(cursor);
+  EXPECT_EQ(frameType->first, folly::to_underlying(FrameType::SUBSCRIBE_OK));
+
+  auto parseResult = parser_.parseSubscribeOk(cursor, frameLength(cursor));
+  EXPECT_TRUE(parseResult.hasValue());
+
+  // When GROUP_ORDER param is not written, parser should set to OldestFirst
+  EXPECT_EQ(parseResult->groupOrder, GroupOrder::OldestFirst);
+}
+
+// Test explicit GroupOrder param overrides default for SubscribeOk
+TEST_P(MoQFramerV15PlusTest, SubscribeOkExplicitGroupOrder) {
+  folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
+
+  SubscribeOk subscribeOk;
+  subscribeOk.requestID = RequestID(42);
+  subscribeOk.trackAlias = TrackAlias(1);
+  subscribeOk.expires = std::chrono::milliseconds(1000);
+  subscribeOk.groupOrder =
+      GroupOrder::NewestFirst; // Non-default, will be written
+  subscribeOk.largest = AbsoluteLocation{10, 20};
+  subscribeOk.params = {};
+
+  auto writeResult = writer_.writeSubscribeOk(writeBuf, subscribeOk);
+  EXPECT_TRUE(writeResult.hasValue());
+
+  auto serialized = writeBuf.move();
+  folly::io::Cursor cursor(serialized.get());
+
+  auto frameType = quic::follyutils::decodeQuicInteger(cursor);
+  EXPECT_EQ(frameType->first, folly::to_underlying(FrameType::SUBSCRIBE_OK));
+
+  auto parseResult = parser_.parseSubscribeOk(cursor, frameLength(cursor));
+  EXPECT_TRUE(parseResult.hasValue());
+
+  // Explicit value should be preserved
+  EXPECT_EQ(parseResult->groupOrder, GroupOrder::NewestFirst);
+}
+
+TEST_P(MoQFramerV15PlusTest, SubscribeOkExpiresParameter) {
+  folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
+
+  SubscribeOk subscribeOk;
+  subscribeOk.requestID = RequestID(42);
+  subscribeOk.trackAlias = TrackAlias(1);
+  subscribeOk.expires = std::chrono::milliseconds(5000);
+  subscribeOk.groupOrder = GroupOrder::OldestFirst;
+  subscribeOk.largest = AbsoluteLocation{10, 20};
+  subscribeOk.params = {};
+
+  auto writeResult = writer_.writeSubscribeOk(writeBuf, subscribeOk);
+  EXPECT_TRUE(writeResult.hasValue());
+
+  auto serialized = writeBuf.move();
+  folly::io::Cursor cursor(serialized.get());
+
+  auto frameType = quic::follyutils::decodeQuicInteger(cursor);
+  EXPECT_EQ(frameType->first, folly::to_underlying(FrameType::SUBSCRIBE_OK));
+
+  auto parseResult = parser_.parseSubscribeOk(cursor, frameLength(cursor));
+  EXPECT_TRUE(parseResult.hasValue());
+
+  // Verify expires is correctly parsed from parameter
+  EXPECT_EQ(parseResult->expires, std::chrono::milliseconds(5000));
+  EXPECT_EQ(parseResult->requestID, RequestID(42));
+  EXPECT_EQ(parseResult->trackAlias, TrackAlias(1));
+  EXPECT_EQ(parseResult->groupOrder, GroupOrder::OldestFirst);
+}
+
+TEST_P(MoQFramerV15PlusTest, SubscribeOkExpiresZeroNotWritten) {
+  folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
+
+  SubscribeOk subscribeOk;
+  subscribeOk.requestID = RequestID(42);
+  subscribeOk.trackAlias = TrackAlias(1);
+  subscribeOk.expires = std::chrono::milliseconds(0); // Zero expires
+  subscribeOk.groupOrder = GroupOrder::NewestFirst;
+  subscribeOk.largest = AbsoluteLocation{10, 20};
+  subscribeOk.params = {};
+
+  auto writeResult = writer_.writeSubscribeOk(writeBuf, subscribeOk);
+  EXPECT_TRUE(writeResult.hasValue());
+
+  auto serialized = writeBuf.move();
+  folly::io::Cursor cursor(serialized.get());
+
+  auto frameType = quic::follyutils::decodeQuicInteger(cursor);
+  EXPECT_EQ(frameType->first, folly::to_underlying(FrameType::SUBSCRIBE_OK));
+
+  auto parseResult = parser_.parseSubscribeOk(cursor, frameLength(cursor));
+  EXPECT_TRUE(parseResult.hasValue());
+
+  // When EXPIRES param not written (value=0), parser should default to 0
+  EXPECT_EQ(parseResult->expires, std::chrono::milliseconds(0));
+  EXPECT_EQ(parseResult->groupOrder, GroupOrder::NewestFirst);
+}
+
+// Test default GroupOrder for Publish when param not present
+TEST_P(MoQFramerV15PlusTest, PublishDefaultGroupOrder) {
+  folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
+
+  PublishRequest publishRequest;
+  publishRequest.requestID = RequestID(100);
+  publishRequest.fullTrackName =
+      FullTrackName({TrackNamespace({"test"}), "pub"});
+  publishRequest.groupOrder =
+      GroupOrder::Default;    // Will be overridden by parser default
+  publishRequest.params = {}; // No GROUP_ORDER param
+
+  auto writeResult = writer_.writePublish(writeBuf, publishRequest);
+  EXPECT_TRUE(writeResult.hasValue());
+
+  auto serialized = writeBuf.move();
+  folly::io::Cursor cursor(serialized.get());
+
+  auto frameType = quic::follyutils::decodeQuicInteger(cursor);
+  EXPECT_EQ(frameType->first, folly::to_underlying(FrameType::PUBLISH));
+
+  auto parseResult = parser_.parsePublish(cursor, frameLength(cursor));
+  EXPECT_TRUE(parseResult.hasValue());
+
+  // When GROUP_ORDER param is not in params, parser should set to OldestFirst
+  EXPECT_EQ(parseResult->groupOrder, GroupOrder::OldestFirst);
+}
+
+// Test explicit GroupOrder param overrides default for Publish
+TEST_P(MoQFramerV15PlusTest, PublishExplicitGroupOrder) {
+  folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
+
+  PublishRequest publishRequest;
+  publishRequest.requestID = RequestID(100);
+  publishRequest.fullTrackName =
+      FullTrackName({TrackNamespace({"test"}), "pub"});
+  publishRequest.groupOrder =
+      GroupOrder::NewestFirst; // Non-default, will be written
+  publishRequest.params = {};
+
+  auto writeResult = writer_.writePublish(writeBuf, publishRequest);
+  EXPECT_TRUE(writeResult.hasValue());
+
+  auto serialized = writeBuf.move();
+  folly::io::Cursor cursor(serialized.get());
+
+  auto frameType = quic::follyutils::decodeQuicInteger(cursor);
+  EXPECT_EQ(frameType->first, folly::to_underlying(FrameType::PUBLISH));
+
+  auto parseResult = parser_.parsePublish(cursor, frameLength(cursor));
+  EXPECT_TRUE(parseResult.hasValue());
+
+  // Explicit value should be preserved
+  EXPECT_EQ(parseResult->groupOrder, GroupOrder::NewestFirst);
+}
+
+// Test default GroupOrder for PublishOk when param not present
+TEST_P(MoQFramerV15PlusTest, PublishOkDefaultGroupOrder) {
+  folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
+
+  PublishOk publishOk;
+  publishOk.requestID = RequestID(200);
+  publishOk.forward = true;
+  publishOk.subscriberPriority = 128;
+  publishOk.groupOrder =
+      GroupOrder::Default; // Writer won't write GROUP_ORDER param
+  publishOk.locType = LocationType::LargestObject;
+  publishOk.params = {};
+
+  auto writeResult = writer_.writePublishOk(writeBuf, publishOk);
+  EXPECT_TRUE(writeResult.hasValue());
+
+  auto serialized = writeBuf.move();
+  folly::io::Cursor cursor(serialized.get());
+
+  auto frameType = quic::follyutils::decodeQuicInteger(cursor);
+  EXPECT_EQ(frameType->first, folly::to_underlying(FrameType::PUBLISH_OK));
+
+  auto parseResult = parser_.parsePublishOk(cursor, frameLength(cursor));
+  EXPECT_TRUE(parseResult.hasValue());
+
+  // When GROUP_ORDER param is not written, parser should set to Default
+  EXPECT_EQ(parseResult->groupOrder, GroupOrder::Default);
+}
+
+// Test explicit GroupOrder param overrides default for PublishOk
+TEST_P(MoQFramerV15PlusTest, PublishOkExplicitGroupOrder) {
+  folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
+
+  PublishOk publishOk;
+  publishOk.requestID = RequestID(200);
+  publishOk.forward = true;
+  publishOk.subscriberPriority = 128;
+  publishOk.groupOrder =
+      GroupOrder::OldestFirst; // Non-default, will be written
+  publishOk.locType = LocationType::LargestObject;
+  publishOk.params = {};
+
+  auto writeResult = writer_.writePublishOk(writeBuf, publishOk);
+  EXPECT_TRUE(writeResult.hasValue());
+
+  auto serialized = writeBuf.move();
+  folly::io::Cursor cursor(serialized.get());
+
+  auto frameType = quic::follyutils::decodeQuicInteger(cursor);
+  EXPECT_EQ(frameType->first, folly::to_underlying(FrameType::PUBLISH_OK));
+
+  auto parseResult = parser_.parsePublishOk(cursor, frameLength(cursor));
+  EXPECT_TRUE(parseResult.hasValue());
+
+  // Explicit value should be preserved
+  EXPECT_EQ(parseResult->groupOrder, GroupOrder::OldestFirst);
+}
+
+// Test default GroupOrder for Fetch when param not present
+TEST_P(MoQFramerV15PlusTest, FetchDefaultGroupOrder) {
+  folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
+
+  Fetch fetchRequest(
+      RequestID(300),
+      FullTrackName({TrackNamespace({"test"}), "fetch"}),
+      AbsoluteLocation{5, 10},  // start
+      AbsoluteLocation{15, 20}, // end
+      kDefaultPriority,         // priority
+      GroupOrder::Default);     // Writer won't write GROUP_ORDER param
+
+  auto writeResult = writer_.writeFetch(writeBuf, fetchRequest);
+  EXPECT_TRUE(writeResult.hasValue());
+
+  auto serialized = writeBuf.move();
+  folly::io::Cursor cursor(serialized.get());
+
+  auto frameType = quic::follyutils::decodeQuicInteger(cursor);
+  EXPECT_EQ(frameType->first, folly::to_underlying(FrameType::FETCH));
+
+  auto parseResult = parser_.parseFetch(cursor, frameLength(cursor));
+  EXPECT_TRUE(parseResult.hasValue());
+
+  // When GROUP_ORDER param is not written, parser should set to OldestFirst
+  EXPECT_EQ(parseResult->groupOrder, GroupOrder::OldestFirst);
+}
+
+// Test explicit GroupOrder param overrides default for Fetch
+TEST_P(MoQFramerV15PlusTest, FetchExplicitGroupOrder) {
+  folly::IOBufQueue writeBuf{folly::IOBufQueue::cacheChainLength()};
+
+  Fetch fetchRequest(
+      RequestID(300),
+      FullTrackName({TrackNamespace({"test"}), "fetch"}),
+      AbsoluteLocation{5, 10},  // start
+      AbsoluteLocation{15, 20}, // end
+      kDefaultPriority,         // priority
+      GroupOrder::NewestFirst); // Non-default, will be written
+
+  auto writeResult = writer_.writeFetch(writeBuf, fetchRequest);
+  EXPECT_TRUE(writeResult.hasValue());
+
+  auto serialized = writeBuf.move();
+  folly::io::Cursor cursor(serialized.get());
+
+  auto frameType = quic::follyutils::decodeQuicInteger(cursor);
+  EXPECT_EQ(frameType->first, folly::to_underlying(FrameType::FETCH));
+
+  auto parseResult = parser_.parseFetch(cursor, frameLength(cursor));
+  EXPECT_TRUE(parseResult.hasValue());
+
+  // Explicit value should be preserved
+  EXPECT_EQ(parseResult->groupOrder, GroupOrder::NewestFirst);
+}
+
+TEST_P(MoQFramerV15PlusTest, ParseFetchObjectHeaderCursorUnderflow) {
+  auto emptyBuf = folly::IOBuf::create(0);
+  folly::io::Cursor cursor(emptyBuf.get());
+
+  ObjectHeader headerTemplate;
+  // Pass length = 1 so remainingLength >= 1 check passes,
+  // but cursor has no data to actually read
+  size_t length = 1;
+  auto parseResult =
+      parser_.parseFetchObjectHeader(cursor, length, headerTemplate);
+
+  // Should return PARSE_UNDERFLOW, not crash
+  EXPECT_TRUE(parseResult.hasError());
+  EXPECT_EQ(parseResult.error(), ErrorCode::PARSE_UNDERFLOW);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    MoQFramerV15PlusTest,
+    MoQFramerV15PlusTest,
+    ::testing::Values(kVersionDraft15));

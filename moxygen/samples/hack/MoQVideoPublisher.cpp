@@ -171,7 +171,14 @@ class LocalSubscriptionHandle : public SubscriptionHandle {
     setSubscribeOk(std::move(ok));
   }
   void unsubscribe() override {}
-  void subscribeUpdate(SubscribeUpdate) override {}
+  folly::coro::Task<folly::Expected<SubscribeUpdateOk, SubscribeUpdateError>>
+  subscribeUpdate(SubscribeUpdate update) override {
+    co_return folly::makeUnexpected(
+        SubscribeUpdateError{
+            update.requestID,
+            SubscribeUpdateErrorCode::NOT_SUPPORTED,
+            "Subscribe update not implemented"});
+  }
 };
 
 const uint8_t AUDIO_STREAM_PRIORITY = 100; /* Lower is higher pri */
@@ -218,15 +225,12 @@ bool MoQVideoPublisher::setup(
   relayClient_ = std::make_unique<MoQRelayClient>(
       std::make_unique<MoQClient>(moqExecutor_, url, std::move(verifier)));
 
-  std::vector<std::string> alpns;
-  if (useLegacySetup) {
-    alpns = {std::string(kAlpnMoqtLegacy)};
-  } else {
-    alpns = {std::string(kAlpnMoqtDraft15), std::string(kAlpnMoqtLegacy)};
-  }
-
   cancel_ = folly::CancellationSource();
   running_ = true;
+
+  // Get ALPN protocols based on legacy flag
+  std::vector<std::string> alpns = getDefaultMoqtProtocols(!useLegacySetup);
+
   folly::coro::blockingWait(co_withExecutor(
                                 evbThread_->getEventBase(),
                                 relayClient_->setup(
