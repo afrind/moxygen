@@ -38,12 +38,12 @@ public:
    * Start the server on the specified address.
    * This will create a background thread running the picoquic packet loop.
    */
-  void start(const folly::SocketAddress &addr);
+  void start(const folly::SocketAddress &addr) override;
 
   /**
    * Stop the server and wait for the packet loop thread to finish.
    */
-  void stop();
+  void stop() override;
 
 private:
   // Picoquic callback - static function that routes to instance methods

@@ -75,6 +75,7 @@ target_link_libraries(
   moqrelayserver PUBLIC
   moqrelay
   moxygenserver
+  moqtransports
 )
 
 install(
