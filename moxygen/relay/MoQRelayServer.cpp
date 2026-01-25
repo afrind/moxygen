@@ -25,6 +25,7 @@ DEFINE_bool(
     use_legacy_setup,
     false,
     "If true, use only moq-00 ALPN (legacy). If false, use latest draft ALPN with fallback to legacy");
+DEFINE_int32(server_threads, 1, "Number of MoQServer threads");
 
 namespace {
 using namespace moxygen;
@@ -36,7 +37,7 @@ class MoQRelayServer : public MoQServer {
       const std::string& cert,
       const std::string& key,
       folly::EventBase* relayEvb)
-      : MoQServer(cert, key, FLAGS_endpoint),
+      : MoQServer(cert, key, FLAGS_endpoint, folly::none, FLAGS_server_threads),
         relay_(std::make_shared<MoQRelay>(
             getOrCreateExecutor(relayEvb),
             FLAGS_enable_cache)) {}
@@ -54,7 +55,9 @@ class MoQRelayServer : public MoQServer {
                 fizz::server::ClientAuthMode::None,
                 "" /* cert */,
                 "" /* key */),
-            FLAGS_endpoint),
+            FLAGS_endpoint,
+            folly::none,
+            FLAGS_server_threads),
         relay_(std::make_shared<MoQRelay>(
             getOrCreateExecutor(relayEvb),
             FLAGS_enable_cache)) {}

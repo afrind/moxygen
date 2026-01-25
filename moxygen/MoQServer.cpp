@@ -22,7 +22,8 @@ MoQServer::MoQServer(
     std::string cert,
     std::string key,
     std::string endpoint,
-    folly::Optional<quic::TransportSettings> transportSettings)
+    folly::Optional<quic::TransportSettings> transportSettings,
+    size_t serverThreads)
     : MoQServer(
           quic::samples::createFizzServerContext(
               []() {
@@ -35,14 +36,16 @@ MoQServer::MoQServer(
               cert,
               key),
           std::move(endpoint),
-          std::move(transportSettings)) {}
+          std::move(transportSettings),
+          serverThreads) {}
 
 MoQServer::MoQServer(
     std::shared_ptr<const fizz::server::FizzServerContext> fizzContext,
     std::string endpoint,
-    folly::Optional<quic::TransportSettings> transportSettings)
+    folly::Optional<quic::TransportSettings> transportSettings,
+    size_t serverThreads)
     : MoQServerBase(std::move(endpoint)), fizzContext_(std::move(fizzContext)) {
-  params_.serverThreads = 1;
+  params_.serverThreads = serverThreads;
   params_.txnTimeout = std::chrono::seconds(60);
   if (transportSettings) {
     params_.transportSettings = *transportSettings;

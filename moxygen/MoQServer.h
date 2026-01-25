@@ -28,12 +28,14 @@ class MoQServer : public MoQServerBase {
       std::string cert,
       std::string key,
       std::string endpoint,
-      folly::Optional<quic::TransportSettings> transportSettings = folly::none);
+      folly::Optional<quic::TransportSettings> transportSettings = folly::none,
+      size_t serverThreads = 1);
 
   MoQServer(
       std::shared_ptr<const fizz::server::FizzServerContext> fizzContext,
       std::string endpoint,
-      folly::Optional<quic::TransportSettings> transportSettings = folly::none);
+      folly::Optional<quic::TransportSettings> transportSettings = folly::none,
+      size_t serverThreads = 1);
 
   void start(const folly::SocketAddress& addr) override {
     start(addr, {});
