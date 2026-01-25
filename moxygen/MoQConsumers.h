@@ -79,6 +79,71 @@ struct MoQPublishError {
 
 enum class ObjectPublishStatus { IN_PROGRESS, DONE };
 
+// Helper class to track object length state for SubgroupConsumer/FetchConsumer
+// implementations. Validates API call ordering and determines when objects
+// are complete.
+class ObjectLengthTracker {
+ public:
+  // Called when beginning a new object. Returns error if an object is already
+  // in progress.
+  folly::Expected<folly::Unit, MoQPublishError> beginObject(
+      uint64_t length,
+      uint64_t initialPayloadLength) {
+    if (remainingLength_) {
+      return folly::makeUnexpected(MoQPublishError(
+          MoQPublishError::API_ERROR, "Still publishing previous object"));
+    }
+    if (length >= initialPayloadLength) {
+      remainingLength_ = length - initialPayloadLength;
+    }
+    return folly::unit;
+  }
+
+  // Called for each payload chunk. Returns the publish status (IN_PROGRESS or
+  // DONE), or error if no object is in progress or payload exceeds expected
+  // length.
+  folly::Expected<ObjectPublishStatus, MoQPublishError> objectPayload(
+      uint64_t payloadLength) {
+    if (!remainingLength_) {
+      return folly::makeUnexpected(MoQPublishError(
+          MoQPublishError::API_ERROR, "Haven't started publishing object"));
+    }
+    if (payloadLength > *remainingLength_) {
+      return folly::makeUnexpected(
+          MoQPublishError(MoQPublishError::API_ERROR, "Payload exceeded length"));
+    }
+    *remainingLength_ -= payloadLength;
+    if (*remainingLength_ == 0) {
+      remainingLength_.reset();
+      return ObjectPublishStatus::DONE;
+    }
+    return ObjectPublishStatus::IN_PROGRESS;
+  }
+
+  // Returns true if an object is currently being published (between beginObject
+  // and completion)
+  bool isObjectInProgress() const {
+    return remainingLength_.has_value();
+  }
+
+  // Check that no object is in progress. Returns error if one is.
+  folly::Expected<folly::Unit, MoQPublishError> checkNoObjectInProgress() const {
+    if (remainingLength_) {
+      return folly::makeUnexpected(MoQPublishError(
+          MoQPublishError::API_ERROR, "Still publishing previous object"));
+    }
+    return folly::unit;
+  }
+
+  // Reset the tracker state (e.g., on error)
+  void reset() {
+    remainingLength_.reset();
+  }
+
+ private:
+  folly::Optional<uint64_t> remainingLength_;
+};
+
 // Interface for Publishing and Receiving objects on a subgroup
 class SubgroupConsumer {
  public:
