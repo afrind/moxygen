@@ -18,8 +18,7 @@ MoQClient::connectQuic(
     const quic::TransportSettings& transportSettings) {
   auto quicClient = co_await QuicConnector::connectQuic(
       exec_->getTypedExecutor<MoQFollyExecutorImpl>()->getBackingEventBase(),
-      folly::SocketAddress(
-          url_.getHost(), url_.getPort(), true), // blocking DNS,
+      connectAddr,
       timeoutMs,
       verifier,
       alpns,

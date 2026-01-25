@@ -12,6 +12,30 @@
 #include <utility>
 
 namespace moxygen {
+
+/*static*/ folly::Synchronized<MoQClientBase::DnsCache>
+    MoQClientBase::dnsCache_;
+
+/*static*/ folly::SocketAddress MoQClientBase::resolveAddress(
+    const std::string& host,
+    uint16_t port) {
+  auto key = std::make_pair(host, port);
+
+  // Check cache first
+  {
+    auto cache = dnsCache_.rlock();
+    auto it = cache->find(key);
+    if (it != cache->end()) {
+      return it->second;
+    }
+  }
+
+  // Resolve and cache
+  folly::SocketAddress addr(host, port, /*allowNameLookup=*/true);
+  dnsCache_.wlock()->emplace(key, addr);
+  return addr;
+}
+
 /*static*/
 bool MoQClientBase::shouldSendAuthorityParam(
     const std::vector<uint64_t>& supportedVersions) {
@@ -36,8 +60,7 @@ folly::coro::Task<void> MoQClientBase::setupMoQSession(
       alpns.empty() ? getDefaultMoqtProtocols(false) : alpns;
   // Establish QUIC connection with multiple ALPN options
   auto quicClient = co_await connectQuic(
-      folly::SocketAddress(
-          url_.getHost(), url_.getPort(), true), // blocking DNS,
+      resolveAddress(url_.getHost(), url_.getPort()),
       connect_timeout,
       verifier_,
       alpn,

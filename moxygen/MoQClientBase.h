@@ -7,6 +7,7 @@
 #pragma once
 
 #include <fizz/protocol/CertificateVerifier.h>
+#include <folly/Synchronized.h>
 #include <folly/coro/Promise.h>
 #include <proxygen/lib/http/webtransport/QuicWebTransport.h>
 #include <proxygen/lib/http/webtransport/WebTransport.h>
@@ -17,6 +18,7 @@
 #include <moxygen/mlog/MLogger.h>
 #include <functional>
 #include <memory>
+#include <map>
 
 namespace moxygen {
 
@@ -77,6 +79,11 @@ class MoQClientBase : public proxygen::WebTransportHandler {
   void goaway(const Goaway& goaway);
   std::shared_ptr<MLogger> logger_ = nullptr;
 
+  // Simple DNS cache to avoid repeated resolution under load
+  static folly::SocketAddress resolveAddress(
+      const std::string& host,
+      uint16_t port);
+
  protected:
   static bool shouldSendAuthorityParam(
       const std::vector<uint64_t>& supportedVersions);
@@ -114,6 +121,10 @@ class MoQClientBase : public proxygen::WebTransportHandler {
   std::shared_ptr<proxygen::QuicWebTransport> quicWebTransport_;
   folly::Optional<std::string> negotiatedProtocol_;
   std::shared_ptr<fizz::CertificateVerifier> verifier_;
+
+ private:
+  using DnsCache = std::map<std::pair<std::string, uint16_t>, folly::SocketAddress>;
+  static folly::Synchronized<DnsCache> dnsCache_;
 };
 
 } // namespace moxygen

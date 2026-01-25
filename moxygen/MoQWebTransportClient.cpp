@@ -80,7 +80,7 @@ folly::coro::Task<proxygen::HQUpstreamSession*> connectH3WithWebtransport(
   hqConnector.connect(
       exec->getBackingEventBase(),
       folly::none,
-      folly::SocketAddress(url.getHost(), url.getPort(), true), // blocking DNS,
+      moxygen::MoQClientBase::resolveAddress(url.getHost(), url.getPort()),
       std::move(fizzContext),
       verifier,
       connect_timeout,
