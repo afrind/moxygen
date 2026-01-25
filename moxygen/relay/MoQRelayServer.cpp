@@ -32,11 +32,17 @@ using namespace moxygen;
 class MoQRelayServer : public MoQServer {
  public:
   // Used when the insecure flag is false
-  MoQRelayServer(const std::string& cert, const std::string& key)
-      : MoQServer(cert, key, FLAGS_endpoint) {}
+  MoQRelayServer(
+      const std::string& cert,
+      const std::string& key,
+      folly::EventBase* relayEvb)
+      : MoQServer(cert, key, FLAGS_endpoint),
+        relay_(std::make_shared<MoQRelay>(
+            getOrCreateExecutor(relayEvb),
+            FLAGS_enable_cache)) {}
 
   // Used when the insecure flag is true
-  MoQRelayServer()
+  explicit MoQRelayServer(folly::EventBase* relayEvb)
       : MoQServer(
             quic::samples::createFizzServerContextWithInsecureDefault(
                 []() {
@@ -48,7 +54,10 @@ class MoQRelayServer : public MoQServer {
                 fizz::server::ClientAuthMode::None,
                 "" /* cert */,
                 "" /* key */),
-            FLAGS_endpoint) {}
+            FLAGS_endpoint),
+        relay_(std::make_shared<MoQRelay>(
+            getOrCreateExecutor(relayEvb),
+            FLAGS_enable_cache)) {}
 
   void onNewSession(std::shared_ptr<MoQSession> clientSession) override {
     clientSession->setPublishHandler(relay_);
@@ -66,22 +75,22 @@ class MoQRelayServer : public MoQServer {
   }
 
  private:
-  std::shared_ptr<MoQRelay> relay_{
-      std::make_shared<MoQRelay>(FLAGS_enable_cache)};
+  std::shared_ptr<MoQRelay> relay_;
 };
 } // namespace
 
 int main(int argc, char* argv[]) {
   folly::Init init(&argc, &argv, true);
+  folly::EventBase relayEvb;
   std::shared_ptr<MoQRelayServer> moqRelayServer = nullptr;
   if (FLAGS_insecure) {
-    moqRelayServer = std::make_shared<MoQRelayServer>();
+    moqRelayServer = std::make_shared<MoQRelayServer>(&relayEvb);
   } else {
-    moqRelayServer = std::make_shared<MoQRelayServer>(FLAGS_cert, FLAGS_key);
+    moqRelayServer =
+        std::make_shared<MoQRelayServer>(FLAGS_cert, FLAGS_key, &relayEvb);
   }
   folly::SocketAddress addr("::", FLAGS_port);
   moqRelayServer->start(addr);
-  folly::EventBase evb;
-  evb.loopForever();
+  relayEvb.loopForever();
   return 0;
 }

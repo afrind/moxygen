@@ -846,7 +846,8 @@ std::shared_ptr<TrackConsumer> MoQCache::getSubscribeWriteback(
 folly::coro::Task<Publisher::FetchResult> MoQCache::fetch(
     Fetch fetch,
     std::shared_ptr<FetchConsumer> consumer,
-    std::shared_ptr<Publisher> upstream) {
+    std::shared_ptr<Publisher> upstream,
+    MoQExecutor* upstreamExec) {
   auto standalone = std::get_if<StandaloneFetch>(&fetch.args);
   CHECK(standalone);
   auto emplaceResult =
@@ -858,7 +859,7 @@ folly::coro::Task<Publisher::FetchResult> MoQCache::fetch(
     XLOG(DBG1) << "Cache miss, upstream fetch";
     FetchRangeIterator fetchRangeIt(
         standalone->start, standalone->end, fetch.groupOrder, track);
-    co_return co_await upstream->fetch(
+    auto upstreamFetchTask = upstream->fetch(
         fetch,
         std::make_shared<FetchWriteback>(
             standalone->start,
@@ -866,6 +867,12 @@ folly::coro::Task<Publisher::FetchResult> MoQCache::fetch(
             true,
             std::move(consumer),
             fetchRangeIt));
+    if (upstreamExec) {
+      co_return co_await co_withExecutor(
+          upstreamExec, std::move(upstreamFetchTask));
+    } else {
+      co_return co_await std::move(upstreamFetchTask);
+    }
   }
   AbsoluteLocation last = standalone->end;
   if (last.object > 0) {
@@ -903,7 +910,8 @@ folly::coro::Task<Publisher::FetchResult> MoQCache::fetch(
                 std::move(fetch),
                 track,
                 std::move(consumer),
-                std::move(upstream))))
+                std::move(upstream),
+                upstreamExec)))
         .start();
     co_return fetchHandle;
   } else {
@@ -913,7 +921,8 @@ folly::coro::Task<Publisher::FetchResult> MoQCache::fetch(
         std::move(fetch),
         track,
         std::move(consumer),
-        std::move(upstream));
+        std::move(upstream),
+        upstreamExec);
   }
 }
 
@@ -922,7 +931,8 @@ folly::coro::Task<Publisher::FetchResult> MoQCache::fetchImpl(
     Fetch fetch,
     std::shared_ptr<CacheTrack> track,
     std::shared_ptr<FetchConsumer> consumer,
-    std::shared_ptr<Publisher> upstream) {
+    std::shared_ptr<Publisher> upstream,
+    MoQExecutor* upstreamExec) {
   auto standalone = std::get_if<StandaloneFetch>(&fetch.args);
   XLOG(DBG1) << "fetchImpl for {" << standalone->start.group << ","
              << standalone->start.object << "}, {" << standalone->end.group
@@ -984,7 +994,8 @@ folly::coro::Task<Publisher::FetchResult> MoQCache::fetchImpl(
             fetch,
             track,
             consumer,
-            upstream);
+            upstream,
+            upstreamExec);
         if (res.hasError()) {
           co_return folly::makeUnexpected(res.error());
         } // else success but only returns FetchOk on lastObject
@@ -1039,7 +1050,8 @@ folly::coro::Task<Publisher::FetchResult> MoQCache::fetchImpl(
           fetch,
           track,
           consumer,
-          upstream);
+          upstream,
+          upstreamExec);
       if (res.hasError()) {
         co_return folly::makeUnexpected(res.error());
       }
@@ -1122,7 +1134,8 @@ folly::coro::Task<Publisher::FetchResult> MoQCache::fetchUpstream(
     Fetch fetch,
     std::shared_ptr<CacheTrack> track,
     std::shared_ptr<FetchConsumer> consumer,
-    std::shared_ptr<Publisher> upstream) {
+    std::shared_ptr<Publisher> upstream,
+    MoQExecutor* upstreamExec) {
   XLOG(DBG1) << "Fetching upstream for {" << fetchStart.group << ","
              << fetchStart.object << "}, {" << fetchEnd.group << ","
              << fetchEnd.object << "}";
@@ -1134,7 +1147,7 @@ folly::coro::Task<Publisher::FetchResult> MoQCache::fetchUpstream(
       fetchStart, fetchEnd, fetch.groupOrder, track);
   auto writeback = std::make_shared<FetchWriteback>(
       fetchStart, adjFetchEnd, lastObject, consumer, fetchRangeIt);
-  auto res = co_await upstream->fetch(
+  auto upstreamFetchTask = upstream->fetch(
       Fetch(
           0,
           fetch.fullTrackName,
@@ -1143,6 +1156,12 @@ folly::coro::Task<Publisher::FetchResult> MoQCache::fetchUpstream(
           fetch.priority,
           fetch.groupOrder),
       writeback);
+  Publisher::FetchResult res;
+  if (upstreamExec) {
+    res = co_await co_withExecutor(upstreamExec, std::move(upstreamFetchTask));
+  } else {
+    res = co_await std::move(upstreamFetchTask);
+  }
   if (res.hasError()) {
     XLOG(ERR) << "upstream fetch failed err=" << res.error().reasonPhrase;
     consumer->reset(ResetStreamErrorCode::CANCELLED);

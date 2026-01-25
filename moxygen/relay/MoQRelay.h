@@ -15,15 +15,22 @@
 
 namespace moxygen {
 
+class ExecutorTrackConsumerFilter;
+
 class MoQRelay : public Publisher,
                  public Subscriber,
                  public std::enable_shared_from_this<MoQRelay>,
                  public MoQForwarder::Callback {
  public:
-  explicit MoQRelay(bool enableCache) {
+  MoQRelay(std::shared_ptr<MoQExecutor> relayExec, bool enableCache)
+      : relayExec_(std::move(relayExec)) {
     if (enableCache) {
       cache_ = std::make_unique<MoQCache>();
     }
+  }
+
+  MoQExecutor* getExecutor() const {
+    return relayExec_.get();
   }
 
   void setAllowedNamespacePrefix(TrackNamespace allowed) {
@@ -182,6 +189,26 @@ class MoQRelay : public Publisher,
   std::shared_ptr<TrackConsumer> getSubscribeWriteback(
       const FullTrackName& ftn,
       std::shared_ptr<TrackConsumer> consumer);
+
+  // Impl methods that run on relay executor
+  folly::coro::Task<SubscribeResult> subscribeImpl(
+      SubscribeRequest subReq,
+      std::shared_ptr<TrackConsumer> consumer);
+  folly::coro::Task<FetchResult> fetchImpl(
+      Fetch fetch,
+      std::shared_ptr<FetchConsumer> consumer);
+  folly::coro::Task<SubscribeAnnouncesResult> subscribeAnnouncesImpl(
+      SubscribeAnnounces subAnn);
+  folly::coro::Task<Subscriber::AnnounceResult> announceImpl(
+      Announce ann,
+      std::shared_ptr<Subscriber::AnnounceCallback> cb);
+  folly::coro::Task<folly::Expected<PublishOk, PublishError>> publishImpl(
+      PublishRequest pub,
+      std::shared_ptr<Publisher::SubscriptionHandle> handle,
+      std::shared_ptr<MoQSession> session,
+      std::shared_ptr<ExecutorTrackConsumerFilter> wrappedFilter);
+
+  std::shared_ptr<MoQExecutor> relayExec_;
   std::unique_ptr<MoQCache> cache_;
 };
 

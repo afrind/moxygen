@@ -14,6 +14,7 @@
 #include <moxygen/MoQConsumers.h>
 #include <moxygen/MoQFramer.h>
 #include <moxygen/Publisher.h>
+#include <moxygen/events/MoQExecutor.h>
 #include <moxygen/util/BidiIterator.h>
 #include <moxygen/util/FetchIntervalSet.h>
 #include <limits>
@@ -37,7 +38,8 @@ class MoQCache {
   folly::coro::Task<Publisher::FetchResult> fetch(
       Fetch fetch,
       std::shared_ptr<FetchConsumer> consumer,
-      std::shared_ptr<Publisher> upstream);
+      std::shared_ptr<Publisher> upstream,
+      MoQExecutor* upstreamExec = nullptr);
 
   void clear() {
     cache_.clear();
@@ -156,7 +158,8 @@ class MoQCache {
       Fetch fetch,
       std::shared_ptr<CacheTrack> track,
       std::shared_ptr<FetchConsumer> consumer,
-      std::shared_ptr<Publisher> upstream);
+      std::shared_ptr<Publisher> upstream,
+      MoQExecutor* upstreamExec);
 
   folly::coro::Task<Publisher::FetchResult> fetchUpstream(
       std::shared_ptr<MoQCache::FetchHandle> fetchHandle,
@@ -166,7 +169,8 @@ class MoQCache {
       Fetch fetch,
       std::shared_ptr<CacheTrack> track,
       std::shared_ptr<FetchConsumer> consumer,
-      std::shared_ptr<Publisher> upstream);
+      std::shared_ptr<Publisher> upstream,
+      MoQExecutor* upstreamExec);
 
   folly::coro::Task<folly::Expected<folly::Unit, FetchError>> handleBlocked(
       std::shared_ptr<FetchConsumer> consumer,

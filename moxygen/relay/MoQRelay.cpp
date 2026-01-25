@@ -74,6 +74,13 @@ std::shared_ptr<MoQRelay::AnnounceNode> MoQRelay::findNamespaceNode(
 folly::coro::Task<Subscriber::AnnounceResult> MoQRelay::announce(
     Announce ann,
     std::shared_ptr<Subscriber::AnnounceCallback> callback) {
+  co_return co_await co_withExecutor(
+      relayExec_.get(), announceImpl(std::move(ann), std::move(callback)));
+}
+
+folly::coro::Task<Subscriber::AnnounceResult> MoQRelay::announceImpl(
+    Announce ann,
+    std::shared_ptr<Subscriber::AnnounceCallback> callback) {
   XLOG(DBG1) << __func__ << " ns=" << ann.trackNamespace;
   // check auth
   if (!ann.trackNamespace.startsWith(allowedNamespacePrefix_)) {
@@ -300,6 +307,8 @@ Subscriber::PublishResult MoQRelay::publish(
     std::shared_ptr<Publisher::SubscriptionHandle> handle) {
   XLOG(DBG1) << __func__ << " ftn=" << pub.fullTrackName;
   XCHECK(handle) << "Publish handle cannot be null";
+
+  // Validation checks (no state modification)
   if (!pub.fullTrackName.trackNamespace.startsWith(allowedNamespacePrefix_)) {
     return folly::makeUnexpected(
         PublishError{
@@ -313,6 +322,37 @@ Subscriber::PublishResult MoQRelay::publish(
          "namespace required"}));
   }
 
+  auto session = MoQSession::getRequestSession();
+
+  // Create wrapper with no downstream - will be set by reply Task
+  auto wrappedFilter =
+      std::make_shared<ExecutorTrackConsumerFilter>(relayExec_);
+
+  // Reply task runs on relay executor and does all state setup
+  auto replyTask = folly::coro::co_invoke(
+      [this,
+       pub = std::move(pub),
+       handle = std::move(handle),
+       session,
+       wrappedFilter]() mutable
+          -> folly::coro::Task<folly::Expected<PublishOk, PublishError>> {
+        co_return co_await co_withExecutor(
+            relayExec_.get(),
+            publishImpl(
+                std::move(pub), std::move(handle), session, wrappedFilter));
+      });
+
+  return PublishConsumerAndReplyTask{
+      wrappedFilter,
+      std::move(replyTask)};
+}
+
+folly::coro::Task<folly::Expected<PublishOk, PublishError>>
+MoQRelay::publishImpl(
+    PublishRequest pub,
+    std::shared_ptr<Publisher::SubscriptionHandle> handle,
+    std::shared_ptr<MoQSession> session,
+    std::shared_ptr<ExecutorTrackConsumerFilter> wrappedFilter) {
   // Find All Nodes that SubscribeAnnounced to this namespace (including prefix
   // ns)
   std::vector<std::pair<std::shared_ptr<MoQSession>, bool>> sessions = {};
@@ -326,7 +366,6 @@ Subscriber::PublishResult MoQRelay::publish(
     sessions.emplace_back(sessionPtr, forward);
   }
 
-  auto session = MoQSession::getRequestSession();
   bool wasEmpty = !nodePtr->hasLocalSessions();
 
   auto it = subscriptions_.find(pub.fullTrackName);
@@ -393,17 +432,18 @@ Subscriber::PublishResult MoQRelay::publish(
   std::shared_ptr<TrackConsumer> filter =
       std::static_pointer_cast<TrackConsumer>(filterImpl);
 
-  return PublishConsumerAndReplyTask{
-      filter, // Return filter, not forwarder directly
-      folly::coro::makeTask<folly::Expected<PublishOk, PublishError>>(PublishOk{
-          pub.requestID,
-          /*forward=*/(nSubscribers > 0),
-          kDefaultPriority,
-          pub.groupOrder,
-          LocationType::AbsoluteRange,
-          kLocationMin,
-          kLocationMax.group,
-          {}})};
+  // Set the downstream on the wrapper that was returned to caller
+  wrappedFilter->downstream_ = std::move(filter);
+
+  co_return PublishOk{
+      pub.requestID,
+      /*forward=*/(nSubscribers > 0),
+      kDefaultPriority,
+      pub.groupOrder,
+      LocationType::AbsoluteRange,
+      kLocationMin,
+      kLocationMax.group,
+      {}};
 }
 
 folly::coro::Task<void> MoQRelay::publishToSession(
@@ -430,7 +470,10 @@ folly::coro::Task<void> MoQRelay::publishToSession(
     XLOG(ERR) << "Publish failed err=" << pubInitial.error().reasonPhrase;
     co_return;
   }
-  subscriber->trackConsumer = std::move(pubInitial->consumer);
+  // Wrap consumer to dispatch forwarder callbacks to session's executor
+  auto exec = std::shared_ptr<MoQExecutor>(session->getExecutor(), [](auto*) {});
+  subscriber->trackConsumer = std::make_shared<ExecutorTrackConsumerFilter>(
+      std::move(exec), std::move(pubInitial->consumer));
   auto pubResult = co_await co_awaitTry(std::move(pubInitial->reply));
   if (pubResult.hasException()) {
     XLOG(ERR) << "Publish failed err=" << pubResult.exception().what();
@@ -520,6 +563,12 @@ std::shared_ptr<TrackConsumer> MoQRelay::getSubscribeWriteback(
 
 folly::coro::Task<Publisher::SubscribeAnnouncesResult>
 MoQRelay::subscribeAnnounces(SubscribeAnnounces subNs) {
+  co_return co_await co_withExecutor(
+      relayExec_.get(), subscribeAnnouncesImpl(std::move(subNs)));
+}
+
+folly::coro::Task<Publisher::SubscribeAnnouncesResult>
+MoQRelay::subscribeAnnouncesImpl(SubscribeAnnounces subNs) {
   XLOG(DBG1) << __func__ << " nsp=" << subNs.trackNamespacePrefix;
   // check auth
   if (subNs.trackNamespacePrefix.empty()) {
@@ -670,6 +719,14 @@ MoQRelay::PublishState MoQRelay::findPublishState(const FullTrackName& ftn) {
 folly::coro::Task<Publisher::SubscribeResult> MoQRelay::subscribe(
     SubscribeRequest subReq,
     std::shared_ptr<TrackConsumer> consumer) {
+  co_return co_await co_withExecutor(
+      relayExec_.get(),
+      subscribeImpl(std::move(subReq), std::move(consumer)));
+}
+
+folly::coro::Task<Publisher::SubscribeResult> MoQRelay::subscribeImpl(
+    SubscribeRequest subReq,
+    std::shared_ptr<TrackConsumer> consumer) {
   auto session = MoQSession::getRequestSession();
   auto subscriptionIt = subscriptions_.find(subReq.fullTrackName);
   if (subscriptionIt == subscriptions_.end()) {
@@ -718,8 +775,12 @@ folly::coro::Task<Publisher::SubscribeResult> MoQRelay::subscribe(
     });
     // Add subscriber first in case objects come before subscribe OK.
     auto sessionVersion = session->getNegotiatedVersion();
+    // Wrap consumer with executor filter to dispatch calls to session's executor
+    auto exec = std::shared_ptr<MoQExecutor>(session->getExecutor(), [](auto*) {});
+    auto wrappedConsumer = std::make_shared<ExecutorTrackConsumerFilter>(
+        std::move(exec), std::move(consumer));
     auto subscriber = forwarder->addSubscriber(
-        std::move(session), subReq, std::move(consumer));
+        std::move(session), subReq, std::move(wrappedConsumer));
     if (!subscriber) {
       XLOG(ERR) << "addSubscriber returned null (draining?) for "
                 << subReq.fullTrackName << " reqID=" << subReq.requestID;
@@ -736,8 +797,12 @@ folly::coro::Task<Publisher::SubscribeResult> MoQRelay::subscribe(
     subReq.forward = forwarder->numForwardingSubscribers() > 0;
 
     emplaceRes.first->second.requestID = upstreamSession->peekNextRequestID();
-    auto subRes = co_await upstreamSession->subscribe(
-        subReq, getSubscribeWriteback(subReq.fullTrackName, forwarder));
+    // Wrap upstream consumer to dispatch callbacks back to relay thread
+    auto upstreamConsumer = std::make_shared<ExecutorTrackConsumerFilter>(
+        relayExec_, getSubscribeWriteback(subReq.fullTrackName, forwarder));
+    auto subRes = co_await co_withExecutor(
+        upstreamSession->getExecutor(),
+        upstreamSession->subscribe(subReq, std::move(upstreamConsumer)));
     if (subRes.hasError()) {
       co_return folly::makeUnexpected(SubscribeError(
           {subReq.requestID,
@@ -801,8 +866,12 @@ folly::coro::Task<Publisher::SubscribeResult> MoQRelay::subscribe(
     }
     bool forwarding =
         subscriptionIt->second.forwarder->numForwardingSubscribers() > 0;
+    // Wrap consumer with executor filter to dispatch calls to session's executor
+    auto exec = std::shared_ptr<MoQExecutor>(session->getExecutor(), [](auto*) {});
+    auto wrappedConsumer = std::make_shared<ExecutorTrackConsumerFilter>(
+        std::move(exec), std::move(consumer));
     auto subscriber = subscriptionIt->second.forwarder->addSubscriber(
-        std::move(session), subReq, std::move(consumer));
+        std::move(session), subReq, std::move(wrappedConsumer));
     if (!subscriber) {
       XLOG(ERR) << "addSubscriber returned null (draining?) for "
                 << subReq.fullTrackName << " reqID=" << subReq.requestID;
@@ -828,7 +897,19 @@ folly::coro::Task<Publisher::SubscribeResult> MoQRelay::subscribe(
 folly::coro::Task<Publisher::FetchResult> MoQRelay::fetch(
     Fetch fetch,
     std::shared_ptr<FetchConsumer> consumer) {
+  co_return co_await co_withExecutor(
+      relayExec_.get(), fetchImpl(std::move(fetch), std::move(consumer)));
+}
+
+folly::coro::Task<Publisher::FetchResult> MoQRelay::fetchImpl(
+    Fetch fetch,
+    std::shared_ptr<FetchConsumer> consumer) {
   auto session = MoQSession::getRequestSession();
+
+  // Wrap consumer with executor filter to dispatch calls to session's executor
+  auto exec = std::shared_ptr<MoQExecutor>(session->getExecutor(), [](auto*) {});
+  auto wrappedConsumer = std::make_shared<ExecutorFetchConsumerFilter>(
+      std::move(exec), std::move(consumer));
 
   // check auth
   // get trackNamespace
@@ -892,10 +973,16 @@ folly::coro::Task<Publisher::FetchResult> MoQRelay::fetch(
                  << standalone->start.object << "}.." << standalone->end.group
                  << "," << standalone->end.object << "}";
     }
-    co_return co_await upstreamSession->fetch(fetch, std::move(consumer));
+    co_return co_await co_withExecutor(
+        upstreamSession->getExecutor(),
+        upstreamSession->fetch(fetch, std::move(wrappedConsumer)));
   }
+  auto upstreamExec = upstreamSession->getExecutor();
   co_return co_await cache_->fetch(
-      fetch, std::move(consumer), std::move(upstreamSession));
+      fetch,
+      std::move(wrappedConsumer),
+      std::move(upstreamSession),
+      upstreamExec);
 }
 
 void MoQRelay::onEmpty(MoQForwarder* forwarder) {

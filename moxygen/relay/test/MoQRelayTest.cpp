@@ -55,7 +55,7 @@ class MoQRelayTest : public ::testing::Test {
  protected:
   void SetUp() override {
     exec_ = std::make_shared<TestMoQExecutor>();
-    relay_ = std::make_shared<MoQRelay>(/*enableCache=*/false);
+    relay_ = std::make_shared<MoQRelay>(exec_, /*enableCache=*/false);
     relay_->setAllowedNamespacePrefix(kAllowedPrefix);
   }
 
@@ -338,7 +338,7 @@ TEST_F(MoQRelayTest, Construction) {
 TEST_F(MoQRelayTest, AllowedNamespacePrefix) {
   // This just verifies the relay can be constructed with a namespace prefix
   // More detailed testing requires full session setup
-  auto relay2 = std::make_shared<MoQRelay>(/*enableCache=*/true);
+  auto relay2 = std::make_shared<MoQRelay>(exec_, /*enableCache=*/true);
   relay2->setAllowedNamespacePrefix(kTestNamespace);
   EXPECT_NE(relay2, nullptr);
 }

@@ -93,10 +93,10 @@ class MoQServer : public MoQServerBase {
   // Register ALPN handlers for direct QUIC connections (internal use)
   void registerAlpnHandler(const std::vector<std::string>& alpns);
 
+  std::shared_ptr<MoQExecutor> getOrCreateExecutor(folly::EventBase* evb);
+
  private:
   void createMoQQuicSession(std::shared_ptr<quic::QuicSocket> quicSocket);
-
-  std::shared_ptr<MoQExecutor> getOrCreateExecutor(folly::EventBase* evb);
 
   class Handler : public proxygen::HTTPTransactionHandler {
    public:
