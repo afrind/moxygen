@@ -95,4 +95,8 @@ if(BUILD_SAMPLES)
   add_subdirectory(sample)
 endif()
 
+if(BUILD_TESTS)
+  add_subdirectory(test)
+endif()
+
 
