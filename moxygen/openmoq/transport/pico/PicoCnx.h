@@ -64,6 +64,17 @@ class PicoCnx {
   /** Max datagram payload size from peer's transport parameters. */
   virtual size_t getMaxDatagramPayload() const = 0;
 
+  /** Remote flow-control limits from peer's transport parameters.
+   *  Valid after the QUIC handshake completes (picoquic_callback_ready).
+   *  Default implementations return max() for backward compatibility with
+   *  mocks that don't override them. */
+  virtual uint64_t getRemoteMaxStreamDataUni() const {
+    return std::numeric_limits<uint64_t>::max();
+  }
+  virtual uint64_t getRemoteMaxStreamDataBidi() const {
+    return std::numeric_limits<uint64_t>::max();
+  }
+
   /**
    * JIT stream buffer provision. Wraps picoquic_provide_stream_data_buffer.
    * Returns pointer to write buffer on success, nullptr if picoquic rejected.

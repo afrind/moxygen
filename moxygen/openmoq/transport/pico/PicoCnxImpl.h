@@ -26,6 +26,8 @@ class PicoCnxImpl : public PicoCnx {
   uint64_t getDataSent() const override;
   uint64_t getDataReceived() const override;
   size_t getMaxDatagramPayload() const override;
+  uint64_t getRemoteMaxStreamDataUni() const override;
+  uint64_t getRemoteMaxStreamDataBidi() const override;
   uint8_t* provideStreamDataBuffer(
       uint8_t* picoContext,
       size_t dataLen,

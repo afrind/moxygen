@@ -23,7 +23,8 @@ PicoH3WebTransport::PicoH3WebTransport(
           false /* isClient - server side */,
           localAddr,
           peerAddr,
-          std::make_unique<PicoCnxImpl>(cnx)),
+          std::make_unique<PicoCnxImpl>(cnx),
+          picowt_get_stream_preface_length(controlStreamCtx->stream_id)),
       cnx_(cnx),
       h3Ctx_(h3Ctx),
       controlStreamCtx_(controlStreamCtx) {
@@ -239,6 +240,14 @@ int PicoH3WebTransport::handleWtEvent(
       }
       if (deregistered_ && streamContexts_.empty()) {
         return kDeleteCtx;
+      }
+      break;
+
+    case picohttp_callback_stream_fc_updated:
+      if (streamCtx) {
+        uint64_t adjusted =
+            length > streamPrefaceBytes_ ? length - streamPrefaceBytes_ : 0;
+        onStreamFcUpdated(streamCtx->stream_id, adjusted);
       }
       break;
 

@@ -105,6 +105,7 @@ class TestPicoWebTransport : public PicoWebTransportBase {
   using PicoWebTransportBase::onSessionCloseCommon;
   using PicoWebTransportBase::onStopSendingCommon;
   using PicoWebTransportBase::onStreamDataCommon;
+  using PicoWebTransportBase::onStreamFcUpdated;
   using PicoWebTransportBase::onStreamResetCommon;
   using PicoWebTransportBase::processEgressEvents;
 
@@ -433,6 +434,90 @@ TEST_F(PicoWebTransportBaseTest, GetTransportInfo) {
 // WakeTimeGuard fires callback
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Priority queue ordering
+// ---------------------------------------------------------------------------
+
+TEST_F(PicoWebTransportBaseTest, IsStillActiveTrueWhenQueueHeadWithMoreData) {
+  transport_->createUniStream(); // stream 0
+  transport_->calls.clear();
+
+  transport_->writeStreamData(
+      0, folly::IOBuf::copyBuffer(std::string(100, 'x')), false, nullptr);
+  transport_->calls.clear();
+
+  EXPECT_CALL(*mock_, provideStreamDataBuffer(_, 10, false, true))
+      .WillOnce(Invoke([this](uint8_t*, size_t len, bool, bool) {
+        sendBuf_.resize(len);
+        return sendBuf_.data();
+      }));
+  transport_->onJitProvideData(0, nullptr, 10);
+  EXPECT_EQ(sendBuf_.size(), 10u);
+}
+
+TEST_F(PicoWebTransportBaseTest, IsStillActiveFalseAfterFin) {
+  transport_->createUniStream(); // stream 0
+  transport_->calls.clear();
+
+  transport_->writeStreamData(
+      0, folly::IOBuf::copyBuffer("bye"), true, nullptr);
+  transport_->calls.clear();
+
+  EXPECT_CALL(*mock_, provideStreamDataBuffer(_, 3, true, false))
+      .WillOnce(Invoke([this](uint8_t*, size_t len, bool, bool) {
+        sendBuf_.resize(len);
+        return sendBuf_.data();
+      }));
+  bool finSent = transport_->onJitProvideData(0, nullptr, 1024);
+  EXPECT_TRUE(finSent);
+}
+
+TEST_F(PicoWebTransportBaseTest, NextStreamActivatedWhenCurrentCompletesViaFin) {
+  transport_->createUniStream(); // stream 0
+  transport_->createUniStream(); // stream 1 (server-side uni: ID 1)
+  transport_->calls.clear();
+
+  transport_->writeStreamData(
+      0, folly::IOBuf::copyBuffer("a"), true, nullptr);
+  transport_->writeStreamData(
+      1, folly::IOBuf::copyBuffer("b"), false, nullptr);
+  transport_->calls.clear();
+
+  EXPECT_CALL(*mock_, provideStreamDataBuffer(_, _, _, _))
+      .WillRepeatedly(Invoke([this](uint8_t*, size_t len, bool, bool) {
+        sendBuf_.resize(len);
+        return len > 0 ? sendBuf_.data() : nullptr;
+      }));
+
+  transport_->onJitProvideData(0, nullptr, 1024);
+
+  // After fin on stream 0, stream 1 should have been marked active
+  bool stream1Activated = std::any_of(
+      transport_->calls.begin(),
+      transport_->calls.end(),
+      [](const TestPicoWebTransport::Call& c) {
+        return c.op == "markActive" && c.arg0 == 1u;
+      });
+  EXPECT_TRUE(stream1Activated);
+}
+
+TEST_F(PicoWebTransportBaseTest, TwoStreamsActivatedInPriorityOrder) {
+  transport_->createUniStream(); // stream 0
+  transport_->createUniStream(); // stream 1
+  transport_->calls.clear();
+
+  transport_->writeStreamData(
+      0, folly::IOBuf::copyBuffer("low"), false, nullptr);
+  transport_->writeStreamData(
+      1, folly::IOBuf::copyBuffer("hi"), false, nullptr);
+
+  bool foundMarkActive = std::any_of(
+      transport_->calls.begin(),
+      transport_->calls.end(),
+      [](const TestPicoWebTransport::Call& c) { return c.op == "markActive"; });
+  EXPECT_TRUE(foundMarkActive);
+}
+
 TEST_F(PicoWebTransportBaseTest, WakeTimeGuardFiresCallback) {
   // Use fixture-level bool so the lambda stays valid through transport_
   // teardown.
@@ -453,3 +538,118 @@ TEST_F(PicoWebTransportBaseTest, WakeTimeGuardFiresCallback) {
 
   EXPECT_TRUE(callbackFired_);
 }
+
+// ---------------------------------------------------------------------------
+// FC window tests — small-window MockPicoCnx variants
+// ---------------------------------------------------------------------------
+
+class SmallStreamWindowMock : public MockPicoCnx {
+ public:
+  explicit SmallStreamWindowMock(uint64_t w) : window_(w) {}
+  // Stream 0 has bit 1 = 0 → WtStreamManager classifies it as bidi.
+  uint64_t getRemoteMaxStreamDataBidi() const override { return window_; }
+
+ private:
+  uint64_t window_;
+};
+
+// Helper: drain a stream via repeated JIT calls until provideStreamDataBuffer
+// is called with isActive=false. Returns total bytes delivered.
+static size_t drainStream(
+    TestPicoWebTransport& t,
+    MockPicoCnx& mock,
+    uint64_t streamId,
+    size_t maxLength,
+    std::vector<uint8_t>& sendBuf) {
+  size_t total = 0;
+  for (int i = 0; i < 100; ++i) {
+    bool deactivated = false;
+    ON_CALL(mock, provideStreamDataBuffer(_, _, _, _))
+        .WillByDefault(Invoke([&](uint8_t*, size_t len, bool, bool active) {
+          sendBuf.resize(len);
+          if (!active) {
+            deactivated = true;
+          }
+          total += len;
+          return len > 0 ? sendBuf.data() : nullptr;
+        }));
+    t.onJitProvideData(streamId, nullptr, maxLength);
+    if (deactivated) {
+      break;
+    }
+  }
+  return total;
+}
+
+class PicoWebTransportBaseFcTest : public Test {
+ protected:
+  void setUpWithStreamWindow(uint64_t streamWindow) {
+    auto mock =
+        std::make_unique<NiceMock<SmallStreamWindowMock>>(streamWindow);
+    setupMock(*mock);
+    mock_ = mock.get();
+    transport_ =
+        std::make_unique<TestPicoWebTransport>(std::move(mock), false);
+    transport_->setHandler(&handler_);
+  }
+
+  template <typename M>
+  void setupMock(M& mock) {
+    ON_CALL(mock, getWakeTimeGuard(_))
+        .WillByDefault(
+            [](const std::function<void()>&) { return WakeTimeGuard{}; });
+    ON_CALL(mock, getMaxDatagramPayload()).WillByDefault(Return(1200));
+    ON_CALL(mock, provideStreamDataBuffer(_, _, _, _))
+        .WillByDefault(Invoke([this](uint8_t*, size_t len, bool, bool) {
+          sendBuf_.resize(len);
+          return len > 0 ? sendBuf_.data() : nullptr;
+        }));
+    ON_CALL(mock, getRtt()).WillByDefault(Return(10000));
+    ON_CALL(mock, getDataSent()).WillByDefault(Return(0));
+    ON_CALL(mock, getDataReceived()).WillByDefault(Return(0));
+  }
+
+  MockPicoCnx* mock_{nullptr};
+  NiceMock<proxygen::test::MockWebTransportHandler> handler_;
+  std::unique_ptr<TestPicoWebTransport> transport_;
+  std::vector<uint8_t> sendBuf_;
+};
+
+TEST_F(PicoWebTransportBaseFcTest, StreamFcWindowLimitsDelivery) {
+  setUpWithStreamWindow(10);
+  transport_->createUniStream(); // stream 0
+
+  transport_->writeStreamData(
+      0, folly::IOBuf::copyBuffer(std::string(20, 'x')), false, nullptr);
+
+  size_t sent =
+      drainStream(*transport_, *mock_, 0, 1024, sendBuf_);
+  EXPECT_EQ(sent, 10u);
+}
+
+TEST_F(PicoWebTransportBaseFcTest, StreamFcUpdateReactivatesStream) {
+  setUpWithStreamWindow(10);
+  transport_->createUniStream(); // stream 0
+
+  transport_->writeStreamData(
+      0, folly::IOBuf::copyBuffer(std::string(20, 'x')), false, nullptr);
+  drainStream(*transport_, *mock_, 0, 1024, sendBuf_);
+
+  size_t markActiveBefore = std::count_if(
+      transport_->calls.begin(),
+      transport_->calls.end(),
+      [](const TestPicoWebTransport::Call& c) {
+        return c.op == "markActive" && c.arg0 == 0u;
+      });
+
+  transport_->onStreamFcUpdated(0, 100);
+
+  size_t markActiveAfter = std::count_if(
+      transport_->calls.begin(),
+      transport_->calls.end(),
+      [](const TestPicoWebTransport::Call& c) {
+        return c.op == "markActive" && c.arg0 == 0u;
+      });
+  EXPECT_GT(markActiveAfter, markActiveBefore);
+}
+

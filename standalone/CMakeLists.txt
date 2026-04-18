@@ -273,7 +273,7 @@ FetchContent_Declare(proxygen
 if(BUILD_PICOQUIC)
     FetchContent_Declare(picoquic
         GIT_REPOSITORY https://github.com/afrind/picoquic.git
-        GIT_TAG openmoq-main
+        GIT_TAG 2ca6cf94
     )
 endif()
 

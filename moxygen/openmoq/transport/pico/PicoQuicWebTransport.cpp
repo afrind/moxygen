@@ -182,6 +182,10 @@ int PicoQuicWebTransport::handlePicoEvent(
       onJitProvideDatagram(bytes, length);
       break;
 
+    case picoquic_callback_stream_fc_updated:
+      onStreamFcUpdated(stream_id, static_cast<uint64_t>(length));
+      break;
+
     case picoquic_callback_stream_gap:
       XLOG(DBG2) << "Stream gap on stream " << stream_id;
       break;

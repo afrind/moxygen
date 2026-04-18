@@ -13,13 +13,15 @@ PicoWebTransportBase::PicoWebTransportBase(
     bool isClient,
     const folly::SocketAddress& localAddr,
     const folly::SocketAddress& peerAddr,
-    std::unique_ptr<PicoCnx> picoCnx)
+    std::unique_ptr<PicoCnx> picoCnx,
+    size_t streamPrefaceBytes)
     : localAddr_(localAddr),
       peerAddr_(peerAddr),
       isClient_(isClient),
       egressCallback_(this),
       ingressCallback_(this),
       picoCnx_(std::move(picoCnx)) {
+  streamPrefaceBytes_ = streamPrefaceBytes;
   // Configure WtStreamManager flow control limits
   // We set all limits to max() because picoquic handles flow control internally
   proxygen::detail::WtStreamManager::WtConfig wtConfig;
@@ -32,8 +34,11 @@ PicoWebTransportBase::PicoWebTransportBase(
   wtConfig.peerMaxStreamsBidi = std::numeric_limits<uint64_t>::max();
   wtConfig.peerMaxStreamsUni = std::numeric_limits<uint64_t>::max();
   wtConfig.peerMaxConnData = std::numeric_limits<uint64_t>::max();
-  wtConfig.peerMaxStreamDataBidi = std::numeric_limits<uint64_t>::max();
-  wtConfig.peerMaxStreamDataUni = std::numeric_limits<uint64_t>::max();
+  auto sub = [](uint64_t v, size_t n) -> uint64_t { return v > n ? v - n : 0; };
+  wtConfig.peerMaxStreamDataBidi =
+      sub(picoCnx_->getRemoteMaxStreamDataBidi(), streamPrefaceBytes_);
+  wtConfig.peerMaxStreamDataUni =
+      sub(picoCnx_->getRemoteMaxStreamDataUni(), streamPrefaceBytes_);
 
   auto dir = isClient_ ? proxygen::detail::WtDir::Client
                        : proxygen::detail::WtDir::Server;
@@ -312,26 +317,26 @@ void PicoWebTransportBase::processEgressEvents() {
         auto* maxConnData =
             std::get_if<proxygen::detail::WtStreamManager::MaxConnData>(
                 &event)) {
-      XLOG(DBG1) << "Unhandled MaxConnData event, maxData="
+      XLOG(DBG5) << "Unhandled MaxConnData event, maxData="
                  << maxConnData->maxData;
     } else if (
         auto* maxStreamData =
             std::get_if<proxygen::detail::WtStreamManager::MaxStreamData>(
                 &event)) {
-      XLOG(DBG1) << "Unhandled MaxStreamData event, streamId="
+      XLOG(DBG5) << "Unhandled MaxStreamData event, streamId="
                  << maxStreamData->streamId
                  << " maxData=" << maxStreamData->maxData;
     } else if (
         auto* maxStreamsBidi =
             std::get_if<proxygen::detail::WtStreamManager::MaxStreamsBidi>(
                 &event)) {
-      XLOG(DBG1) << "Unhandled MaxStreamsBidi event, maxStreams="
+      XLOG(DBG5) << "Unhandled MaxStreamsBidi event, maxStreams="
                  << maxStreamsBidi->maxStreams;
     } else if (
         auto* maxStreamsUni =
             std::get_if<proxygen::detail::WtStreamManager::MaxStreamsUni>(
                 &event)) {
-      XLOG(DBG1) << "Unhandled MaxStreamsUni event, maxStreams="
+      XLOG(DBG5) << "Unhandled MaxStreamsUni event, maxStreams="
                  << maxStreamsUni->maxStreams;
     } else {
       XLOG(ERR) << "Unknown event type in processEgressEvents";
@@ -348,6 +353,13 @@ void PicoWebTransportBase::processEgressEvents() {
       markStreamActiveImpl(streamId);
     }
   }
+}
+
+void PicoWebTransportBase::onStreamFcUpdated(
+    uint64_t streamId,
+    uint64_t maxData) {
+  streamManager_->onMaxData(
+      proxygen::detail::WtStreamManager::MaxStreamData{{maxData}, streamId});
 }
 
 // JIT send path
@@ -371,6 +383,15 @@ bool PicoWebTransportBase::onJitProvideData(
   bool fin = streamData.fin;
   // Stream is still active if we sent data and have more, or filled the buffer
   bool isStillActive = (dataLen > 0 && !fin) || (dataLen >= maxLength);
+  // If FC was exhausted during dequeue(), WtStreamManager removed this stream
+  // from writableStreams_ and (synchronously via eventsAvailable()) already
+  // activated the new priority head. Force deactivation so picoquic doesn't
+  // re-probe a blocked stream; it will be re-activated when FC re-opens.
+  if (isStillActive) {
+    bool stillAtQueueHead = priorityQueue_.empty() ||
+        priorityQueue_.peekNextScheduledID().asStreamID() == streamId;
+    isStillActive = stillAtQueueHead;
+  }
 
   XLOG(DBG6) << "onJitProvideData: stream=" << streamId
              << " dequeued=" << dataLen << " fin=" << fin

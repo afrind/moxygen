@@ -70,6 +70,14 @@ size_t PicoCnxImpl::getMaxDatagramPayload() const {
   return tp ? static_cast<size_t>(tp->max_datagram_frame_size) : 0;
 }
 
+uint64_t PicoCnxImpl::getRemoteMaxStreamDataUni() const {
+  return picoquic_get_remote_max_stream_data_uni(cnx_);
+}
+
+uint64_t PicoCnxImpl::getRemoteMaxStreamDataBidi() const {
+  return picoquic_get_remote_max_stream_data_bidi_remote(cnx_);
+}
+
 uint8_t* PicoCnxImpl::provideStreamDataBuffer(
     uint8_t* picoContext,
     size_t dataLen,

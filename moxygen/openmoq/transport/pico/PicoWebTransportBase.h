@@ -42,7 +42,8 @@ class PicoWebTransportBase : public proxygen::WebTransport {
       bool isClient,
       const folly::SocketAddress& localAddr,
       const folly::SocketAddress& peerAddr,
-      std::unique_ptr<PicoCnx> picoCnx);
+      std::unique_ptr<PicoCnx> picoCnx,
+      size_t streamPrefaceBytes = 0);
 
   ~PicoWebTransportBase() override;
 
@@ -193,6 +194,12 @@ class PicoWebTransportBase : public proxygen::WebTransport {
    */
   void processEgressEvents();
 
+  /** Deliver per-stream FC window update to WtStreamManager.
+   *  Called when picoquic_callback_stream_fc_updated fires (MAX_STREAM_DATA).
+   *  Connection-level FC (MAX_DATA) is enforced by picoquic at the JIT layer
+   *  and does not need to be tracked here. */
+  void onStreamFcUpdated(uint64_t streamId, uint64_t maxData);
+
   /**
    * JIT send path: dequeue data and provide to picoquic.
    * Subclass JIT callback should call this.
@@ -256,6 +263,10 @@ class PicoWebTransportBase : public proxygen::WebTransport {
 
   std::function<void()> updateWakeTimeoutCallback_;
   PicoQuicStatsCallback* statsCallback_{nullptr};
+  // Bytes prepended before app data on each locally-created WT stream (e.g.
+  // h3zero stream type + session ID varints). 0 for direct QUIC. Used to
+  // convert QUIC stream FC limits to app-layer byte counts.
+  size_t streamPrefaceBytes_{0};
 
  private:
   // WtStreamManager callbacks

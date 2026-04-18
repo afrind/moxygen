@@ -540,12 +540,11 @@ int MoQPicoServerBase::onWebTransportConnectImpl(
   XLOG(DBG1) << "Accepting WebTransport session from "
              << peerSockAddr.describe();
 
-  // Get per-connection h3zero context — after almost_ready hands off to
-  // h3zero_callback, the connection callback context is h3Ctx directly.
+  // h3zero_callback is installed at almost_ready; its context is the h3Ctx.
   auto* h3Ctx =
       static_cast<h3zero_callback_ctx_t*>(picoquic_get_callback_context(cnx));
   if (!h3Ctx) {
-    XLOG(ERR) << "No h3Ctx found for cnx=" << (void*)cnx;
+    XLOG(ERR) << "No h3zero context found for cnx=" << (void*)cnx;
     return -1;
   }
 
