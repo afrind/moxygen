@@ -64,6 +64,7 @@ class PicoQuicWebTransport : public PicoWebTransportBase {
   // Clear picoquic callback to prevent use-after-free
   void clearPicoquicCallback();
 
+  picoquic_cnx_t* cnx_;
   std::function<void()> onConnectionClosedCallback_;
 };
 

@@ -7,6 +7,7 @@
 #include "moxygen/openmoq/transport/pico/PicoQuicWebTransport.h"
 #include <folly/logging/xlog.h>
 #include <picoquic.h>
+#include "moxygen/openmoq/transport/pico/PicoCnxImpl.h"
 
 namespace moxygen {
 
@@ -37,7 +38,12 @@ PicoQuicWebTransport::PicoQuicWebTransport(
     picoquic_cnx_t* cnx,
     const folly::SocketAddress& localAddr,
     const folly::SocketAddress& peerAddr)
-    : PicoWebTransportBase(cnx, picoquic_is_client(cnx), localAddr, peerAddr) {
+    : PicoWebTransportBase(
+          picoquic_is_client(cnx),
+          localAddr,
+          peerAddr,
+          std::make_unique<PicoCnxImpl>(cnx)),
+      cnx_(cnx) {
   // Set the callback context for picoquic
   picoquic_set_callback(cnx_, moxygen::picoCallback, this);
 }

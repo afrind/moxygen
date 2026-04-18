@@ -9,6 +9,7 @@
 #include <h3zero_common.h>
 #include <pico_webtransport.h>
 #include <picoquic.h>
+#include "moxygen/openmoq/transport/pico/PicoCnxImpl.h"
 
 namespace moxygen {
 
@@ -19,10 +20,11 @@ PicoH3WebTransport::PicoH3WebTransport(
     const folly::SocketAddress& localAddr,
     const folly::SocketAddress& peerAddr)
     : PicoWebTransportBase(
-          cnx,
           false /* isClient - server side */,
           localAddr,
-          peerAddr),
+          peerAddr,
+          std::make_unique<PicoCnxImpl>(cnx)),
+      cnx_(cnx),
       h3Ctx_(h3Ctx),
       controlStreamCtx_(controlStreamCtx) {
   // Store control stream context
@@ -273,8 +275,7 @@ void PicoH3WebTransport::onStreamData(
     if (bytes && length > 0) {
       // Parse WebTransport capsules
       picowt_capsule_t capsule = {};
-      int ret = picowt_receive_capsule(
-          cnx_, bytes, bytes + length, &capsule);
+      int ret = picowt_receive_capsule(cnx_, bytes, bytes + length, &capsule);
       if (ret != 0) {
         XLOG(ERR) << "Failed to parse WebTransport capsule: " << ret
                   << ", tearing down session";

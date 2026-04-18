@@ -8,6 +8,7 @@
 
 #include <folly/SocketAddress.h>
 #include <folly/container/F14Set.h>
+#include <moxygen/openmoq/transport/pico/PicoCnx.h>
 #include <moxygen/openmoq/transport/pico/PicoQuicStatsCallback.h>
 #include <proxygen/lib/http/webtransport/WebTransport.h>
 #include <proxygen/lib/http/webtransport/WtStreamManager.h>
@@ -16,7 +17,7 @@
 #include <functional>
 #include <memory>
 
-// Forward declaration - avoids including picoquic.h
+// Forward declaration for subclass constructors that take picoquic_cnx_t*.
 typedef struct st_picoquic_cnx_t picoquic_cnx_t;
 
 namespace moxygen {
@@ -38,10 +39,10 @@ namespace moxygen {
 class PicoWebTransportBase : public proxygen::WebTransport {
  public:
   PicoWebTransportBase(
-      picoquic_cnx_t* cnx,
       bool isClient,
       const folly::SocketAddress& localAddr,
-      const folly::SocketAddress& peerAddr);
+      const folly::SocketAddress& peerAddr,
+      std::unique_ptr<PicoCnx> picoCnx);
 
   ~PicoWebTransportBase() override;
 
@@ -238,7 +239,6 @@ class PicoWebTransportBase : public proxygen::WebTransport {
   void onReceiveDatagramCommon(uint8_t* bytes, size_t length);
 
   // Shared state accessible by subclasses
-  picoquic_cnx_t* cnx_;
   folly::SocketAddress localAddr_;
   folly::SocketAddress peerAddr_;
   proxygen::WebTransportHandler* handler_{nullptr};
@@ -281,6 +281,8 @@ class PicoWebTransportBase : public proxygen::WebTransport {
 
   EgressCallback egressCallback_;
   IngressCallback ingressCallback_;
+
+  std::unique_ptr<PicoCnx> picoCnx_;
 };
 
 } // namespace moxygen

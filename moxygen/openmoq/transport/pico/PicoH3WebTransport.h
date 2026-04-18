@@ -89,6 +89,7 @@ class PicoH3WebTransport : public PicoWebTransportBase {
   // picohttp_callback_free will fire and erase the stream from streamContexts_.
   void maybeDeleteStream(h3zero_stream_ctx_t* streamCtx) noexcept;
 
+  picoquic_cnx_t* cnx_;
   h3zero_callback_ctx_t* h3Ctx_;
   h3zero_stream_ctx_t* controlStreamCtx_;
 

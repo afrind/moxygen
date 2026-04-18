@@ -6,48 +6,20 @@
 
 #include "moxygen/openmoq/transport/pico/PicoWebTransportBase.h"
 #include <folly/logging/xlog.h>
-#include <picoquic.h>
 
 namespace moxygen {
 
-namespace {
-
-// RAII guard: captures picoquic's next wake time on construction and fires
-// a callback on destruction if the wake time decreased (e.g. after
-// mark_active_stream / mark_datagram_ready).
-struct WakeTimeGuard {
-  WakeTimeGuard(picoquic_cnx_t* cnx, const std::function<void()>& cb)
-      : quic_(picoquic_get_quic_ctx(cnx)), cb_(cb) {
-    if (cb_) {
-      before_ = picoquic_get_next_wake_time(quic_, picoquic_current_time());
-    }
-  }
-  ~WakeTimeGuard() {
-    if (cb_ &&
-        picoquic_get_next_wake_time(quic_, picoquic_current_time()) < before_) {
-      cb_();
-    }
-  }
-
- private:
-  picoquic_quic_t* quic_;
-  const std::function<void()>& cb_;
-  uint64_t before_{UINT64_MAX};
-};
-
-} // namespace
-
 PicoWebTransportBase::PicoWebTransportBase(
-    picoquic_cnx_t* cnx,
     bool isClient,
     const folly::SocketAddress& localAddr,
-    const folly::SocketAddress& peerAddr)
-    : cnx_(cnx),
-      localAddr_(localAddr),
+    const folly::SocketAddress& peerAddr,
+    std::unique_ptr<PicoCnx> picoCnx)
+    : localAddr_(localAddr),
       peerAddr_(peerAddr),
       isClient_(isClient),
       egressCallback_(this),
-      ingressCallback_(this) {
+      ingressCallback_(this),
+      picoCnx_(std::move(picoCnx)) {
   // Configure WtStreamManager flow control limits
   // We set all limits to max() because picoquic handles flow control internally
   proxygen::detail::WtStreamManager::WtConfig wtConfig;
@@ -87,7 +59,6 @@ folly::Expected<
     PicoWebTransportBase::StreamWriteHandle*,
     PicoWebTransportBase::ErrorCode>
 PicoWebTransportBase::createUniStream() {
-  XCHECK(cnx_);
   if (sessionClosed_) {
     return folly::makeUnexpected(ErrorCode::STREAM_CREATION_ERROR);
   }
@@ -115,7 +86,6 @@ folly::Expected<
     PicoWebTransportBase::BidiStreamHandle,
     PicoWebTransportBase::ErrorCode>
 PicoWebTransportBase::createBidiStream() {
-  XCHECK(cnx_);
   if (sessionClosed_) {
     return folly::makeUnexpected(ErrorCode::STREAM_CREATION_ERROR);
   }
@@ -179,7 +149,7 @@ PicoWebTransportBase::writeStreamData(
 
   auto result = handle->writeStreamData(std::move(data), fin, deliveryCallback);
   if (result.hasValue()) {
-    WakeTimeGuard guard(cnx_, updateWakeTimeoutCallback_);
+    auto guard = picoCnx_->getWakeTimeGuard(updateWakeTimeoutCallback_);
     markStreamActiveImpl(id);
   }
   return result;
@@ -232,7 +202,6 @@ PicoWebTransportBase::stopSending(uint64_t streamId, uint32_t error) {
 
 folly::Expected<folly::Unit, PicoWebTransportBase::ErrorCode>
 PicoWebTransportBase::sendDatagram(std::unique_ptr<folly::IOBuf> datagram) {
-  XCHECK(cnx_);
   if (sessionClosed_) {
     return folly::makeUnexpected(ErrorCode::GENERIC_ERROR);
   }
@@ -242,7 +211,7 @@ PicoWebTransportBase::sendDatagram(std::unique_ptr<folly::IOBuf> datagram) {
              << "queue_size=" << datagramQueue_.size();
 
   datagramQueue_.push_back(std::move(datagram));
-  WakeTimeGuard guard(cnx_, updateWakeTimeoutCallback_);
+  auto guard = picoCnx_->getWakeTimeGuard(updateWakeTimeoutCallback_);
   markDatagramActiveImpl();
 
   return folly::unit;
@@ -258,10 +227,9 @@ const folly::SocketAddress& PicoWebTransportBase::getPeerAddress() const {
 
 quic::TransportInfo PicoWebTransportBase::getTransportInfo() const {
   quic::TransportInfo info;
-  XCHECK(cnx_);
-  info.srtt = std::chrono::microseconds(picoquic_get_rtt(cnx_));
-  info.bytesSent = picoquic_get_data_sent(cnx_);
-  info.bytesRecvd = picoquic_get_data_received(cnx_);
+  info.srtt = std::chrono::microseconds(picoCnx_->getRtt());
+  info.bytesSent = picoCnx_->getDataSent();
+  info.bytesRecvd = picoCnx_->getDataReceived();
   return info;
 }
 
@@ -317,10 +285,8 @@ void PicoWebTransportBase::IngressCallback::onNewPeerStream(
 // Egress event processing
 
 void PicoWebTransportBase::processEgressEvents() {
-  XCHECK(cnx_);
-
   XLOG(DBG4) << "processEgressEvents: processing egress events";
-  WakeTimeGuard guard(cnx_, updateWakeTimeoutCallback_);
+  auto guard = picoCnx_->getWakeTimeGuard(updateWakeTimeoutCallback_);
 
   auto events = streamManager_->moveEvents();
 
@@ -393,7 +359,7 @@ bool PicoWebTransportBase::onJitProvideData(
   auto* handle = streamManager_->getOrCreateEgressHandle(streamId);
   if (!handle) {
     XLOG(DBG2) << "onJitProvideData: no handle for stream " << streamId;
-    picoquic_provide_stream_data_buffer(picoContext, 0, 0, 0);
+    picoCnx_->provideStreamDataBuffer(picoContext, 0, false, false);
     return false;
   }
 
@@ -411,8 +377,8 @@ bool PicoWebTransportBase::onJitProvideData(
              << " isStillActive=" << isStillActive;
 
   // Get buffer from picoquic via JIT API
-  uint8_t* buffer = picoquic_provide_stream_data_buffer(
-      picoContext, dataLen, fin ? 1 : 0, isStillActive ? 1 : 0);
+  uint8_t* buffer = picoCnx_->provideStreamDataBuffer(
+      picoContext, dataLen, fin, isStillActive);
 
   if (buffer == nullptr) {
     if (dataLen > 0) {
@@ -498,8 +464,8 @@ void PicoWebTransportBase::onStreamDataCommon(
       return;
     }
 
-    // Determine if this is a bidi or uni stream
-    bool isBidi = PICOQUIC_IS_BIDIR_STREAM_ID(streamId);
+    // Determine if this is a bidi or uni stream (QUIC bit 1: 0=bidi, 1=uni)
+    bool isBidi = (streamId & 2) == 0;
 
     if (isBidi) {
       auto bidiHandle = streamManager_->getOrCreateBidiHandle(streamId);
@@ -556,9 +522,7 @@ void PicoWebTransportBase::onSessionCloseCommon(uint32_t errorCode) {
 }
 
 size_t PicoWebTransportBase::getMaxDatagramPayload() const {
-  XCHECK(cnx_);
-  auto* tp = picoquic_get_transport_parameters(cnx_, 0 /* peer */);
-  return tp ? static_cast<size_t>(tp->max_datagram_frame_size) : 0;
+  return picoCnx_->getMaxDatagramPayload();
 }
 
 void PicoWebTransportBase::onJitProvideDatagram(
