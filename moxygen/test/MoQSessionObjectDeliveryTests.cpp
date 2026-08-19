@@ -1407,3 +1407,128 @@ CO_TEST_P_X(MoQSessionTest, SubscriptionCountersCountDatagrams) {
 
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
+
+namespace {
+// Collects the object-tier mlog records so the observer migration of the data
+// plane has a regression signal. The control-plane equivalent lives in
+// MoQSessionPublishNamespaceTests.
+class ObjectRecordingMLogger : public MLogger {
+ public:
+  explicit ObjectRecordingMLogger(VantagePoint vp) : MLogger(vp) {}
+  void outputLogs() override {}
+
+  struct Counts {
+    size_t subgroupHeadersCreated{0};
+    size_t subgroupHeadersParsed{0};
+    size_t subgroupObjectsCreated{0};
+    size_t subgroupObjectsParsed{0};
+    size_t datagramsParsed{0};
+    size_t streamTypesSet{0};
+  };
+
+  Counts counts() const {
+    Counts c;
+    for (const auto& event : logs_) {
+      if (std::get_if<MOQTSubgroupHeaderCreated>(&event.data_)) {
+        c.subgroupHeadersCreated++;
+      } else if (std::get_if<MOQTSubgroupHeaderParsed>(&event.data_)) {
+        c.subgroupHeadersParsed++;
+      } else if (std::get_if<MOQTSubgroupObjectCreated>(&event.data_)) {
+        c.subgroupObjectsCreated++;
+      } else if (std::get_if<MOQTSubgroupObjectParsed>(&event.data_)) {
+        c.subgroupObjectsParsed++;
+      } else if (std::get_if<MOQTObjectDatagramParsed>(&event.data_)) {
+        c.datagramsParsed++;
+      } else if (std::get_if<MOQTStreamTypeSet>(&event.data_)) {
+        c.streamTypesSet++;
+      }
+    }
+    return c;
+  }
+
+  // Payload of the Nth parsed subgroup object, so the migration cannot
+  // silently start logging an empty or aliased buffer.
+  std::string parsedObjectPayload(size_t index) const {
+    size_t seen = 0;
+    for (const auto& event : logs_) {
+      if (const auto* parsed =
+              std::get_if<MOQTSubgroupObjectParsed>(&event.data_)) {
+        if (seen++ == index) {
+          return parsed->objectPayload
+              ? parsed->objectPayload->clone()->moveToFbString().toStdString()
+              : std::string();
+        }
+      }
+    }
+    return std::string();
+  }
+};
+} // namespace
+
+CO_TEST_P_X(MoQSessionTest, MLogRecordsObjectTier) {
+  auto clientLogger =
+      std::make_shared<ObjectRecordingMLogger>(VantagePoint::CLIENT);
+  auto serverLogger =
+      std::make_shared<ObjectRecordingMLogger>(VantagePoint::SERVER);
+
+  co_await setupMoQSession();
+  clientSession_->setLogger(clientLogger);
+  serverSession_->setLogger(serverLogger);
+
+  // Two subgroups in one group. The second object is begun with only half its
+  // payload and finished from a later turn of the loop, so the receiver parses
+  // it across two frames -- the path that stashes the header at object begin
+  // and reports once the final frame lands.
+  expectSubscribe([this](auto sub, auto pub) -> TaskSubscribeResult {
+    auto sg0 = pub->beginSubgroup(0, 0, 0).value();
+    sg0->object(0, folly::IOBuf::copyBuffer("abcdef"), noExtensions(), false);
+    auto sg1 = pub->beginSubgroup(0, 1, 0).value();
+    sg1->beginObject(0, 6, folly::IOBuf::copyBuffer("abc"), noExtensions());
+    eventBase_.add([sub, pub, sg0, sg1] {
+      sg1->objectPayload(folly::IOBuf::copyBuffer("def"), true);
+      sg0->endOfSubgroup();
+      pub->publishDone(getTrackEndedPublishDone(sub.requestID));
+    });
+    co_return makeSubscribeOkResult(sub, AbsoluteLocation{0, 0});
+  });
+
+  auto rsg0 = std::make_shared<testing::NiceMock<MockSubgroupConsumer>>();
+  auto rsg1 = std::make_shared<testing::NiceMock<MockSubgroupConsumer>>();
+  EXPECT_CALL(*subscribeCallback_, beginSubgroup(0, 0, 0, _))
+      .WillOnce(testing::Return(rsg0));
+  EXPECT_CALL(*subscribeCallback_, beginSubgroup(0, 1, 0, _))
+      .WillOnce(testing::Return(rsg1));
+
+  expectPublishDone();
+  auto res = co_await clientSession_->subscribe(
+      getSubscribe(kTestTrackName), subscribeCallback_);
+  EXPECT_FALSE(res.hasError());
+  co_await publishDone_;
+
+  auto sent = serverLogger->counts();
+  auto received = clientLogger->counts();
+
+  // The publisher records each subgroup header it writes; the subscriber
+  // records each one it parses.
+  EXPECT_EQ(sent.subgroupHeadersCreated, 2u);
+  EXPECT_EQ(received.subgroupHeadersParsed, 2u);
+  // Only the whole-in-one-frame object is reported. The split object is
+  // parsed and delivered to the application, but never recorded: onObjectBegin
+  // stashes its header expecting onObjectPayload to report it, and that report
+  // does not happen. This is pre-existing -- the same assertion fails
+  // identically against the code before the observer migration -- so it is
+  // pinned here rather than fixed, to keep the migration behaviour-neutral and
+  // to make the gap visible.
+  // TODO: report the split object and change this to 2.
+  EXPECT_EQ(received.subgroupObjectsParsed, 1u);
+  EXPECT_EQ(received.datagramsParsed, 0u);
+  // Each subgroup stream gets a stream type, on both sides.
+  EXPECT_EQ(sent.streamTypesSet, 2u);
+  EXPECT_EQ(received.streamTypesSet, 2u);
+  // Payload survives the clone-inside-the-observer change: MLogger now clones
+  // in its override rather than every call site cloning unconditionally.
+  EXPECT_EQ(clientLogger->parsedObjectPayload(0), "abcdef");
+
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
