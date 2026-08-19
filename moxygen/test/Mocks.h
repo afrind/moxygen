@@ -11,6 +11,7 @@
 #include <moxygen/MoQConsumers.h>
 #include <moxygen/Publisher.h>
 #include <moxygen/Subscriber.h>
+#include <moxygen/stats/MoQSessionObserver.h>
 #include <moxygen/stats/MoQStats.h>
 
 namespace moxygen {
@@ -545,6 +546,185 @@ class MockSubscriberStats : public MoQSubscriberStatsCallback {
   MOCK_METHOD(void, onPublishError, (PublishErrorCode), (override));
 
   MOCK_METHOD(void, onSubgroupReset, (ResetStreamErrorCode), (override));
+};
+
+/*
+ * Mock observer. interests() is settable so a test can exercise the tier
+ * gating in MoQSessionObserverList (an observer that does not ask for
+ * Interest::kObject must never see an object event).
+ */
+class MockMoQSessionObserver : public MoQSessionObserver {
+ public:
+  explicit MockMoQSessionObserver(
+      uint32_t interests = kControl | kSubscription | kObject)
+      : interests_(interests) {}
+
+  uint32_t interests() const override {
+    return interests_;
+  }
+
+  void setInterests(uint32_t interests) {
+    interests_ = interests;
+  }
+
+  MOCK_METHOD(void, onSessionStart, (const SessionContext&), (override));
+  MOCK_METHOD(
+      void,
+      onSessionEnd,
+      (std::optional<SessionCloseErrorCode>),
+      (override));
+
+  MOCK_METHOD(
+      void,
+      onClientSetup,
+      (Direction, const ClientSetup&, uint64_t),
+      (override));
+  MOCK_METHOD(
+      void,
+      onServerSetup,
+      (Direction, const ServerSetup&, uint64_t),
+      (override));
+
+  MOCK_METHOD(void, onSubscribe, (Direction, const SubscribeRequest&), (override));
+  MOCK_METHOD(void, onSubscribeOk, (Direction, const SubscribeOk&), (override));
+  MOCK_METHOD(
+      void,
+      onSubscribeError,
+      (Direction, const SubscribeError&),
+      (override));
+  MOCK_METHOD(void, onRequestUpdate, (Direction, const RequestUpdate&), (override));
+  MOCK_METHOD(void, onUnsubscribe, (Direction, const Unsubscribe&), (override));
+
+  MOCK_METHOD(void, onFetch, (Direction, const Fetch&), (override));
+  MOCK_METHOD(void, onFetchOk, (Direction, const FetchOk&), (override));
+  MOCK_METHOD(void, onFetchError, (Direction, const FetchError&), (override));
+  MOCK_METHOD(void, onFetchCancel, (Direction, const FetchCancel&), (override));
+
+  MOCK_METHOD(void, onPublish, (Direction, const PublishRequest&), (override));
+  MOCK_METHOD(void, onPublishOk, (Direction, const PublishOk&), (override));
+  MOCK_METHOD(void, onPublishError, (Direction, const PublishError&), (override));
+  MOCK_METHOD(void, onPublishDone, (Direction, const PublishDone&), (override));
+
+  MOCK_METHOD(
+      void,
+      onPublishNamespace,
+      (Direction, const PublishNamespace&),
+      (override));
+  MOCK_METHOD(
+      void,
+      onPublishNamespaceOk,
+      (Direction, const PublishNamespaceOk&),
+      (override));
+  MOCK_METHOD(
+      void,
+      onPublishNamespaceError,
+      (Direction, const PublishNamespaceError&),
+      (override));
+  MOCK_METHOD(
+      void,
+      onPublishNamespaceDone,
+      (Direction, const PublishNamespaceDone&),
+      (override));
+  MOCK_METHOD(
+      void,
+      onPublishNamespaceCancel,
+      (Direction, const PublishNamespaceCancel&),
+      (override));
+
+  MOCK_METHOD(
+      void,
+      onSubscribeNamespace,
+      (Direction, const SubscribeNamespace&),
+      (override));
+  MOCK_METHOD(
+      void,
+      onSubscribeNamespaceOk,
+      (Direction, const SubscribeNamespaceOk&),
+      (override));
+  MOCK_METHOD(
+      void,
+      onSubscribeNamespaceError,
+      (Direction, const SubscribeNamespaceError&),
+      (override));
+  MOCK_METHOD(
+      void,
+      onUnsubscribeNamespace,
+      (Direction, const UnsubscribeNamespace&),
+      (override));
+
+  MOCK_METHOD(
+      void,
+      onSubscribeTracksOk,
+      (Direction, const SubscribeTracksOk&),
+      (override));
+  MOCK_METHOD(
+      void,
+      onSubscribeTracksError,
+      (Direction, const SubscribeTracksError&),
+      (override));
+
+  MOCK_METHOD(void, onTrackStatus, (Direction, const TrackStatus&), (override));
+  MOCK_METHOD(
+      void,
+      onTrackStatusOk,
+      (Direction, const TrackStatusOk&),
+      (override));
+  MOCK_METHOD(
+      void,
+      onTrackStatusError,
+      (Direction, const TrackStatusError&),
+      (override));
+
+  MOCK_METHOD(void, onGoaway, (Direction, const Goaway&), (override));
+  MOCK_METHOD(void, onMaxRequestID, (Direction, uint64_t), (override));
+  MOCK_METHOD(void, onRequestsBlocked, (Direction, uint64_t), (override));
+
+  MOCK_METHOD(void, onSubscriptionBegin, (const SubscriptionInfo&), (override));
+  MOCK_METHOD(
+      void,
+      onSubscriptionEnd,
+      (const SubscriptionInfo&, const SubscriptionCounters&),
+      (override));
+  MOCK_METHOD(void, onSubscriptionStreamOpened, (Direction), (override));
+  MOCK_METHOD(void, onSubscriptionStreamClosed, (Direction), (override));
+  MOCK_METHOD(void, onSubgroupReset, (Direction, ResetStreamErrorCode), (override));
+  MOCK_METHOD(void, onObjectAckLatency, (std::chrono::microseconds), (override));
+
+  MOCK_METHOD(
+      void,
+      onStreamTypeSet,
+      (Direction, uint64_t, ObservedStreamType),
+      (override));
+  MOCK_METHOD(
+      void,
+      onDatagramObject,
+      (Direction, TrackAlias, const ObjectHeader&, const Payload&),
+      (override));
+  MOCK_METHOD(
+      void,
+      onSubgroupHeader,
+      (Direction,
+       uint64_t,
+       TrackAlias,
+       uint64_t,
+       uint64_t,
+       uint8_t,
+       const SubgroupOptions&),
+      (override));
+  MOCK_METHOD(
+      void,
+      onSubgroupObject,
+      (Direction, uint64_t, TrackAlias, const ObjectHeader&, const Payload&),
+      (override));
+  MOCK_METHOD(void, onFetchHeader, (Direction, uint64_t, uint64_t), (override));
+  MOCK_METHOD(
+      void,
+      onFetchObject,
+      (Direction, uint64_t, const ObjectHeader&, const Payload&),
+      (override));
+
+ private:
+  uint32_t interests_;
 };
 
 } // namespace moxygen

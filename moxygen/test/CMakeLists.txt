@@ -104,6 +104,16 @@ moxygen_add_test(TARGET MoQSessionTests
     testmain
 )
 
+moxygen_add_test(TARGET MoQSessionObserverTests
+  PREFIX "MoQSessionObserver"
+  SOURCES
+    MoQSessionObserverTest.cpp
+  DEPENDS
+    moxygen_moq_framer
+    moxygen_stats_moq_stats
+    testmain
+)
+
 moxygen_add_test(TARGET MoQDeliveryTimerTests
   PREFIX "MoQDeliveryTimer"
   SOURCES
