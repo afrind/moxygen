@@ -1289,3 +1289,121 @@ CO_TEST_P_X(MoQSessionTest, NullPayloadWithLogger) {
   co_await publishDone_;
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
+
+// === SUBSCRIPTION COUNTERS ===
+//
+// The per-subscription delivery totals are the one piece of instrumentation
+// that is new rather than relocated, so they get their own coverage: nothing
+// in moxygen tracked per-subscription object/byte/group totals before.
+
+// Objects published across two groups on the subgroup path must arrive at
+// onSubscriptionEnd as a single rollup, with groups counted once per group
+// rather than once per subgroup.
+CO_TEST_P_X(MoQSessionTest, SubscriptionCountersRollUpAtEnd) {
+  co_await setupMoQSession();
+
+  auto observer = std::make_shared<testing::NiceMock<MockMoQSessionObserver>>(
+      MoQSessionObserver::kSubscription);
+  serverSession_->addObserver(observer);
+
+  MoQSessionObserver::SubscriptionCounters seen;
+  bool sawEnd = false;
+  EXPECT_CALL(*observer, onSubscriptionEnd(_, _))
+      .WillOnce(testing::Invoke(
+          [&](const MoQSessionObserver::SubscriptionInfo& info,
+              const MoQSessionObserver::SubscriptionCounters& counters) {
+            EXPECT_EQ(info.role, MoQSessionObserver::Role::Publisher);
+            EXPECT_EQ(info.fullTrackName.trackName, kTestTrackName.trackName);
+            seen = counters;
+            sawEnd = true;
+          }));
+
+  expectSubscribe([](auto sub, auto pub) -> TaskSubscribeResult {
+    // Group 0 carries two objects across two subgroups; group 1 carries one.
+    // Six bytes, then five, then four: 15 bytes over 3 objects and 2 groups.
+    auto sg0 = pub->beginSubgroup(0, 0, 0).value();
+    sg0->object(0, folly::IOBuf::copyBuffer("abcdef"), noExtensions(), false);
+    auto sg1 = pub->beginSubgroup(0, 1, 0).value();
+    sg1->object(1, folly::IOBuf::copyBuffer("abcde"), noExtensions(), true);
+    auto sg2 = pub->beginSubgroup(1, 0, 0).value();
+    sg2->object(0, folly::IOBuf::copyBuffer("abcd"), noExtensions(), true);
+    sg0->endOfSubgroup();
+    pub->publishDone(getTrackEndedPublishDone(sub.requestID));
+    co_return makeSubscribeOkResult(sub, AbsoluteLocation{0, 0});
+  });
+
+  // The receiving side is a StrictMock, so the inbound subgroups need
+  // expectations even though this test is about the sender's counters.
+  auto rsg0 = std::make_shared<testing::NiceMock<MockSubgroupConsumer>>();
+  auto rsg1 = std::make_shared<testing::NiceMock<MockSubgroupConsumer>>();
+  auto rsg2 = std::make_shared<testing::NiceMock<MockSubgroupConsumer>>();
+  EXPECT_CALL(*subscribeCallback_, beginSubgroup(0, 0, 0, _))
+      .WillOnce(testing::Return(rsg0));
+  EXPECT_CALL(*subscribeCallback_, beginSubgroup(0, 1, 0, _))
+      .WillOnce(testing::Return(rsg1));
+  EXPECT_CALL(*subscribeCallback_, beginSubgroup(1, 0, 0, _))
+      .WillOnce(testing::Return(rsg2));
+
+  expectPublishDone();
+  auto res = co_await clientSession_->subscribe(
+      getSubscribe(kTestTrackName), subscribeCallback_);
+  EXPECT_FALSE(res.hasError());
+  co_await publishDone_;
+
+  EXPECT_TRUE(sawEnd);
+  EXPECT_EQ(seen.objects, 3u);
+  EXPECT_EQ(seen.bytes, 15u);
+  // Two distinct groups, three subgroups: the group counter must not follow
+  // the subgroup count.
+  EXPECT_EQ(seen.groups, 2u);
+  EXPECT_TRUE(seen.endReason.has_value());
+  if (seen.endReason) {
+    EXPECT_EQ(*seen.endReason, PublishDoneStatusCode::TRACK_ENDED);
+  }
+
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+// Datagrams bypass the subgroup path entirely, so they are counted separately.
+CO_TEST_P_X(MoQSessionTest, SubscriptionCountersCountDatagrams) {
+  co_await setupMoQSession();
+
+  auto observer = std::make_shared<testing::NiceMock<MockMoQSessionObserver>>(
+      MoQSessionObserver::kSubscription);
+  serverSession_->addObserver(observer);
+
+  MoQSessionObserver::SubscriptionCounters seen;
+  bool sawEnd = false;
+  EXPECT_CALL(*observer, onSubscriptionEnd(_, _))
+      .WillOnce(testing::Invoke(
+          [&](const MoQSessionObserver::SubscriptionInfo&,
+              const MoQSessionObserver::SubscriptionCounters& counters) {
+            seen = counters;
+            sawEnd = true;
+          }));
+
+  expectSubscribe([](auto sub, auto pub) -> TaskSubscribeResult {
+    pub->datagram(
+        ObjectHeader(0, 0, 1, 0, 11), folly::IOBuf::copyBuffer("hello world"));
+    pub->datagram(
+        ObjectHeader(1, 0, 1, 0, 5), folly::IOBuf::copyBuffer("hello"));
+    pub->publishDone(getTrackEndedPublishDone(sub.requestID));
+    co_return makeSubscribeOkResult(sub, AbsoluteLocation{0, 0});
+  });
+
+  EXPECT_CALL(*subscribeCallback_, datagram(_, _, _))
+      .Times(2)
+      .WillRepeatedly(testing::Return(folly::unit));
+  expectPublishDone();
+  auto res = co_await clientSession_->subscribe(
+      getSubscribe(kTestTrackName), subscribeCallback_);
+  EXPECT_FALSE(res.hasError());
+  co_await publishDone_;
+
+  EXPECT_TRUE(sawEnd);
+  EXPECT_EQ(seen.objects, 2u);
+  EXPECT_EQ(seen.bytes, 16u);
+  EXPECT_EQ(seen.groups, 2u);
+
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}

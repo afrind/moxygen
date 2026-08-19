@@ -817,14 +817,33 @@ folly::Expected<folly::Unit, MoQPublishError> StreamPublisherImpl::objectImpl(
   auto length = payload ? payload->computeChainDataLength() : 0;
   header_.status = ObjectStatus::NORMAL;
 
-  if (logger_) {
-    auto payloadClone = payload ? payload->clone() : nullptr;
+  if (publisher_) {
+    // Delivery totals for this subscription, reported at onSubscriptionEnd.
+    // objectStream() routes through beginSubgroup()+object(), so counting here
+    // covers both the subgroup and the object-stream paths without double
+    // counting; datagrams are counted separately on their own path.
+    publisher_->countObject(length);
+    publisher_->countGroup(header_.group);
+
     if (streamType_ != StreamType::FETCH_HEADER) {
-      logger_->logSubgroupObjectCreated(
-          writeHandle_->getID(), trackAlias_, header_, std::move(payloadClone));
+      MOQ_OBSERVE(
+          publisher_->observers(),
+          kObject,
+          onSubgroupObject(
+              MoQSessionObserver::Direction::Sent,
+              writeHandle_->getID(),
+              trackAlias_,
+              header_,
+              payload));
     } else {
-      logger_->logFetchObjectCreated(
-          writeHandle_->getID(), header_, std::move(payloadClone));
+      MOQ_OBSERVE(
+          publisher_->observers(),
+          kObject,
+          onFetchObject(
+              MoQSessionObserver::Direction::Sent,
+              writeHandle_->getID(),
+              header_,
+              payload));
     }
   }
 
@@ -858,6 +877,13 @@ folly::Expected<folly::Unit, MoQPublishError> StreamPublisherImpl::beginObject(
     return validateRes;
   }
   currentLengthRemaining_ = length;
+  if (publisher_) {
+    // The full object length is declared up front here, so counting it once at
+    // the start is both correct and avoids double counting the objectPayload()
+    // chunks that follow.
+    publisher_->countObject(length);
+    publisher_->countGroup(header_.group);
+  }
   auto validateObjectPublishRes = validateObjectPublishAndUpdateState(
       initialPayload.get(),
       /*finStream=*/false);
@@ -1852,9 +1878,14 @@ MoQSession::TrackPublisherImpl::datagram(
         MoQPublishError::API_ERROR, "Publish after publishDone"));
   }
 
-  if (logger_) {
-    logger_->logObjectDatagramCreated(*trackAlias_, header, payload);
-  }
+  countObject(header.length.value_or(
+      payload ? payload->computeChainDataLength() : 0));
+  countGroup(header.group);
+  MOQ_OBSERVE(
+      observers(),
+      kObject,
+      onDatagramObject(
+          MoQSessionObserver::Direction::Sent, *trackAlias_, header, payload));
 
   // Elide priority if it matches publisher priority
   auto elidedPriority =
@@ -2434,6 +2465,7 @@ void MoQSession::cleanup() {
     if (const auto& control = pubTrack->bidiControl()) {
       control->disarmOnPeerTermination();
     }
+    pubTrack->setEndReason(PublishDoneStatusCode::SESSION_CLOSED);
     endSubscriptionStat(*pubTrack);
     pubTrack->terminatePublish(
         PublishDone(
@@ -5977,6 +6009,9 @@ void MoQSession::sendPublishDone(const PublishDone& pubDone) {
               << " sess=" << this;
     return;
   }
+  // Record why the subscription ended before the bracket closes, so the
+  // counters delivered at onSubscriptionEnd carry the reason.
+  it->second->setEndReason(pubDone.statusCode);
   endSubscriptionStat(*it->second);
   auto* ctx = it->second->replyContext();
   SCOPE_EXIT {

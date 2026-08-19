@@ -450,6 +450,13 @@ class MoQSession : public Subscriber,
     std::chrono::steady_clock::time_point subscriptionStartTime() const {
       return subscriptionStartTime_;
     }
+
+    // The owning session's observers, or null once the session is gone. This
+    // is what replaces the MLogger pointer each of these helpers used to hold.
+    const std::shared_ptr<MoQSessionObserverList>& observers() const {
+      static const std::shared_ptr<MoQSessionObserverList> kNoObservers;
+      return session_ ? session_->observers_ : kNoObservers;
+    }
     uint8_t subPriority() const {
       return subPriority_;
     }
