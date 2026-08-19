@@ -1250,10 +1250,6 @@ void MoQRelaySession::publishNamespaceOk(
 void MoQRelaySession::publishNamespaceCancel(
     const PublishNamespaceCancel& annCan,
     std::shared_ptr<ReplyContext> replyContext) {
-  MOQ_OBSERVE(
-      observers_,
-      kControl,
-      onPublishNamespaceCancel(MoQSessionObserver::Direction::Sent, annCan));
   if (useUniControlStreams(*getNegotiatedVersion())) {
     // Draft 18+: PUBLISH_NAMESPACE_CANCEL was removed from the wire. Cancel
     // by RSTing our read half of the PUBLISH_NAMESPACE bidi stream.
@@ -1275,9 +1271,14 @@ void MoQRelaySession::publishNamespaceCancel(
   }
   retireRequestID(/*signalWriteLoop=*/false);
 
-  if (logger_) {
-    logger_->logPublishNamespaceCancel(annCan);
-  }
+  // Reported once the cancel has been signalled, by whichever mechanism the
+  // negotiated draft uses. In draft 18+ PUBLISH_NAMESPACE_CANCEL is gone from
+  // the wire and the signal is an RST of the PUBLISH_NAMESPACE bidi, so there
+  // is no frame to describe -- the event still describes the cancellation.
+  MOQ_OBSERVE(
+      observers_,
+      kControl,
+      onPublishNamespaceCancel(MoQSessionObserver::Direction::Sent, annCan));
 }
 
 void MoQRelaySession::onPublishNamespaceDone(PublishNamespaceDone unAnn) {
@@ -1291,11 +1292,6 @@ void MoQRelaySession::onPublishNamespaceDone(PublishNamespaceDone unAnn) {
   // getRequestSession() to verify ownership.
   folly::RequestContextScopeGuard guard;
   setRequestSession();
-
-  if (logger_) {
-    logger_->logPublishNamespaceDone(
-        unAnn, MOQTByteStringType::STRING_VALUE, ControlMessageType::PARSED);
-  }
 
   // Version-specific lookup, common action
   std::shared_ptr<Subscriber::PublishNamespaceHandle> handle;

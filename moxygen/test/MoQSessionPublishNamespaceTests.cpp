@@ -4,6 +4,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+#include "moxygen/mlog/MLogger.h"
 #include "moxygen/test/MoQSessionTestCommon.h"
 
 using namespace moxygen;
@@ -224,5 +225,108 @@ CO_TEST_P_X(Draft18Test, PublishNamespaceFailsOnPeerFinWithoutReply) {
   EXPECT_TRUE(errorCode.has_value());
 
   releaseHandler.post();
+  clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+// === MLOG RECORD DUPLICATION ===
+//
+// MLogger is a MoQSessionObserver now, so a call site that both notifies
+// observers and still calls logger_->logXXX directly emits the same qlog
+// record twice. Nothing else catches that: the stats mocks only see the
+// observer path, and the mlog tests cover FileMLogger's sink rather than what
+// a session records. This did happen, in publishNamespaceCancel and
+// onPublishNamespaceDone.
+namespace {
+class RecordingMLogger : public MLogger {
+ public:
+  explicit RecordingMLogger(VantagePoint vp) : MLogger(vp) {}
+  void outputLogs() override {}
+
+  // Number of control-message records emitted for a given message type, e.g.
+  // "publish_namespace_cancel".
+  size_t countControlMessages(const std::string& type) const {
+    size_t count = 0;
+    for (const auto& event : logs_) {
+      const MOQTBaseControlMessage* msg = nullptr;
+      if (const auto* created =
+              std::get_if<MOQTControlMessageCreated>(&event.data_)) {
+        msg = created->message.get();
+      } else if (const auto* parsed =
+                     std::get_if<MOQTControlMessageParsed>(&event.data_)) {
+        msg = parsed->message.get();
+      }
+      if (msg && msg->type == type) {
+        count++;
+      }
+    }
+    return count;
+  }
+};
+} // namespace
+
+CO_TEST_P_X(MoQSessionTest, MLogRecordsControlMessagesExactlyOnce) {
+  auto clientLogger =
+      std::make_shared<RecordingMLogger>(VantagePoint::CLIENT);
+  auto serverLogger =
+      std::make_shared<RecordingMLogger>(VantagePoint::SERVER);
+
+  co_await setupMoQSession();
+  clientSession_->setLogger(clientLogger);
+  serverSession_->setLogger(serverLogger);
+
+  std::shared_ptr<MockPublishNamespaceHandle> mockPublishNamespaceHandle;
+  std::shared_ptr<moxygen::Subscriber::PublishNamespaceCallback>
+      publishNamespaceCallback;
+  EXPECT_CALL(*serverSubscriber, publishNamespace(_, _))
+      .WillOnce(
+          testing::Invoke(
+              [&mockPublishNamespaceHandle, &publishNamespaceCallback](
+                  auto ann, auto publishNamespaceCallbackIn)
+                  -> folly::coro::Task<Subscriber::PublishNamespaceResult> {
+                publishNamespaceCallback = publishNamespaceCallbackIn;
+                mockPublishNamespaceHandle =
+                    std::make_shared<MockPublishNamespaceHandle>(
+                        PublishNamespaceOk(
+                            {.requestID = ann.requestID,
+                             .requestSpecificParams = {}}));
+                co_return Subscriber::PublishNamespaceResult(
+                    mockPublishNamespaceHandle);
+              }));
+
+  EXPECT_CALL(*clientPublisherStatsCallback_, onPublishNamespaceSuccess());
+  EXPECT_CALL(*serverSubscriberStatsCallback_, onPublishNamespaceSuccess());
+  auto mockPublishNamespaceCallback =
+      std::make_shared<MockPublishNamespaceCallback>();
+  auto publishNamespaceResult = co_await clientSession_->publishNamespace(
+      getPublishNamespace(), mockPublishNamespaceCallback);
+  EXPECT_FALSE(publishNamespaceResult.hasError());
+
+  EXPECT_CALL(*clientPublisherStatsCallback_, onPublishNamespaceCancel());
+  EXPECT_CALL(*serverSubscriberStatsCallback_, onPublishNamespaceCancel());
+  folly::coro::Baton barricade;
+  EXPECT_CALL(*mockPublishNamespaceCallback, publishNamespaceCancel(_, _))
+      .WillOnce(
+          testing::Invoke(
+              [&barricade](moxygen::PublishNamespaceErrorCode, std::string) {
+                barricade.post();
+              }));
+  publishNamespaceCallback->publishNamespaceCancel(
+      PublishNamespaceErrorCode::UNINTERESTED, "Not interested!");
+  co_await barricade;
+
+  // One record per message per side, never two. The publisher sends
+  // PUBLISH_NAMESPACE and the subscriber cancels it, so each side records its
+  // own half exactly once.
+  // Note the type strings really are camelCase here while the neighbouring
+  // ones in MLogTypes.h are snake_case ("publishNamespace" vs "subscribe").
+  // Getting these wrong makes the assertions vacuous rather than failing,
+  // which is exactly what happened the first time this test was written.
+  EXPECT_EQ(clientLogger->countControlMessages("publishNamespace"), 1u);
+  EXPECT_EQ(serverLogger->countControlMessages("publishNamespace"), 1u);
+  EXPECT_EQ(
+      clientLogger->countControlMessages("publishNamespace_cancel"), 1u);
+  EXPECT_EQ(
+      serverLogger->countControlMessages("publishNamespace_cancel"), 1u);
+
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }

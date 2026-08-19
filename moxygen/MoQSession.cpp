@@ -6460,11 +6460,6 @@ void MoQSession::fetchCancel(
     const std::shared_ptr<BidiStreamControl>& control) {
   XLOG(DBG1) << __func__ << " sess=" << this;
 
-  // Log FetchCancel
-  if (logger_) {
-    logger_->logFetchCancel(fetchCan);
-  }
-
   auto trackIt = fetches_.find(fetchCan.requestID);
   if (trackIt == fetches_.end()) {
     XLOG(ERR) << "unknown subscribe ID=" << fetchCan.requestID
@@ -6483,6 +6478,14 @@ void MoQSession::fetchCancel(
     }
     controlWriteEvent_.signal();
   }
+
+  // Reported after the cancel is signalled, on either path. Previously this
+  // was logged at the top of the function, so mlog recorded a FETCH_CANCEL
+  // even when the request ID was unknown and nothing was signalled at all.
+  MOQ_OBSERVE(
+      observers_,
+      kControl,
+      onFetchCancel(MoQSessionObserver::Direction::Sent, fetchCan));
 }
 
 folly::coro::Task<MoQSession::JoinResult> MoQSession::join(
