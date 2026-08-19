@@ -186,6 +186,32 @@ class MoQPublisherStatsObserver : public MoQSessionObserver {
     }
   }
 
+  // A request we refused before sending still counts as that request failing,
+  // which is what the counter meant before these paths were distinguished from
+  // errors that actually came back from the peer.
+  void onRequestFailedLocally(FrameType type, const RequestError& err)
+      override {
+    switch (type) {
+      case FrameType::PUBLISH_ERROR:
+        callback_->onPublishError(err.errorCode);
+        break;
+      case FrameType::PUBLISH_NAMESPACE_ERROR:
+        callback_->onPublishNamespaceError(err.errorCode);
+        break;
+      case FrameType::SUBSCRIBE_NAMESPACE_ERROR:
+        callback_->onSubscribeNamespaceError(err.errorCode);
+        break;
+      case FrameType::SUBSCRIBE_ERROR:
+        callback_->onSubscribeError(err.errorCode);
+        break;
+      case FrameType::FETCH_ERROR:
+        callback_->onFetchError(err.errorCode);
+        break;
+      default:
+        break;
+    }
+  }
+
   void onObjectAckLatency(std::chrono::microseconds latency) override {
     callback_->recordObjectAckLatency(uint64_t(latency.count()));
   }
@@ -351,6 +377,31 @@ class MoQSubscriberStatsObserver : public MoQSessionObserver {
   void onSubgroupReset(Direction dir, ResetStreamErrorCode code) override {
     if (dir == Direction::Received) {
       callback_->onSubgroupReset(code);
+    }
+  }
+
+  // See the publisher adapter: a locally-refused request still increments the
+  // same failure counter it did before.
+  void onRequestFailedLocally(FrameType type, const RequestError& err)
+      override {
+    switch (type) {
+      case FrameType::SUBSCRIBE_ERROR:
+        callback_->onSubscribeError(err.errorCode);
+        break;
+      case FrameType::FETCH_ERROR:
+        callback_->onFetchError(err.errorCode);
+        break;
+      case FrameType::SUBSCRIBE_NAMESPACE_ERROR:
+        callback_->onSubscribeNamespaceError(err.errorCode);
+        break;
+      case FrameType::PUBLISH_NAMESPACE_ERROR:
+        callback_->onPublishNamespaceError(err.errorCode);
+        break;
+      case FrameType::PUBLISH_ERROR:
+        callback_->onPublishError(err.errorCode);
+        break;
+      default:
+        break;
     }
   }
 

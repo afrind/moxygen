@@ -806,6 +806,7 @@ class MoQSession : public Subscriber,
       PublisherImpl& pubTrack);
   MoQSessionObserver::SubscriptionInfo subscriberSubscriptionInfo(
       RequestID requestID);
+  void notifySessionEnd();
 
   folly::coro::Task<void> handleFetch(
       Fetch fetch,
@@ -935,6 +936,7 @@ class MoQSession : public Subscriber,
   // plane growing a second check.
   std::shared_ptr<MoQSessionObserverList> observers_{
       std::make_shared<MoQSessionObserverList>()};
+  bool sessionEndNotified_{false};
 
   // Control channel state
   folly::IOBufQueue controlWriteBuf_{folly::IOBufQueue::cacheChainLength()};

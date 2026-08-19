@@ -897,10 +897,9 @@ MoQRelaySession::publishNamespace(
   pendingRequests_.emplace(ann.requestID, std::move(pending));
   auto publishNamespaceResult = co_await std::move(contract.second);
   if (publishNamespaceResult.hasError()) {
-    MOQ_PUBLISHER_STATS(
-        publisherStatsCallback_,
-        onPublishNamespaceError,
-        publishNamespaceResult.error().errorCode);
+    // Reported where the error frame is parsed, or by onRequestFailedLocally
+    // when the request fails without one. Reporting it again here would double
+    // count.
     co_return folly::makeUnexpected(publishNamespaceResult.error());
   } else {
     MOQ_PUBLISHER_STATS(publisherStatsCallback_, onPublishNamespaceSuccess);
@@ -1450,10 +1449,8 @@ MoQRelaySession::subscribeNamespace(
 
   auto subAnnResult = co_await std::move(contract.second);
   if (subAnnResult.hasError()) {
-    MOQ_SUBSCRIBER_STATS(
-        subscriberStatsCallback_,
-        onSubscribeNamespaceError,
-        subAnnResult.error().errorCode);
+    // Reported at the parse site or by onRequestFailedLocally; see
+    // publishNamespace() above.
     co_return folly::makeUnexpected(subAnnResult.error());
   } else {
     MOQ_SUBSCRIBER_STATS(subscriberStatsCallback_, onSubscribeNamespaceSuccess);
@@ -1809,6 +1806,10 @@ MoQRelaySession::subscribeTracks(
 
   auto subTracksResult = co_await std::move(contract.second);
   if (subTracksResult.hasError()) {
+    // Unlike the namespace requests above, SUBSCRIBE_TRACKS has no error frame
+    // type of its own -- it arrives as REQUEST_ERROR, which shares a value with
+    // SUBSCRIBE_ERROR -- so notifyRequestError cannot tell it apart and this
+    // stays a direct call for now.
     MOQ_SUBSCRIBER_STATS(
         subscriberStatsCallback_,
         onSubscribeTracksError,

@@ -50,6 +50,23 @@ class MoQSessionObserver {
    * Which side of the wire an event happened on. Sent means this endpoint
    * produced the message (MLogger's ControlMessageType::CREATED); Received
    * means it came off the wire (ControlMessageType::PARSED).
+   *
+   * Where a control event fires relative to validation is part of the
+   * contract, because the two directions want opposite things:
+   *
+   *   Received: reported straight after parse, BEFORE request-ID validation,
+   *     GOAWAY checks or any other early return. A consumer needs to see the
+   *     requests this session rejects, not just the ones it accepts -- an
+   *     access log that cannot log its 4xx is not an access log.
+   *
+   *   Sent: reported AFTER the frame has been written. A message whose
+   *     serialization failed never reached the peer, so reporting it would
+   *     describe something that did not happen.
+   *
+   * The old code was not consistent about this: the stats callback and the
+   * mlog record for the same event sometimes sat on opposite sides of a
+   * validation check or a write. Collapsing them onto one notification forces
+   * a single answer, and this is it.
    */
   enum class Direction : uint8_t { Sent, Received };
 
@@ -177,6 +194,28 @@ class MoQSessionObserver {
   virtual void onGoaway(Direction, const Goaway&) {}
   virtual void onMaxRequestID(Direction, uint64_t) {}
   virtual void onRequestsBlocked(Direction, uint64_t) {}
+
+  /*
+   * A request that failed without an error frame arriving from the peer: the
+   * session was draining, a GOAWAY had been received, a joining FETCH could
+   * not be resolved, the send failed, or the session was torn down while the
+   * request was still outstanding.
+   *
+   * The FrameType is the *error* frame type this request would have produced
+   * (SUBSCRIBE_ERROR, FETCH_ERROR, ...), matching both
+   * PendingRequestState::getErrorFrameType() and notifyRequestError(), so
+   * locally- and remotely-sourced failures are described the same way.
+   *
+   * This is deliberately not reported as an error in either Direction. Nothing
+   * was sent, so Direction::Sent would describe a frame that does not exist,
+   * and nothing arrived, so Direction::Received would be a fabrication.
+   *
+   * It is terminal on arrival: because the request never reached the peer, no
+   * response can ever match it, so an observer must complete it here rather
+   * than opening a pending entry that would dangle for the life of the
+   * session.
+   */
+  virtual void onRequestFailedLocally(FrameType, const RequestError&) {}
 
   // ---- Subscription lifecycle -------------------------------------------
 
