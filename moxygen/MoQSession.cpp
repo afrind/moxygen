@@ -2653,9 +2653,6 @@ void MoQSession::goaway(Goaway goaway) {
     if (draft18OrLater) {
       goaway.requestID = RequestID(nextPeerRequestIDForGoaway_);
     }
-    if (logger_) {
-      logger_->logGoaway(goaway);
-    }
     auto res = moqFrameWriter_.writeGoaway(controlWriteBuf_, goaway);
     if (!res) {
       XLOG(ERR) << "writeGoaway failed sess=" << this;
@@ -2665,6 +2662,10 @@ void MoQSession::goaway(Goaway goaway) {
       scheduleGoawayTimeout(goaway.timeout);
     }
     controlWriteEvent_.signal();
+    MOQ_OBSERVE(
+        observers_,
+        kControl,
+        onGoaway(MoQSessionObserver::Direction::Sent, goaway));
     drain();
   }
 }
@@ -2896,12 +2897,13 @@ void MoQSession::onServerSetup(Setup serverSetup) {
   XCHECK(dir_ == MoQControlCodec::Direction::CLIENT);
   XLOG(DBG1) << __func__ << " sess=" << this;
 
-  if (logger_) {
-    logger_->logServerSetup(
-        serverSetup,
-        negotiatedVersion_.value_or(kVersionDraft14),
-        ControlMessageType::PARSED);
-  }
+  MOQ_OBSERVE(
+      observers_,
+      kControl,
+      onServerSetup(
+          MoQSessionObserver::Direction::Received,
+          serverSetup,
+          negotiatedVersion_.value_or(kVersionDraft14)));
 
   // Validate that server MUST NOT send AUTHORITY parameter
   auto authorityParam = std::find_if(
@@ -2936,12 +2938,13 @@ void MoQSession::onClientSetup(Setup clientSetup) {
   XCHECK(dir_ == MoQControlCodec::Direction::SERVER);
   XLOG(DBG1) << __func__ << " sess=" << this;
 
-  if (logger_) {
-    logger_->logClientSetup(
-        clientSetup,
-        negotiatedVersion_.value_or(kVersionDraft14),
-        ControlMessageType::PARSED);
-  }
+  MOQ_OBSERVE(
+      observers_,
+      kControl,
+      onClientSetup(
+          MoQSessionObserver::Direction::Received,
+          clientSetup,
+          negotiatedVersion_.value_or(kVersionDraft14)));
 
   auto moqtImplementation = getMoQTImplementationIfPresent(clientSetup.params);
   if (moqtImplementation) {
@@ -4039,14 +4042,12 @@ void MoQSession::onSubscribeImpl(
   XLOG(DBG1) << __func__ << " ftn=" << subscribeRequest.fullTrackName
              << " sess=" << this;
   const auto requestID = subscribeRequest.requestID;
+  MOQ_OBSERVE(
+      observers_,
+      kControl,
+      onSubscribe(MoQSessionObserver::Direction::Received, subscribeRequest));
   if (closeSessionIfRequestIDInvalid(requestID, false, true)) {
     return;
-  }
-  if (logger_) {
-    logger_->logSubscribe(
-        subscribeRequest,
-        MOQTByteStringType::STRING_VALUE,
-        ControlMessageType::PARSED);
   }
   if (shouldRejectNewPeerRequestDueToGoaway()) {
     XLOG(DBG1) << "Rejecting subscribe request, GOAWAY/draining sess=" << this;
@@ -4374,9 +4375,10 @@ void MoQSession::onUnsubscribe(Unsubscribe unsubscribe) {
 void MoQSession::onPublishOk(PublishOk publishOk) {
   XLOG(DBG1) << __func__ << " reqID=" << publishOk.requestID
              << " sess=" << this;
-  if (logger_) {
-    logger_->logPublishOk(publishOk, ControlMessageType::PARSED);
-  }
+  MOQ_OBSERVE(
+      observers_,
+      kControl,
+      onPublishOk(MoQSessionObserver::Direction::Received, publishOk));
   auto pubIt = pendingRequests_.find(publishOk.requestID);
   if (pubIt == pendingRequests_.end()) {
     XLOG(ERR) << "No matching publish reqID=" << publishOk.requestID
@@ -4877,10 +4879,11 @@ void MoQSession::removeSubscriptionState(TrackAlias alias, RequestID id) {
 void MoQSession::onMaxRequestID(MaxRequestID maxRequestID) {
   XLOG(DBG1) << __func__ << " sess=" << this;
 
-  if (logger_) {
-    logger_->logMaxRequestId(
-        maxRequestID.requestID.value, ControlMessageType::PARSED);
-  }
+  MOQ_OBSERVE(
+      observers_,
+      kControl,
+      onMaxRequestID(
+          MoQSessionObserver::Direction::Received, maxRequestID.requestID.value));
 
   if (maxRequestID.requestID.value > peerMaxRequestID_) {
     XLOG(DBG1) << fmt::format(
@@ -4903,10 +4906,12 @@ void MoQSession::onRequestsBlocked(RequestsBlocked requestsBlocked) {
   // Increment the maxRequestID_ by the number of pending closed subscribes
   // and send a new MaxRequestID.
 
-  if (logger_) {
-    logger_->logRequestsBlocked(
-        requestsBlocked.maxRequestID.value, ControlMessageType::PARSED);
-  }
+  MOQ_OBSERVE(
+      observers_,
+      kControl,
+      onRequestsBlocked(
+          MoQSessionObserver::Direction::Received,
+          requestsBlocked.maxRequestID.value));
 
   if (requestsBlocked.maxRequestID >= maxRequestID_ && closedRequests_ > 0) {
     maxRequestID_ += (closedRequests_ * getRequestIDMultiplier());
@@ -4929,10 +4934,8 @@ void MoQSession::onFetchImpl(
   XLOG(DBG1) << __func__ << " (" << logStr << ") sess=" << this;
   const auto requestID = fetch.requestID;
 
-  if (logger_) {
-    logger_->logFetch(
-        fetch, MOQTByteStringType::STRING_VALUE, ControlMessageType::PARSED);
-  }
+  MOQ_OBSERVE(
+      observers_, kControl, onFetch(MoQSessionObserver::Direction::Received, fetch));
 
   if (closeSessionIfRequestIDInvalid(requestID, false, true)) {
     return;
@@ -5075,12 +5078,12 @@ folly::coro::Task<void> MoQSession::handleFetch(
 
 void MoQSession::onFetchCancel(FetchCancel fetchCancel) {
   XLOG(DBG1) << __func__ << " id=" << fetchCancel.requestID << " sess=" << this;
+  MOQ_OBSERVE(
+      observers_,
+      kControl,
+      onFetchCancel(MoQSessionObserver::Direction::Received, fetchCancel));
   if (closeSessionIfRequestIDInvalid(fetchCancel.requestID, false, false)) {
     return;
-  }
-
-  if (logger_) {
-    logger_->logFetchCancel(fetchCancel, ControlMessageType::PARSED);
   }
 
   auto pubTrackIt = pubTracks_.find(fetchCancel.requestID);
@@ -5220,14 +5223,14 @@ void MoQSession::trackStatusOk(
   auto res = moqFrameWriter_.writeTrackStatusOk(
       replyContext.writeBuf(), trackStatusOk);
 
-  if (logger_) {
-    logger_->logTrackStatusOk(trackStatusOk);
-  }
-
   if (!res) {
     XLOG(ERR) << "trackStatusOk failed sess=" << this;
   } else {
     replyContext.flushFinal();
+    MOQ_OBSERVE(
+        observers_,
+        kControl,
+        onTrackStatusOk(MoQSessionObserver::Direction::Sent, trackStatusOk));
   }
 }
 
@@ -5237,14 +5240,15 @@ void MoQSession::trackStatusError(
   auto res = moqFrameWriter_.writeTrackStatusError(
       replyContext.writeBuf(), trackStatusError);
 
-  if (logger_) {
-    logger_->logTrackStatusError(trackStatusError);
-  }
-
   if (!res) {
     XLOG(ERR) << "trackStatusError failed sess=" << this;
   } else {
     replyContext.flushFinal();
+    MOQ_OBSERVE(
+        observers_,
+        kControl,
+        onTrackStatusError(
+            MoQSessionObserver::Direction::Sent, trackStatusError));
   }
 }
 
@@ -5381,7 +5385,7 @@ folly::coro::Task<MoQSession::TrackStatusResult> MoQSession::trackStatus(
       // Peer close (FIN or RST) before sending a reply: synthesize
       // TRACK_STATUS_ERROR. (sender control finIsCancellation=true.)
       [this](RequestID id) {
-        onTrackStatusError(
+        handleTrackStatusError(
             TrackStatusError{
                 id,
                 TrackStatusErrorCode::CANCELLED,
@@ -5419,12 +5423,10 @@ void MoQSession::onTrackStatusOk(TrackStatusOk trackStatusOk) {
   auto reqID = trackStatusOk.requestID;
   auto trackStatusIt = pendingRequests_.find(reqID);
 
-  if (logger_) {
-    logger_->logTrackStatusOk(
-        trackStatusOk,
-        MOQTByteStringType::STRING_VALUE,
-        ControlMessageType::PARSED);
-  }
+  MOQ_OBSERVE(
+      observers_,
+      kControl,
+      onTrackStatusOk(MoQSessionObserver::Direction::Received, trackStatusOk));
   if (trackStatusIt == pendingRequests_.end()) {
     XLOG(ERR) << __func__
               << " Couldn't find a pending TrackStatusRequest for reqID="
@@ -5449,17 +5451,25 @@ void MoQSession::onTrackStatusOk(TrackStatusOk trackStatusOk) {
 }
 
 void MoQSession::onTrackStatusError(TrackStatusError trackStatusError) {
+  // Reached only when a TRACK_STATUS_ERROR frame was parsed off the wire
+  // (pre-draft-18; from 18 on the error arrives as REQUEST_ERROR and is
+  // reported by notifyRequestError). The peer-close synthesis path calls
+  // handleTrackStatusError directly, because a request the peer abandoned
+  // without replying did not produce a received frame to report.
+  MOQ_OBSERVE(
+      observers_,
+      kControl,
+      onTrackStatusError(
+          MoQSessionObserver::Direction::Received, trackStatusError));
+  handleTrackStatusError(std::move(trackStatusError));
+}
+
+void MoQSession::handleTrackStatusError(TrackStatusError trackStatusError) {
   XLOG(DBG1) << __func__ << " id=" << trackStatusError.requestID
              << " sess=" << this;
   auto reqID = trackStatusError.requestID;
   auto trackStatusIt = pendingRequests_.find(reqID);
 
-  if (logger_) {
-    logger_->logTrackStatusError(
-        trackStatusError,
-        MOQTByteStringType::STRING_VALUE,
-        ControlMessageType::PARSED);
-  }
   if (trackStatusIt == pendingRequests_.end()) {
     XLOG(ERR) << __func__
               << " Couldn't find a pending TrackStatusRequest for reqID="
@@ -5486,9 +5496,10 @@ void MoQSession::onTrackStatusError(TrackStatusError trackStatusError) {
 void MoQSession::onGoaway(Goaway goaway) {
   XLOG(DBG1) << __func__ << " sess=" << this;
 
-  if (logger_) {
-    logger_->logGoaway(goaway, ControlMessageType::PARSED);
-  }
+  MOQ_OBSERVE(
+      observers_,
+      kControl,
+      onGoaway(MoQSessionObserver::Direction::Received, goaway));
   if (receivedGoaway_) {
     XLOG(ERR) << "Received multiple GOAWAYs sess=" << this;
     close(SessionCloseErrorCode::PROTOCOL_VIOLATION);
@@ -5636,10 +5647,8 @@ Subscriber::PublishResult MoQSession::publish(
             std::nullopt,
             std::move(sendError.webTransportError)});
   }
-  if (logger_) {
-    logger_->logPublish(
-        pub, MOQTByteStringType::STRING_VALUE, ControlMessageType::CREATED);
-  }
+  MOQ_OBSERVE(
+      observers_, kControl, onPublish(MoQSessionObserver::Direction::Sent, pub));
 
   auto trackPublisher = std::make_shared<TrackPublisherImpl>(
       this,
@@ -6196,13 +6205,14 @@ void MoQSession::sendMaxRequestID(bool signalWriteLoop) {
     return;
   }
 
-  if (logger_) {
-    logger_->logMaxRequestId(maxRequestID_);
-  }
-
   if (signalWriteLoop) {
     controlWriteEvent_.signal();
   }
+
+  MOQ_OBSERVE(
+      observers_,
+      kControl,
+      onMaxRequestID(MoQSessionObserver::Direction::Sent, maxRequestID_));
 }
 
 void MoQSession::PublisherImpl::fetchComplete() {
@@ -7244,12 +7254,11 @@ void MoQSession::onRequestOk(RequestOk requestOk, FrameType frameType) {
 
 void MoQSession::onPublishNamespaceDone(
     PublishNamespaceDone publishNamespaceDone) {
-  if (logger_) {
-    logger_->logPublishNamespaceDone(
-        publishNamespaceDone,
-        MOQTByteStringType::STRING_VALUE,
-        ControlMessageType::PARSED);
-  }
+  MOQ_OBSERVE(
+      observers_,
+      kControl,
+      onPublishNamespaceDone(
+          MoQSessionObserver::Direction::Received, publishNamespaceDone));
 
   XLOG(DBG1)
       << "Received PublishNamespaceDone on base session - ignoring, sess="

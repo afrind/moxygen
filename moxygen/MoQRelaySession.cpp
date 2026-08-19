@@ -843,10 +843,6 @@ MoQRelaySession::publishNamespace(
     std::shared_ptr<PublishNamespaceCallback> publishNamespaceCallback) {
   XLOG(DBG1) << __func__ << " ns=" << ann.trackNamespace << " sess=" << this;
 
-  if (logger_) {
-    logger_->logPublishNamespace(ann);
-  }
-
   auto publishNamespaceStartTime = std::chrono::steady_clock::now();
   SCOPE_EXIT {
     auto duration =
@@ -890,6 +886,10 @@ MoQRelaySession::publishNamespace(
          PublishNamespaceErrorCode::INTERNAL_ERROR,
          std::move(sendResult.error().reasonPhrase)}));
   }
+  MOQ_OBSERVE(
+      observers_,
+      kControl,
+      onPublishNamespace(MoQSessionObserver::Direction::Sent, ann));
   auto control = sendResult.value();
   auto replyCtx = makeReplyContext(control);
   auto contract = folly::coro::makePromiseContract<
@@ -1142,10 +1142,10 @@ void MoQRelaySession::onPublishNamespaceImpl(
     std::shared_ptr<ReplyContext> replyContext) {
   XLOG(DBG1) << __func__ << " ns=" << ann.trackNamespace << " sess=" << this;
 
-  if (logger_) {
-    logger_->logPublishNamespace(
-        ann, MOQTByteStringType::STRING_VALUE, ControlMessageType::PARSED);
-  }
+  MOQ_OBSERVE(
+      observers_,
+      kControl,
+      onPublishNamespace(MoQSessionObserver::Direction::Received, ann));
 
   if (closeSessionIfRequestIDInvalid(ann.requestID, false, true)) {
     return;
@@ -1440,9 +1440,10 @@ MoQRelaySession::subscribeNamespace(
          std::move(sendResult.error().reasonPhrase)}));
   }
 
-  if (logger_) {
-    logger_->logSubscribeNamespace(sa);
-  }
+  MOQ_OBSERVE(
+      observers_,
+      kControl,
+      onSubscribeNamespace(MoQSessionObserver::Direction::Sent, sa));
   auto contract = folly::coro::makePromiseContract<
       folly::Expected<SubscribeNamespaceOk, SubscribeNamespaceError>>();
   pendingRequests_.emplace(
@@ -1499,10 +1500,10 @@ void MoQRelaySession::onSubscribeNamespaceImpl(
     std::shared_ptr<SubNSReply> subNsReply) {
   XLOG(DBG1) << __func__ << " prefix=" << sa.trackNamespacePrefix
              << " sess=" << this;
-  if (logger_) {
-    logger_->logSubscribeNamespace(
-        sa, MOQTByteStringType::STRING_VALUE, ControlMessageType::PARSED);
-  }
+  MOQ_OBSERVE(
+      observers_,
+      kControl,
+      onSubscribeNamespace(MoQSessionObserver::Direction::Received, sa));
   if (closeSessionIfRequestIDInvalid(sa.requestID, false, true)) {
     return;
   }

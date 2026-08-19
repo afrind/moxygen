@@ -848,6 +848,9 @@ class MoQSession : public Subscriber,
   void onTrackStatus(TrackStatus trackStatus) override;
   void onTrackStatusOk(TrackStatusOk trackStatusOk) override;
   void onTrackStatusError(TrackStatusError trackStatusError) override;
+  // Shared tail of onTrackStatusError: fails the pending request without
+  // reporting a received error frame. See onTrackStatusError.
+  void handleTrackStatusError(TrackStatusError trackStatusError);
   void onGoaway(Goaway goaway) override;
   void onConnectionError(ErrorCode error) override;
 
