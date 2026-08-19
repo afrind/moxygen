@@ -837,10 +837,8 @@ folly::Expected<folly::Unit, MoQPublishError> StreamPublisherImpl::objectImpl(
   header_.status = ObjectStatus::NORMAL;
 
   if (publisher_) {
-    // Delivery totals for this subscription, reported at onSubscriptionEnd.
-    // objectStream() routes through beginSubgroup()+object(), so counting here
-    // covers both the subgroup and the object-stream paths without double
-    // counting; datagrams are counted separately on their own path.
+    // Counted here so the subgroup and objectStream paths (which routes through
+    // this one) are covered once. Datagrams count on their own path.
     publisher_->countObject(length);
     publisher_->countGroup(header_.group);
 
@@ -895,9 +893,8 @@ folly::Expected<folly::Unit, MoQPublishError> StreamPublisherImpl::beginObject(
   }
   currentLengthRemaining_ = length;
   if (publisher_) {
-    // The full object length is declared up front here, so counting it once at
-    // the start is both correct and avoids double counting the objectPayload()
-    // chunks that follow.
+    // Length is declared up front, so count once here rather than accumulating
+    // the objectPayload() chunks that follow.
     publisher_->countObject(length);
     publisher_->countGroup(header_.group);
   }
@@ -2296,9 +2293,8 @@ class MoQSession::FetchTrackReceiveState
     promise_.setValue(std::move(ok));
   }
 
-  // Returns whether the error was actually delivered. A fetch that already has
-  // its answer swallows the error, and callers need to know that so they do
-  // not report a failure for a request that succeeded.
+  // Returns whether the error reached anyone: a fetch that already has its
+  // answer swallows it, and callers must not report that as a failure.
   bool fetchError(FetchError fetchErr) {
     if (!promise_.isFulfilled()) {
       fetchErr.requestID = requestID_;
@@ -2388,8 +2384,7 @@ MoQSession::PendingRequestState::setError(
     case FrameType::FETCH_ERROR: {
       auto fetchPtr = tryGetFetch();
       if (!fetchPtr || !(*fetchPtr)->fetchError(std::move(error))) {
-        // Either no state, or the fetch already had its answer -- in both
-        // cases this error reached nobody.
+        // No state, or the fetch already had its answer: this reached nobody.
         return folly::makeUnexpected(folly::unit);
       }
       return type_;
@@ -2459,9 +2454,8 @@ MoQSession::MoQSession(
 
 MoQSession::~MoQSession() {
   cleanup();
-  // A session destroyed without an explicit close still has to close the
-  // bracket, otherwise an observer correlating requests to responses keeps
-  // waiting on entries that can never complete.
+  // Destruction without an explicit close must still close the bracket, or an
+  // observer waits forever on entries that can never complete.
   notifySessionEnd();
   if (logger_) {
     logger_->outputLogs();
@@ -2528,10 +2522,8 @@ void MoQSession::cleanup() {
         reqID, RequestErrorCode::INTERNAL_ERROR, "Session closed"};
     auto frameType = pendingState->getErrorFrameType();
     auto res = pendingState->setError(sessionClosed, frameType);
-    // setError fails when the promise was already satisfied, which is how an
-    // entry that has had its answer is told apart from one that is genuinely
-    // still waiting. Reporting only on success keeps this exactly once and
-    // stops teardown inventing failures for completed requests.
+    // setError fails if the promise was already satisfied, so reporting only on
+    // success stops teardown inventing failures for completed requests.
     if (!res.hasError()) {
       MOQ_OBSERVE_CONTROL(
           observers_, onRequestFailedLocally(frameType, sessionClosed));
@@ -2623,9 +2615,8 @@ void MoQSession::start() {
 }
 
 void MoQSession::setLogger(const std::shared_ptr<MLogger>& logger) {
-  // Thin shim over addObserver so out-of-tree callers keep compiling. MLogger
-  // is itself a MoQSessionObserver, so the session notifies it through the
-  // observer list like any other consumer.
+  // Shim over addObserver for out-of-tree callers: MLogger is itself an
+  // observer, notified through the list like any other consumer.
   logger_ = logger;
   if (logger_) {
     observers_->add(logger_);
@@ -2838,9 +2829,8 @@ folly::Expected<folly::Unit, quic::TransportErrorCode> MoQSession::sendSetup(
   }
   initLocalMaxRequestID(maxRequestID);
   controlWriteEvent_.signal();
-  // Reported here rather than by the caller, so both directions of setup pass
-  // through one place and a setup whose serialization failed is not reported
-  // as sent.
+  // Reported here, not by the caller, so both setups pass through one place and
+  // one whose write failed is not reported as sent.
   if (isClient) {
     MOQ_OBSERVE_CONTROL(
         observers_,
@@ -3288,9 +3278,8 @@ void MoQSession::failPendingRequestOnEarlyClose(
   if (res.hasError()) {
     XLOG(ERR) << "setError failure id=" << requestID << " sess=" << this;
   } else {
-    // The peer closed the request stream instead of replying, so no error
-    // frame will arrive. Reported only when the error actually reached a
-    // waiting requester, so this stays exactly once per request.
+    // No error frame will arrive -- the peer closed instead of replying.
+    // Reported only when it reached a waiter, keeping this exactly once.
     MOQ_OBSERVE_CONTROL(
         observers_, onRequestFailedLocally(frameType, earlyClose));
   }
@@ -3588,9 +3577,8 @@ class ObjectStreamCallback : public MoQObjectStreamCodec::ObjectCallback {
       return MoQCodec::ParseResult::ERROR_TERMINATE;
     }
 
-    // An object split across payload frames is reported by onObjectPayload
-    // when the last frame lands, so the header is stashed rather than sent
-    // twice. Building it at all is worth skipping when nobody wants the tier.
+    // A split object is reported by onObjectPayload on its last frame, so
+    // stash the header. Skip building it if nobody listens.
     if (session_->observers()->interested(MoQSessionObserver::kObject)) {
       ObjectHeader obj = ObjectHeader();
       obj.id = objectID;
@@ -4268,8 +4256,7 @@ void MoQSession::setPublisherPriorityFromParams(
 void MoQSession::onRequestUpdate(RequestUpdate requestUpdate) {
   XLOG(DBG1) << __func__ << " id=" << requestUpdate.requestID
              << " sess=" << this;
-  // Received messages are reported before validation, so an observer sees the
-  // requests this session rejects as well as the ones it accepts.
+  // Reported before validation, so observers see rejected requests too.
   MOQ_OBSERVE_CONTROL(
       observers_,
       onRequestUpdate(MoQSessionObserver::Direction::Received, requestUpdate));
@@ -4444,8 +4431,7 @@ void MoQSession::onRequestError(RequestError error, FrameType frameType) {
              << " frameType=" << folly::to_underlying(frameType)
              << " sess=" << this;
 
-  // Report the received error frame exactly once, whether or not a pending
-  // request is still waiting on it.
+  // Report the received error frame once, waiter or not.
   auto g = folly::makeGuard([&] {
     notifyRequestError(
         observers_, error, frameType, MoQSessionObserver::Direction::Received);
@@ -5466,11 +5452,9 @@ void MoQSession::onTrackStatusOk(TrackStatusOk trackStatusOk) {
 }
 
 void MoQSession::onTrackStatusError(TrackStatusError trackStatusError) {
-  // Reached only when a TRACK_STATUS_ERROR frame was parsed off the wire
-  // (pre-draft-18; from 18 on the error arrives as REQUEST_ERROR and is
-  // reported by notifyRequestError). The peer-close synthesis path calls
-  // handleTrackStatusError directly, because a request the peer abandoned
-  // without replying did not produce a received frame to report.
+  // Only for a TRACK_STATUS_ERROR parsed off the wire (pre-draft-18; from 18 it
+  // arrives as REQUEST_ERROR via notifyRequestError). The peer-close path calls
+  // handleTrackStatusError directly -- no frame arrived, so none is reported.
   MOQ_OBSERVE_CONTROL(
       observers_,
       onTrackStatusError(
@@ -5858,8 +5842,7 @@ folly::coro::Task<Publisher::SubscribeResult> MoQSession::subscribe(
         onRequestFailedLocally(FrameType::SUBSCRIBE_ERROR, subscribeError));
     co_return folly::makeUnexpected(subscribeError);
   }
-  // The request is on the wire now, so this is the first point at which a
-  // response can ever match it.
+  // On the wire now: the first point a response can match it.
   MOQ_OBSERVE_CONTROL(
       observers_, onSubscribe(MoQSessionObserver::Direction::Sent, sub));
   auto control = std::move(sendResult.value());
@@ -5889,8 +5872,7 @@ folly::coro::Task<Publisher::SubscribeResult> MoQSession::subscribe(
   XLOG(DBG1) << "Subscribe ready trackReceiveState=" << trackReceiveState
              << " requestID=" << reqID;
   if (subscribeResult.hasError()) {
-    // The SUBSCRIBE_ERROR is reported where it is parsed off the wire, not
-    // here, so that it fires exactly once whether or not anyone is awaiting.
+    // Already reported at its origin; do not report it again here.
     co_return folly::makeUnexpected(subscribeResult.error());
   } else {
     MOQ_OBSERVE_SUBSCRIPTION(
@@ -5911,10 +5893,6 @@ void MoQSession::sendSubscribeOk(const SubscribeOk& subOk, ReplyContext& ctx) {
     return;
   }
 
-  // The stats callback used to fire before this write and the log after it.
-  // Collapsing them onto one notification means picking a point; after the
-  // successful write is the defensible one, since an observer should not see
-  // a message that never went out.
   MOQ_OBSERVE_CONTROL(
       observers_, onSubscribeOk(MoQSessionObserver::Direction::Sent, subOk));
 
@@ -6004,11 +5982,9 @@ void MoQSession::unsubscribe(
 }
 
 void MoQSession::notifySessionEnd() {
-  // Fires exactly once, whichever of close() or destruction happens first.
-  // Observers that correlate a received request against the response we send
-  // rely on this to bound entries whose response never went out -- a failed
-  // response write leaves the peer's request unanswered and, without this,
-  // pending forever.
+  // Fires once, from whichever of close() or destruction comes first. Without
+  // it, an observer correlating requests to responses waits forever on a
+  // request whose response write failed.
   if (sessionEndNotified_) {
     return;
   }
@@ -6025,9 +6001,8 @@ MoQSessionObserver::SubscriptionInfo MoQSession::subscriberSubscriptionInfo(
   MoQSessionObserver::SubscriptionInfo info;
   info.requestID = requestID;
   info.role = MoQSessionObserver::Role::Subscriber;
-  // Recover the track identity from the receive state when it is still around.
-  // Callers on the teardown path may run after it has been erased, in which
-  // case the request ID alone is what the observer gets.
+  // Recover track identity from the receive state if it still exists; teardown
+  // callers may run after erase, leaving only the request ID.
   auto aliasIt = reqIdToTrackAlias_.find(requestID);
   if (aliasIt != reqIdToTrackAlias_.end()) {
     info.trackAlias = aliasIt->second;
@@ -6073,8 +6048,7 @@ void MoQSession::sendPublishDone(const PublishDone& pubDone) {
               << " sess=" << this;
     return;
   }
-  // Record why the subscription ended before the bracket closes, so the
-  // counters delivered at onSubscriptionEnd carry the reason.
+  // Record the reason before the bracket closes, so onSubscriptionEnd has it.
   it->second->setEndReason(pubDone.statusCode);
   endSubscriptionStat(*it->second);
   auto* ctx = it->second->replyContext();
@@ -6401,7 +6375,7 @@ folly::coro::Task<Publisher::FetchResult> MoQSession::fetch(
              << " fetchReady trackReceiveState=" << trackReceiveState;
   if (fetchResult.hasError()) {
     XLOG(ERR) << fetchResult.error().reasonPhrase;
-    // The FETCH_ERROR is reported where it is parsed off the wire.
+    // Already reported at its origin; do not report it again here.
     co_return folly::makeUnexpected(fetchResult.error());
   } else {
     co_return std::make_shared<ReceiverFetchHandle>(
@@ -6468,9 +6442,7 @@ void MoQSession::fetchCancel(
     controlWriteEvent_.signal();
   }
 
-  // Reported after the cancel is signalled, on either path. Previously this
-  // was logged at the top of the function, so mlog recorded a FETCH_CANCEL
-  // even when the request ID was unknown and nothing was signalled at all.
+  // After the cancel is signalled, on either path: no signal, no report.
   MOQ_OBSERVE_CONTROL(
       observers_, onFetchCancel(MoQSessionObserver::Direction::Sent, fetchCan));
 }
@@ -7014,9 +6986,8 @@ void MoQSession::initializeNegotiatedVersion(uint64_t negotiatedVersion) {
   }
   subgroupsWaitingForVersion_.clear();
 
-  // The negotiated version is the last piece of session metadata to land, so
-  // this is the point where the session context is complete: the transport
-  // half was supplied by the client before this session existed.
+  // Version is the last metadata to land, so the context is complete here; the
+  // transport half came from the client before this session existed.
   sessionContext_.negotiatedVersion = negotiatedVersion;
   MOQ_OBSERVE_CONTROL(observers_, onSessionStart(sessionContext_));
 }

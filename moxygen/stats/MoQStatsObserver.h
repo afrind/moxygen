@@ -186,9 +186,9 @@ class MoQPublisherStatsObserver : public MoQSessionObserver {
     }
   }
 
-  // A request we refused before sending still counts as that request failing,
-  // which is what the counter meant before these paths were distinguished from
-  // errors that actually came back from the peer.
+  // A request refused before it was sent increments the same failure counter
+  // as an error frame from the peer: to a counter, both are that request
+  // failing.
   void onRequestFailedLocally(FrameType type, const RequestError& err)
       override {
     switch (type) {
@@ -380,8 +380,8 @@ class MoQSubscriberStatsObserver : public MoQSessionObserver {
     }
   }
 
-  // See the publisher adapter: a locally-refused request still increments the
-  // same failure counter it did before.
+  // See the publisher adapter: a locally-refused request increments the same
+  // failure counter as an error frame from the peer.
   void onRequestFailedLocally(FrameType type, const RequestError& err)
       override {
     switch (type) {

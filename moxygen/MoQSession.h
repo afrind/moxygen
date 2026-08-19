@@ -462,8 +462,9 @@ class MoQSession : public Subscriber,
       return subscriptionStartTime_;
     }
 
-    // The owning session's observers, or null once the session is gone. This
-    // is what replaces the MLogger pointer each of these helpers used to hold.
+    // The owning session's observers, or null once the session is gone.
+    // Notifying through a null list is a no-op, so helpers outliving their
+    // session stay safe.
     const std::shared_ptr<MoQSessionObserverList>& observers() const {
       static const std::shared_ptr<MoQSessionObserverList> kNoObservers;
       return session_ ? session_->observers_ : kNoObservers;
@@ -944,10 +945,10 @@ class MoQSession : public Subscriber,
   folly::MaybeManagedPtr<proxygen::WebTransport> wt_;
   std::shared_ptr<MoQExecutor> exec_;
   std::shared_ptr<MLogger> logger_ = nullptr;
-  // The session's observers. Shared with the per-stream and per-track helper
-  // objects below, which used to each carry their own MLogger pointer; holding
-  // the list instead is what lets a second consumer attach without the data
-  // plane growing a second check.
+  // The session's observers, shared with the per-stream and per-track helper
+  // objects below. Holding one list rather than a pointer per consumer is what
+  // lets a second consumer attach without the data plane growing a second
+  // check.
   std::shared_ptr<MoQSessionObserverList> observers_{
       std::make_shared<MoQSessionObserverList>()};
   bool sessionEndNotified_{false};

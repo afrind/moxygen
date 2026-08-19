@@ -898,12 +898,9 @@ MoQRelaySession::publishNamespace(
   pendingRequests_.emplace(ann.requestID, std::move(pending));
   auto publishNamespaceResult = co_await std::move(contract.second);
   if (publishNamespaceResult.hasError()) {
-    // Reported where the error frame is parsed, or by onRequestFailedLocally
-    // when the request fails without one. Reporting it again here would double
-    // count.
+    // Already reported at its origin; do not report it again here.
     co_return folly::makeUnexpected(publishNamespaceResult.error());
   } else {
-    // Reported where PUBLISH_NAMESPACE_OK is parsed; see the error branch.
     co_return std::make_shared<PublisherPublishNamespaceHandle>(
         std::static_pointer_cast<MoQRelaySession>(shared_from_this()),
         trackNamespace,
@@ -1441,12 +1438,9 @@ MoQRelaySession::subscribeNamespace(
 
   auto subAnnResult = co_await std::move(contract.second);
   if (subAnnResult.hasError()) {
-    // Reported at the parse site or by onRequestFailedLocally; see
-    // publishNamespace() above.
+    // Already reported at its origin; do not report it again here.
     co_return folly::makeUnexpected(subAnnResult.error());
   } else {
-    // Reported where SUBSCRIBE_NAMESPACE_OK is parsed, so it fires once
-    // whether or not a coroutine is still awaiting.
     co_return std::make_shared<SubscribeNamespaceHandle>(
         std::static_pointer_cast<MoQRelaySession>(shared_from_this()),
         trackNamespace,
@@ -1796,8 +1790,10 @@ MoQRelaySession::subscribeTracks(
   if (subTracksResult.hasError()) {
     // Unlike the namespace requests above, SUBSCRIBE_TRACKS has no error frame
     // type of its own -- it arrives as REQUEST_ERROR, which shares a value with
-    // SUBSCRIBE_ERROR -- so notifyRequestError cannot tell it apart and this
-    // stays a direct call for now.
+    // SUBSCRIBE_ERROR -- so notifyRequestError cannot tell it apart. Hence the
+    // direct stats call: this is the one event not routed through an observer.
+    // TODO: distinguish the two so this can move to the parse site with the
+    // rest of the error reporting.
     MOQ_SUBSCRIBER_STATS(
         subscriberStatsCallback_,
         onSubscribeTracksError,
@@ -1816,8 +1812,6 @@ MoQRelaySession::subscribeTracks(
     }
     co_return folly::makeUnexpected(subTracksResult.error());
   }
-  // Reported where the REQUEST_OK is parsed, in
-  // handleSubscribeTracksOkFromRequestOk.
   co_return std::make_shared<SubscribeTracksHandle>(
       std::static_pointer_cast<MoQRelaySession>(shared_from_this()),
       std::move(subTracksResult.value()),

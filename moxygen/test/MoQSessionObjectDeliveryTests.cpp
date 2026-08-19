@@ -1292,9 +1292,9 @@ CO_TEST_P_X(MoQSessionTest, NullPayloadWithLogger) {
 
 // === SUBSCRIPTION COUNTERS ===
 //
-// The per-subscription delivery totals are the one piece of instrumentation
-// that is new rather than relocated, so they get their own coverage: nothing
-// in moxygen tracked per-subscription object/byte/group totals before.
+// Per-subscription delivery totals reach onSubscriptionEnd as a single rollup.
+// The counts are accumulated across every publish path, so these pin that each
+// path contributes exactly once.
 
 // Objects published across two groups on the subgroup path must arrive at
 // onSubscriptionEnd as a single rollup, with groups counted once per group
@@ -1409,8 +1409,9 @@ CO_TEST_P_X(MoQSessionTest, SubscriptionCountersCountDatagrams) {
 }
 
 namespace {
-// Collects the object-tier mlog records so the observer migration of the data
-// plane has a regression signal. The control-plane equivalent lives in
+// Collects the object-tier mlog records, so a data-plane change that stops
+// emitting them -- or emits them twice -- fails a test rather than quietly
+// altering operator-facing output. The control-plane equivalent lives in
 // MoQSessionPublishNamespaceTests.
 class ObjectRecordingMLogger : public MLogger {
  public:
@@ -1446,8 +1447,9 @@ class ObjectRecordingMLogger : public MLogger {
     return c;
   }
 
-  // Payload of the Nth parsed subgroup object, so the migration cannot
-  // silently start logging an empty or aliased buffer.
+  // Payload of the Nth parsed subgroup object. MLogger clones the payload
+  // inside its observer override, so this is what catches an empty, truncated
+  // or aliased buffer reaching the log.
   std::string parsedObjectPayload(size_t index) const {
     size_t seen = 0;
     for (const auto& event : logs_) {
@@ -1512,13 +1514,11 @@ CO_TEST_P_X(MoQSessionTest, MLogRecordsObjectTier) {
   // records each one it parses.
   EXPECT_EQ(sent.subgroupHeadersCreated, 2u);
   EXPECT_EQ(received.subgroupHeadersParsed, 2u);
-  // Only the whole-in-one-frame object is reported. The split object is
-  // parsed and delivered to the application, but never recorded: onObjectBegin
-  // stashes its header expecting onObjectPayload to report it, and that report
-  // does not happen. This is pre-existing -- the same assertion fails
-  // identically against the code before the observer migration -- so it is
-  // pinned here rather than fixed, to keep the migration behaviour-neutral and
-  // to make the gap visible.
+  // Only the whole-in-one-frame object is reported. An object split across
+  // payload frames is parsed and delivered to the application but never
+  // recorded: onObjectBegin stashes its header expecting onObjectPayload to
+  // report it, and that report does not happen. Pinned at the broken value so
+  // the gap is visible rather than invisible.
   // TODO: report the split object and change this to 2.
   EXPECT_EQ(received.subgroupObjectsParsed, 1u);
   EXPECT_EQ(received.datagramsParsed, 0u);

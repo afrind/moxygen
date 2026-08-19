@@ -62,13 +62,38 @@ class MoQSessionObserver {
    *   Sent: reported AFTER the frame has been written. A message whose
    *     serialization failed never reached the peer, so reporting it would
    *     describe something that did not happen.
-   *
-   * The old code was not consistent about this: the stats callback and the
-   * mlog record for the same event sometimes sat on opposite sides of a
-   * validation check or a write. Collapsing them onto one notification forces
-   * a single answer, and this is it.
    */
   enum class Direction : uint8_t { Sent, Received };
+
+  /*
+   * How a request's failure is reported exactly once.
+   *
+   * A request can fail from exactly one of four origins, and each has a single
+   * reporting site. Anything awaiting the request -- the coroutine in
+   * subscribe(), fetch(), publishNamespace() and friends -- deliberately does
+   * NOT report the failure it observes, because by then the failure has already
+   * been reported by whichever origin produced it. Reporting again there would
+   * double count every error that happens to have someone waiting on it.
+   *
+   *   1. Refused before anything was sent (draining, GOAWAY received, a joining
+   *      FETCH that could not be resolved, a failed write). Reported at the
+   *      refusing site as onRequestFailedLocally, with no pending entry opened.
+   *
+   *   2. The peer closed the request stream instead of replying. Reported by
+   *      failPendingRequestOnEarlyClose, and only when the error actually
+   *      reached a waiting requester.
+   *
+   *   3. The peer sent an error frame. Reported by notifyRequestError at the
+   *      site where the frame is parsed, so it fires once per frame whether or
+   *      not anything is still awaiting it.
+   *
+   *   4. The session was torn down with the request outstanding. Reported by
+   *      cleanup(), and only for entries whose setError succeeded -- an entry
+   *      that already had its answer is not a failure.
+   *
+   * Successful responses follow the same shape: reported where the OK frame is
+   * parsed, not where a coroutine resumes.
+   */
 
   /*
    * Our role in a subscription, for the events that bracket one.
