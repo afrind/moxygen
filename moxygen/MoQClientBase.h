@@ -132,6 +132,11 @@ class MoQClientBase {
   void goaway(const Goaway& goaway);
   std::shared_ptr<MLogger> logger_ = nullptr;
 
+  // Transport metadata gathered while connecting, before a MoQSession exists.
+  // Handed to the session at setup, which merges the negotiated version in and
+  // publishes the whole thing as onSessionStart.
+  MoQSessionObserver::SessionContext transportContext_;
+
  protected:
   virtual folly::coro::Task<std::shared_ptr<quic::QuicClientTransport>>
   connectQuic(

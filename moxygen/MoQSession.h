@@ -344,6 +344,21 @@ class MoQSession : public Subscriber,
     return observers_;
   }
 
+  /*
+   * Transport metadata (addresses, connection IDs) known to the client before
+   * the session exists. Published immediately, and published again once the
+   * negotiated version lands -- see onSessionStart, which is an upsert rather
+   * than a one-shot for exactly this reason. Publishing the transport half
+   * eagerly matters because a session whose handshake never completes still
+   * has to be attributable: MLogger derives its output path from the dcid, so
+   * waiting for version negotiation would lose the log for every failed
+   * handshake.
+   */
+  void setSessionContext(MoQSessionObserver::SessionContext ctx) {
+    sessionContext_ = std::move(ctx);
+    MOQ_OBSERVE(observers_, kControl, onSessionStart(sessionContext_));
+  }
+
   // Installs the stats callback as an observer. Kept so existing callers and
   // the counter tests keep working unchanged; MoQPublisherStatsObserver maps
   // the observer events back onto this interface.
@@ -940,6 +955,9 @@ class MoQSession : public Subscriber,
   std::shared_ptr<MoQSessionObserverList> observers_{
       std::make_shared<MoQSessionObserverList>()};
   bool sessionEndNotified_{false};
+  // Transport metadata supplied by the client before setup; see
+  // setSessionContext.
+  MoQSessionObserver::SessionContext sessionContext_;
 
   // Control channel state
   folly::IOBufQueue controlWriteBuf_{folly::IOBufQueue::cacheChainLength()};

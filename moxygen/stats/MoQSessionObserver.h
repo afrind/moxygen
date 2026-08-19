@@ -141,6 +141,14 @@ class MoQSessionObserver {
 
   // ---- Session lifecycle -------------------------------------------------
 
+  /*
+   * Session metadata. Fires more than once: the transport half (addresses,
+   * connection IDs) is known before version negotiation, and the negotiated
+   * version only after it. Each call carries the fullest context known so far,
+   * so treat it as an upsert of the fields that are set rather than as a
+   * one-shot start event. A session whose handshake fails gets the first call
+   * and not the second.
+   */
   virtual void onSessionStart(const SessionContext&) {}
   virtual void onSessionEnd(std::optional<SessionCloseErrorCode>) {}
 

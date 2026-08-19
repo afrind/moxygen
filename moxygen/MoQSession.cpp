@@ -2858,6 +2858,26 @@ folly::Expected<folly::Unit, quic::TransportErrorCode> MoQSession::sendSetup(
   }
   initLocalMaxRequestID(maxRequestID);
   controlWriteEvent_.signal();
+  // Reported here rather than by the caller, so both directions of setup pass
+  // through one place and a setup whose serialization failed is not reported
+  // as sent.
+  if (isClient) {
+    MOQ_OBSERVE(
+        observers_,
+        kControl,
+        onClientSetup(
+            MoQSessionObserver::Direction::Sent,
+            setup,
+            setupSerializationVersion));
+  } else {
+    MOQ_OBSERVE(
+        observers_,
+        kControl,
+        onServerSetup(
+            MoQSessionObserver::Direction::Sent,
+            setup,
+            setupSerializationVersion));
+  }
   return folly::unit;
 }
 
@@ -7083,10 +7103,10 @@ void MoQSession::initializeNegotiatedVersion(uint64_t negotiatedVersion) {
   subgroupsWaitingForVersion_.clear();
 
   // The negotiated version is the last piece of session metadata to land, so
-  // this is the point where the session context is complete.
-  MoQSessionObserver::SessionContext ctx;
-  ctx.negotiatedVersion = negotiatedVersion;
-  MOQ_OBSERVE(observers_, kControl, onSessionStart(ctx));
+  // this is the point where the session context is complete: the transport
+  // half was supplied by the client before this session existed.
+  sessionContext_.negotiatedVersion = negotiatedVersion;
+  MOQ_OBSERVE(observers_, kControl, onSessionStart(sessionContext_));
 }
 
 /*static*/

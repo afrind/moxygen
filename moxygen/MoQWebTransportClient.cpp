@@ -123,21 +123,18 @@ folly::coro::Task<void> MoQWebTransportClient::setupMoQSession(
       verifier_,
       transportSettings);
 
-  if (logger_) {
-    auto quicInfo = session->getQuicInfo();
-    if (quicInfo) {
-      if (quicInfo->clientConnectionId) {
-        logger_->setSrcCid(*quicInfo->clientConnectionId);
-      }
-      if (quicInfo->serverConnectionId) {
-        logger_->setDcid(*quicInfo->serverConnectionId);
-      }
+  if (auto quicInfo = session->getQuicInfo()) {
+    if (quicInfo->clientConnectionId) {
+      transportContext_.srcCid = *quicInfo->clientConnectionId;
     }
-    logger_->setLocalAddress(
-        quic::toFollySocketAddress(session->getLocalAddress()));
-    logger_->setPeerAddress(
-        quic::toFollySocketAddress(session->getPeerAddress()));
+    if (quicInfo->serverConnectionId) {
+      transportContext_.dcid = *quicInfo->serverConnectionId;
+    }
   }
+  transportContext_.localAddress =
+      quic::toFollySocketAddress(session->getLocalAddress());
+  transportContext_.peerAddress =
+      quic::toFollySocketAddress(session->getPeerAddress());
 
   // Establish WebTransport session
   auto txn = session->newTransaction(&httpHandler_);

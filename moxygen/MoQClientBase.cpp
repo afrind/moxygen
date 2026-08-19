@@ -35,18 +35,16 @@ folly::coro::Task<void> MoQClientBase::connectAndSendSetup(
   transportConnectTime_ = std::chrono::duration_cast<std::chrono::milliseconds>(
       std::chrono::steady_clock::now() - quicConnectStart);
 
-  if (logger_) {
-    if (auto scid = quicClient->getClientConnectionId()) {
-      logger_->setSrcCid(*scid);
-    }
-    if (auto dcid = quicClient->getServerConnectionId()) {
-      logger_->setDcid(*dcid);
-    }
-    logger_->setLocalAddress(
-        quic::toFollySocketAddress(quicClient->getLocalAddress()));
-    logger_->setPeerAddress(
-        quic::toFollySocketAddress(quicClient->getPeerAddress()));
+  if (auto scid = quicClient->getClientConnectionId()) {
+    transportContext_.srcCid = *scid;
   }
+  if (auto dcid = quicClient->getServerConnectionId()) {
+    transportContext_.dcid = *dcid;
+  }
+  transportContext_.localAddress =
+      quic::toFollySocketAddress(quicClient->getLocalAddress());
+  transportContext_.peerAddress =
+      quic::toFollySocketAddress(quicClient->getPeerAddress());
 
   // Detect negotiated ALPN before wrapping the socket
   auto stdAlpn = quicClient->getAppProtocol();
@@ -158,13 +156,9 @@ void MoQClientBase::completeSetupMoQSession(
   moqSession_->setPublishHandler(std::move(publishHandler));
   moqSession_->setSubscribeHandler(std::move(subscribeHandler));
   moqSession_->setLogger(logger_);
+  moqSession_->setSessionContext(transportContext_);
   moqSession_->start();
   ClientSetup clientSetup = getClientSetup(pathParam);
-  if (logger_) {
-    logger_->logClientSetup(
-        clientSetup,
-        moqSession_->getNegotiatedVersion().value_or(kVersionDraft14));
-  }
   moqSession_->sendSetup(clientSetup);
 }
 
