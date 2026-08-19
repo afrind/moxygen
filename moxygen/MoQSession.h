@@ -20,7 +20,9 @@
 #include <moxygen/MoQConsumers.h>
 #include <moxygen/Publisher.h>
 #include <moxygen/Subscriber.h>
+#include <moxygen/stats/MoQSessionObserver.h>
 #include <moxygen/stats/MoQStats.h>
+#include <moxygen/stats/MoQStatsObserver.h>
 #include <memory>
 #include <optional>
 #include "moxygen/mlog/MLogger.h"
@@ -330,30 +332,65 @@ class MoQSession : public Subscriber,
       std::shared_ptr<FetchConsumer> fetchCallback,
       FetchType fetchType);
 
+  /*
+   * Register an observer for this session's lifetime. Observers are notified
+   * in registration order and MUST NOT call back into the session.
+   */
+  void addObserver(std::shared_ptr<MoQSessionObserver> observer) {
+    observers_->add(std::move(observer));
+  }
+
+  const std::shared_ptr<MoQSessionObserverList>& observers() const {
+    return observers_;
+  }
+
+  // Installs the stats callback as an observer. Kept so existing callers and
+  // the counter tests keep working unchanged; MoQPublisherStatsObserver maps
+  // the observer events back onto this interface.
   void setPublisherStatsCallback(
       std::shared_ptr<MoQPublisherStatsCallback> publisherStatsCallback) {
     publisherStatsCallback_ = publisherStatsCallback;
+    if (publisherStatsCallback_) {
+      observers_->add(std::make_shared<MoQPublisherStatsObserver>(
+          publisherStatsCallback_));
+    }
   }
 
   void setSubscriberStatsCallback(
       std::shared_ptr<MoQSubscriberStatsCallback> subscriberStatsCallback) {
     subscriberStatsCallback_ = subscriberStatsCallback;
+    if (subscriberStatsCallback_) {
+      observers_->add(std::make_shared<MoQSubscriberStatsObserver>(
+          subscriberStatsCallback_));
+    }
   }
 
   void onSubscriptionStreamOpenedByPeer() {
-    MOQ_SUBSCRIBER_STATS(subscriberStatsCallback_, onSubscriptionStreamOpened);
+    MOQ_OBSERVE(
+        observers_,
+        kSubscription,
+        onSubscriptionStreamOpened(MoQSessionObserver::Direction::Received));
   }
 
   void onSubscriptionStreamClosedByPeer() {
-    MOQ_SUBSCRIBER_STATS(subscriberStatsCallback_, onSubscriptionStreamClosed);
+    MOQ_OBSERVE(
+        observers_,
+        kSubscription,
+        onSubscriptionStreamClosed(MoQSessionObserver::Direction::Received));
   }
 
   void onSubscriptionStreamOpened() {
-    MOQ_PUBLISHER_STATS(publisherStatsCallback_, onSubscriptionStreamOpened);
+    MOQ_OBSERVE(
+        observers_,
+        kSubscription,
+        onSubscriptionStreamOpened(MoQSessionObserver::Direction::Sent));
   }
 
   void onSubscriptionStreamClosed() {
-    MOQ_PUBLISHER_STATS(publisherStatsCallback_, onSubscriptionStreamClosed);
+    MOQ_OBSERVE(
+        observers_,
+        kSubscription,
+        onSubscriptionStreamClosed(MoQSessionObserver::Direction::Sent));
   }
 
   class PublisherImpl : public std::enable_shared_from_this<PublisherImpl> {
@@ -383,6 +420,35 @@ class MoQSession : public Subscriber,
     }
     RequestID requestID() const {
       return requestID_;
+    }
+
+    /*
+     * Per-subscription delivery totals, reported once at onSubscriptionEnd.
+     * Accumulated on the session's own executor, so plain non-atomic adds.
+     */
+    const MoQSessionObserver::SubscriptionCounters& counters() const {
+      return counters_;
+    }
+    void countObject(uint64_t bytes) {
+      counters_.objects++;
+      counters_.bytes += bytes;
+    }
+    void countPayloadBytes(uint64_t bytes) {
+      counters_.bytes += bytes;
+    }
+    // Groups are counted by observing the group ID change rather than by
+    // counting subgroups, so a group split across several subgroups counts once.
+    void countGroup(uint64_t groupID) {
+      if (!lastCountedGroup_ || *lastCountedGroup_ != groupID) {
+        lastCountedGroup_ = groupID;
+        counters_.groups++;
+      }
+    }
+    void setEndReason(PublishDoneStatusCode statusCode) {
+      counters_.endReason = statusCode;
+    }
+    std::chrono::steady_clock::time_point subscriptionStartTime() const {
+      return subscriptionStartTime_;
     }
     uint8_t subPriority() const {
       return subPriority_;
@@ -533,6 +599,10 @@ class MoQSession : public Subscriber,
     std::shared_ptr<ReplyContext> replyContext_;
     std::shared_ptr<BidiStreamControl> bidiControl_;
     State state_{State::PENDING};
+    MoQSessionObserver::SubscriptionCounters counters_;
+    std::optional<uint64_t> lastCountedGroup_;
+    std::chrono::steady_clock::time_point subscriptionStartTime_{
+        std::chrono::steady_clock::now()};
   };
 
   void onNewUniStream(
@@ -725,6 +795,10 @@ class MoQSession : public Subscriber,
 
   void beginSubscriptionStat(PublisherImpl& pubTrack);
   void endSubscriptionStat(PublisherImpl& pubTrack);
+  static MoQSessionObserver::SubscriptionInfo publisherSubscriptionInfo(
+      PublisherImpl& pubTrack);
+  MoQSessionObserver::SubscriptionInfo subscriberSubscriptionInfo(
+      RequestID requestID);
 
   folly::coro::Task<void> handleFetch(
       Fetch fetch,
@@ -848,6 +922,12 @@ class MoQSession : public Subscriber,
   folly::MaybeManagedPtr<proxygen::WebTransport> wt_;
   std::shared_ptr<MoQExecutor> exec_;
   std::shared_ptr<MLogger> logger_ = nullptr;
+  // The session's observers. Shared with the per-stream and per-track helper
+  // objects below, which used to each carry their own MLogger pointer; holding
+  // the list instead is what lets a second consumer attach without the data
+  // plane growing a second check.
+  std::shared_ptr<MoQSessionObserverList> observers_{
+      std::make_shared<MoQSessionObserverList>()};
 
   // Control channel state
   folly::IOBufQueue controlWriteBuf_{folly::IOBufQueue::cacheChainLength()};

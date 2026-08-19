@@ -209,6 +209,19 @@ class MoQSessionObserver {
    */
   virtual void onObjectAckLatency(std::chrono::microseconds) {}
 
+  /*
+   * Request-to-response latency, measured by the session at the point the
+   * response lands. SubscriptionInfo::startTime lets an observer derive its
+   * own timings for subscriptions, but these requests are not all
+   * subscriptions and the session already has the measurement in hand, so
+   * reporting it directly avoids making every observer keep a pending-request
+   * map just to recover a number the session already computed.
+   */
+  virtual void onSubscribeLatency(std::chrono::milliseconds) {}
+  virtual void onFetchLatency(std::chrono::milliseconds) {}
+  virtual void onPublishLatency(std::chrono::milliseconds) {}
+  virtual void onPublishNamespaceLatency(std::chrono::milliseconds) {}
+
   // ---- Object tier (HOT: gated on Interest::kObject) ---------------------
 
   virtual void onStreamTypeSet(Direction, uint64_t, ObservedStreamType) {}

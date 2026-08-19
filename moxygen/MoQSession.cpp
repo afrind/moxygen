@@ -2124,8 +2124,17 @@ class MoQSession::SubscribeTrackReceiveState
             << "deliverPublishDoneAndRemove: Delivering PUBLISH_DONE to app; statusCode="
             << folly::to_underlying(pendingPublishDone_->statusCode)
             << " alias=" << alias_ << " requestID=" << requestID_;
-        MOQ_SUBSCRIBER_STATS(
-            session_->subscriberStatsCallback_, onSubscriptionEnd);
+        MoQSessionObserver::SubscriptionInfo info;
+        info.requestID = requestID_;
+        info.fullTrackName = fullTrackName();
+        info.trackAlias = alias_;
+        info.role = MoQSessionObserver::Role::Subscriber;
+        MoQSessionObserver::SubscriptionCounters counters;
+        counters.endReason = pendingPublishDone_->statusCode;
+        MOQ_OBSERVE(
+            session_->observers_,
+            kSubscription,
+            onSubscriptionEnd(info, counters));
         auto token = cancelSource_.getToken();
         auto cb = std::exchange(callback_, nullptr);
         cb->publishDone(std::move(*pendingPublishDone_));
@@ -2549,7 +2558,13 @@ void MoQSession::start() {
 }
 
 void MoQSession::setLogger(const std::shared_ptr<MLogger>& logger) {
+  // Thin shim over addObserver so out-of-tree callers keep compiling. MLogger
+  // is itself a MoQSessionObserver, so the session notifies it through the
+  // observer list like any other consumer.
   logger_ = logger;
+  if (logger_) {
+    observers_->add(logger_);
+  }
 }
 
 std::shared_ptr<MLogger> MoQSession::getLogger() const {
@@ -4438,9 +4453,10 @@ void MoQSession::onRequestError(RequestError error, FrameType frameType) {
 void MoQSession::onSubscribeOk(SubscribeOk subOk) {
   XLOG(DBG1) << __func__ << " id=" << subOk.requestID << " sess=" << this;
 
-  if (logger_) {
-    logger_->logSubscribeOk(subOk, ControlMessageType::PARSED);
-  }
+  MOQ_OBSERVE(
+      observers_,
+      kControl,
+      onSubscribeOk(MoQSessionObserver::Direction::Received, subOk));
 
   auto it = pendingRequests_.find(subOk.requestID);
   if (it == pendingRequests_.end()) {
@@ -5619,8 +5635,14 @@ Subscriber::PublishResult MoQSession::publish(
 
 void MoQSession::publishOk(const PublishOk& pubOk, ReplyContext& replyContext) {
   XLOG(DBG1) << __func__ << " reqID=" << pubOk.requestID << " sess=" << this;
-  MOQ_SUBSCRIBER_STATS(subscriberStatsCallback_, onPublishOk);
-  MOQ_SUBSCRIBER_STATS(subscriberStatsCallback_, onSubscriptionBegin);
+  MOQ_OBSERVE(
+      observers_,
+      kControl,
+      onPublishOk(MoQSessionObserver::Direction::Sent, pubOk));
+  MOQ_OBSERVE(
+      observers_,
+      kSubscription,
+      onSubscriptionBegin(subscriberSubscriptionInfo(pubOk.requestID)));
 
   if (logger_) {
     logger_->logPublishOk(pubOk, ControlMessageType::CREATED);
@@ -5780,8 +5802,10 @@ folly::coro::Task<Publisher::SubscribeResult> MoQSession::subscribe(
         subscribeResult.error().errorCode);
     co_return folly::makeUnexpected(subscribeResult.error());
   } else {
-    MOQ_SUBSCRIBER_STATS(subscriberStatsCallback_, onSubscribeSuccess);
-    MOQ_SUBSCRIBER_STATS(subscriberStatsCallback_, onSubscriptionBegin);
+    MOQ_OBSERVE(
+        observers_,
+        kSubscription,
+        onSubscriptionBegin(subscriberSubscriptionInfo(reqID)));
     co_return std::make_shared<ReceiverSubscriptionHandle>(
         std::move(subscribeResult.value()),
         trackAlias,
@@ -5792,16 +5816,20 @@ folly::coro::Task<Publisher::SubscribeResult> MoQSession::subscribe(
 
 void MoQSession::sendSubscribeOk(const SubscribeOk& subOk, ReplyContext& ctx) {
   XLOG(DBG1) << __func__ << " sess=" << this;
-  MOQ_PUBLISHER_STATS(publisherStatsCallback_, onSubscribeSuccess);
   auto res = moqFrameWriter_.writeSubscribeOk(ctx.writeBuf(), subOk);
   if (!res) {
     XLOG(ERR) << "writeSubscribeOk failed sess=" << this;
     return;
   }
 
-  if (logger_) {
-    logger_->logSubscribeOk(subOk);
-  }
+  // The stats callback used to fire before this write and the log after it.
+  // Collapsing them onto one notification means picking a point; after the
+  // successful write is the defensible one, since an observer should not see
+  // a message that never went out.
+  MOQ_OBSERVE(
+      observers_,
+      kControl,
+      onSubscribeOk(MoQSessionObserver::Direction::Sent, subOk));
 
   ctx.flush();
 }
@@ -5857,7 +5885,15 @@ void MoQSession::unsubscribe(
   // cancel() should send STOP_SENDING on any open streams for this
   // subscription
   if (trackIt->second->getSubscribeCallback()) {
-    MOQ_SUBSCRIBER_STATS(subscriberStatsCallback_, onSubscriptionEnd);
+    MoQSessionObserver::SubscriptionInfo info;
+    info.requestID = unsubscribe.requestID;
+    info.fullTrackName = trackIt->second->fullTrackName();
+    info.trackAlias = trackAliasIt->second;
+    info.role = MoQSessionObserver::Role::Subscriber;
+    MOQ_OBSERVE(
+        observers_,
+        kSubscription,
+        onSubscriptionEnd(info, MoQSessionObserver::SubscriptionCounters{}));
   }
   trackIt->second->cancel();
   subTracks_.erase(trackIt);
@@ -5883,15 +5919,51 @@ void MoQSession::unsubscribe(
   checkForCloseOnDrain();
 }
 
+MoQSessionObserver::SubscriptionInfo MoQSession::subscriberSubscriptionInfo(
+    RequestID requestID) {
+  MoQSessionObserver::SubscriptionInfo info;
+  info.requestID = requestID;
+  info.role = MoQSessionObserver::Role::Subscriber;
+  // Recover the track identity from the receive state when it is still around.
+  // Callers on the teardown path may run after it has been erased, in which
+  // case the request ID alone is what the observer gets.
+  auto aliasIt = reqIdToTrackAlias_.find(requestID);
+  if (aliasIt != reqIdToTrackAlias_.end()) {
+    info.trackAlias = aliasIt->second;
+    auto trackIt = subTracks_.find(aliasIt->second);
+    if (trackIt != subTracks_.end() && trackIt->second) {
+      info.fullTrackName = trackIt->second->fullTrackName();
+    }
+  }
+  return info;
+}
+
+MoQSessionObserver::SubscriptionInfo MoQSession::publisherSubscriptionInfo(
+    PublisherImpl& pubTrack) {
+  MoQSessionObserver::SubscriptionInfo info;
+  info.requestID = pubTrack.requestID();
+  info.fullTrackName = pubTrack.fullTrackName();
+  info.role = MoQSessionObserver::Role::Publisher;
+  info.startTime = pubTrack.subscriptionStartTime();
+  return info;
+}
+
 void MoQSession::beginSubscriptionStat(PublisherImpl& pubTrack) {
   if (pubTrack.markEstablished()) {
-    MOQ_PUBLISHER_STATS(publisherStatsCallback_, onSubscriptionBegin);
+    MOQ_OBSERVE(
+        observers_,
+        kSubscription,
+        onSubscriptionBegin(publisherSubscriptionInfo(pubTrack)));
   }
 }
 
 void MoQSession::endSubscriptionStat(PublisherImpl& pubTrack) {
   if (pubTrack.markDone()) {
-    MOQ_PUBLISHER_STATS(publisherStatsCallback_, onSubscriptionEnd);
+    MOQ_OBSERVE(
+        observers_,
+        kSubscription,
+        onSubscriptionEnd(
+            publisherSubscriptionInfo(pubTrack), pubTrack.counters()));
   }
 }
 
