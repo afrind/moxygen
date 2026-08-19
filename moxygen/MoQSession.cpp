@@ -303,8 +303,6 @@ class StreamPublisherImpl
     if (streamType_ != StreamType::FETCH_HEADER) {
       maybeTrackAlias = trackAlias_;
     }
-    auto* pubStats =
-        publisher_ ? publisher_->getPublisherStatsCallback() : nullptr;
     auto now = folly::chrono::coarse_steady_clock::now();
     while (!pendingDeliveries_.empty() &&
            pendingDeliveries_.front().endOffset <= offset) {
@@ -321,8 +319,12 @@ class StreamPublisherImpl
       auto latencyUsec = std::chrono::duration_cast<std::chrono::microseconds>(
                              now - pendingDelivery.enqueuedAt)
                              .count();
-      MOQ_PUBLISHER_STATS(
-          pubStats, recordObjectAckLatency, uint64_t(latencyUsec));
+      if (publisher_) {
+        MOQ_OBSERVE(
+            publisher_->observers(),
+            kSubscription,
+            onObjectAckLatency(std::chrono::microseconds(latencyUsec)));
+      }
 
       // Cancel delivery timeout timer when object is successfully delivered
       if (deliveryTimer_) {
@@ -1022,8 +1024,10 @@ void StreamPublisherImpl::reset(ResetStreamErrorCode error) {
     XLOG(WARN) << "Stream header pending on subgroup=" << header_;
   }
   if (publisher_) {
-    MOQ_PUBLISHER_STATS(
-        publisher_->getPublisherStatsCallback(), onSubgroupReset, error);
+    MOQ_OBSERVE(
+        publisher_->observers(),
+        kSubscription,
+        onSubgroupReset(MoQSessionObserver::Direction::Sent, error));
   }
   // Cancel all delivery timeout timers for this stream since it's being reset
   if (deliveryTimer_) {
@@ -3951,8 +3955,11 @@ folly::coro::Task<void> MoQSession::dataStreamReadLoop(
           XLOG(ERR) << __func__ << " terminating for unknown "
                     << "stream id=" << id << " sess=" << this;
         } else {
-          MOQ_SUBSCRIBER_STATS(
-              subscriberStatsCallback_, onSubgroupReset, errorCode);
+          MOQ_OBSERVE(
+              observers_,
+              kSubscription,
+              onSubgroupReset(
+                  MoQSessionObserver::Direction::Received, errorCode));
         }
         // Per the WebTransport contract, the StreamReadHandle is invalid once
         // readStreamData() yields an exception (peer reset, session close, or
@@ -4691,11 +4698,10 @@ void MoQSession::onPublishImpl(
     std::shared_ptr<ReplyContext> replyContext,
     std::shared_ptr<BidiStreamControl> control) {
   XLOG(DBG1) << __func__ << " reqID=" << publish.requestID << " sess=" << this;
-  if (logger_) {
-    logger_->logPublish(
-        publish, MOQTByteStringType::STRING_VALUE, ControlMessageType::PARSED);
-  }
-  MOQ_SUBSCRIBER_STATS(subscriberStatsCallback_, onPublish);
+  MOQ_OBSERVE(
+      observers_,
+      kControl,
+      onPublish(MoQSessionObserver::Direction::Received, publish));
   if (closeSessionIfRequestIDInvalid(publish.requestID, false, true)) {
     return;
   }
@@ -4827,11 +4833,10 @@ void MoQSession::onPublishDone(PublishDone publishDone) {
              << " code=" << folly::to_underlying(publishDone.statusCode)
              << " reason=" << publishDone.reasonPhrase;
 
-  if (logger_) {
-    logger_->logPublishDone(publishDone, ControlMessageType::PARSED);
-  }
-  MOQ_SUBSCRIBER_STATS(
-      subscriberStatsCallback_, onPublishDone, publishDone.statusCode);
+  MOQ_OBSERVE(
+      observers_,
+      kControl,
+      onPublishDone(MoQSessionObserver::Direction::Received, publishDone));
 
   // Handle regular subscription PUBLISH_DONE
   auto trackAliasIt = reqIdToTrackAlias_.find(publishDone.requestID);
@@ -5579,8 +5584,7 @@ Subscriber::PublishResult MoQSession::publish(
     auto duration = (std::chrono::steady_clock::now() - publishStartTime);
     auto durationMsec =
         std::chrono::duration_cast<std::chrono::milliseconds>(duration);
-    MOQ_PUBLISHER_STATS(
-        publisherStatsCallback_, recordPublishLatency, durationMsec.count());
+    MOQ_OBSERVE(observers_, kControl, onPublishLatency(durationMsec));
   };
 
   aliasifyAuthTokens(pub.params);
@@ -5704,24 +5708,20 @@ Subscriber::PublishResult MoQSession::publish(
 
 void MoQSession::publishOk(const PublishOk& pubOk, ReplyContext& replyContext) {
   XLOG(DBG1) << __func__ << " reqID=" << pubOk.requestID << " sess=" << this;
-  MOQ_OBSERVE(
-      observers_,
-      kControl,
-      onPublishOk(MoQSessionObserver::Direction::Sent, pubOk));
-  MOQ_OBSERVE(
-      observers_,
-      kSubscription,
-      onSubscriptionBegin(subscriberSubscriptionInfo(pubOk.requestID)));
-
-  if (logger_) {
-    logger_->logPublishOk(pubOk, ControlMessageType::CREATED);
-  }
-
   auto res = moqFrameWriter_.writePublishOk(replyContext.writeBuf(), pubOk);
   if (!res) {
     XLOG(ERR) << "writePublishOk failed sess=" << this;
     return;
   }
+  MOQ_OBSERVE(
+      observers_,
+      kControl,
+      onPublishOk(MoQSessionObserver::Direction::Sent, pubOk));
+  // Accepting a PUBLISH makes this endpoint a subscriber for that track.
+  MOQ_OBSERVE(
+      observers_,
+      kSubscription,
+      onSubscriptionBegin(subscriberSubscriptionInfo(pubOk.requestID)));
   replyContext.flush();
 }
 
@@ -5730,17 +5730,17 @@ void MoQSession::publishError(
     ReplyContext& replyContext) {
   XLOG(DBG1) << __func__ << " reqID=" << publishError.requestID
              << " sess=" << this;
-  MOQ_SUBSCRIBER_STATS(
-      subscriberStatsCallback_, onPublishError, publishError.errorCode);
-  if (logger_) {
-    logger_->logPublishError(publishError, ControlMessageType::CREATED);
-  }
   auto res = moqFrameWriter_.writeRequestError(
       replyContext.writeBuf(), publishError, FrameType::PUBLISH_ERROR);
   if (!res) {
     XLOG(ERR) << "writePublishError failed sess=" << this;
     return;
   }
+  notifyRequestError(
+      observers_,
+      publishError,
+      FrameType::PUBLISH_ERROR,
+      MoQSessionObserver::Direction::Sent);
   replyContext.flushFinal();
 
   auto aliasRes = reqIdToTrackAlias_.find(publishError.requestID);
@@ -6065,8 +6065,6 @@ void MoQSession::endSubscriptionStat(PublisherImpl& pubTrack) {
 
 void MoQSession::sendPublishDone(const PublishDone& pubDone) {
   XLOG(DBG1) << __func__ << " sess=" << this;
-  MOQ_PUBLISHER_STATS(
-      publisherStatsCallback_, onPublishDone, pubDone.statusCode);
   auto it = pubTracks_.find(pubDone.requestID);
   if (it == pubTracks_.end()) {
     XLOG(ERR) << "publishDone for invalid id=" << pubDone.requestID
@@ -6091,9 +6089,10 @@ void MoQSession::sendPublishDone(const PublishDone& pubDone) {
     return;
   }
 
-  if (logger_) {
-    logger_->logPublishDone(pubDone);
-  }
+  MOQ_OBSERVE(
+      observers_,
+      kControl,
+      onPublishDone(MoQSessionObserver::Direction::Sent, pubDone));
   ctx->flushFinal();
   retireRequestID(/*signalWriteLoop=*/false);
 }
