@@ -1137,4 +1137,297 @@ void MLogger::logControlMessage(
   }
 }
 
+// ---- MoQSessionObserver overrides ---------------------------------------
+//
+// These translate the generic observer events into mlog's qlog schema by
+// delegating to the logXXX methods above. Direction maps exactly onto
+// ControlMessageType, which is why this reparenting changes no output.
+
+namespace {
+ControlMessageType toControlMessageType(MoQSessionObserver::Direction dir) {
+  return dir == MoQSessionObserver::Direction::Sent ? ControlMessageType::CREATED
+                                                    : ControlMessageType::PARSED;
+}
+
+// The object tier hands observers a const Payload& so that nothing is copied
+// for observers that do not want it. mlog does want it, so it clones here --
+// this is the copy that used to happen unconditionally at every call site.
+Payload clonePayload(const Payload& payload) {
+  return payload ? payload->clone() : nullptr;
+}
+} // namespace
+
+void MLogger::onSessionStart(const SessionContext& ctx) {
+  if (ctx.dcid) {
+    dcid_ = *ctx.dcid;
+  }
+  if (ctx.srcCid) {
+    srcCid_ = *ctx.srcCid;
+  }
+  if (ctx.peerAddress) {
+    peerAddress_ = *ctx.peerAddress;
+  }
+  if (ctx.localAddress) {
+    localAddress_ = *ctx.localAddress;
+  }
+  if (ctx.negotiatedVersion) {
+    negotiatedMoQVersion_ = *ctx.negotiatedVersion;
+  }
+  if (!ctx.experiments.empty()) {
+    experiments_ = ctx.experiments;
+  }
+}
+
+void MLogger::onClientSetup(
+    Direction dir,
+    const ClientSetup& setup,
+    uint64_t version) {
+  logClientSetup(setup, version, toControlMessageType(dir));
+}
+
+void MLogger::onServerSetup(
+    Direction dir,
+    const ServerSetup& setup,
+    uint64_t version) {
+  logServerSetup(setup, version, toControlMessageType(dir));
+}
+
+void MLogger::onSubscribe(Direction dir, const SubscribeRequest& req) {
+  logSubscribe(
+      req, MOQTByteStringType::STRING_VALUE, toControlMessageType(dir));
+}
+
+void MLogger::onSubscribeOk(Direction dir, const SubscribeOk& req) {
+  logSubscribeOk(req, toControlMessageType(dir));
+}
+
+void MLogger::onSubscribeError(Direction dir, const SubscribeError& req) {
+  logSubscribeError(req, toControlMessageType(dir));
+}
+
+void MLogger::onRequestUpdate(Direction dir, const RequestUpdate& req) {
+  logSubscribeUpdate(req, toControlMessageType(dir));
+}
+
+void MLogger::onUnsubscribe(Direction dir, const Unsubscribe& req) {
+  logUnsubscribe(req, toControlMessageType(dir));
+}
+
+void MLogger::onFetch(Direction dir, const Fetch& req) {
+  logFetch(req, MOQTByteStringType::STRING_VALUE, toControlMessageType(dir));
+}
+
+void MLogger::onFetchOk(Direction dir, const FetchOk& req) {
+  logFetchOk(req, toControlMessageType(dir));
+}
+
+void MLogger::onFetchError(Direction dir, const FetchError& req) {
+  logFetchError(req, toControlMessageType(dir));
+}
+
+void MLogger::onFetchCancel(Direction dir, const FetchCancel& req) {
+  logFetchCancel(req, toControlMessageType(dir));
+}
+
+void MLogger::onPublish(Direction dir, const PublishRequest& req) {
+  logPublish(req, MOQTByteStringType::STRING_VALUE, toControlMessageType(dir));
+}
+
+void MLogger::onPublishOk(Direction dir, const PublishOk& req) {
+  logPublishOk(req, toControlMessageType(dir));
+}
+
+void MLogger::onPublishError(Direction dir, const PublishError& req) {
+  logPublishError(req, toControlMessageType(dir));
+}
+
+void MLogger::onPublishDone(Direction dir, const PublishDone& req) {
+  logPublishDone(req, toControlMessageType(dir));
+}
+
+void MLogger::onPublishNamespace(Direction dir, const PublishNamespace& req) {
+  logPublishNamespace(
+      req, MOQTByteStringType::STRING_VALUE, toControlMessageType(dir));
+}
+
+void MLogger::onPublishNamespaceOk(
+    Direction dir,
+    const PublishNamespaceOk& req) {
+  logPublishNamespaceOk(req, toControlMessageType(dir));
+}
+
+void MLogger::onPublishNamespaceError(
+    Direction dir,
+    const PublishNamespaceError& req) {
+  logPublishNamespaceError(req, toControlMessageType(dir));
+}
+
+void MLogger::onPublishNamespaceDone(
+    Direction dir,
+    const PublishNamespaceDone& req) {
+  logPublishNamespaceDone(
+      req, MOQTByteStringType::STRING_VALUE, toControlMessageType(dir));
+}
+
+void MLogger::onPublishNamespaceCancel(
+    Direction dir,
+    const PublishNamespaceCancel& req) {
+  logPublishNamespaceCancel(
+      req, MOQTByteStringType::STRING_VALUE, toControlMessageType(dir));
+}
+
+void MLogger::onSubscribeNamespace(
+    Direction dir,
+    const SubscribeNamespace& req) {
+  logSubscribeNamespace(
+      req, MOQTByteStringType::STRING_VALUE, toControlMessageType(dir));
+}
+
+void MLogger::onSubscribeNamespaceOk(
+    Direction dir,
+    const SubscribeNamespaceOk& req) {
+  logSubscribeNamespaceOk(req, toControlMessageType(dir));
+}
+
+void MLogger::onSubscribeNamespaceError(
+    Direction dir,
+    const SubscribeNamespaceError& req) {
+  logSubscribeNamespaceError(req, toControlMessageType(dir));
+}
+
+void MLogger::onUnsubscribeNamespace(
+    Direction dir,
+    const UnsubscribeNamespace& req) {
+  logUnsubscribeNamespace(
+      req, MOQTByteStringType::STRING_VALUE, toControlMessageType(dir));
+}
+
+void MLogger::onTrackStatus(Direction dir, const TrackStatus& req) {
+  logTrackStatus(
+      req, MOQTByteStringType::STRING_VALUE, toControlMessageType(dir));
+}
+
+void MLogger::onTrackStatusOk(Direction dir, const TrackStatusOk& req) {
+  logTrackStatusOk(
+      req, MOQTByteStringType::STRING_VALUE, toControlMessageType(dir));
+}
+
+void MLogger::onTrackStatusError(Direction dir, const TrackStatusError& req) {
+  logTrackStatusError(
+      req, MOQTByteStringType::STRING_VALUE, toControlMessageType(dir));
+}
+
+void MLogger::onGoaway(Direction dir, const Goaway& req) {
+  logGoaway(req, toControlMessageType(dir));
+}
+
+void MLogger::onMaxRequestID(Direction dir, uint64_t requestID) {
+  logMaxRequestId(requestID, toControlMessageType(dir));
+}
+
+void MLogger::onRequestsBlocked(Direction dir, uint64_t maximumRequestID) {
+  logRequestsBlocked(maximumRequestID, toControlMessageType(dir));
+}
+
+void MLogger::onStreamTypeSet(
+    Direction dir,
+    uint64_t streamID,
+    ObservedStreamType type) {
+  MOQTStreamType mlogType = MOQTStreamType::CONTROL;
+  switch (type) {
+    case ObservedStreamType::Control:
+      mlogType = MOQTStreamType::CONTROL;
+      break;
+    case ObservedStreamType::SubgroupHeader:
+      mlogType = MOQTStreamType::SUBGROUP_HEADER;
+      break;
+    case ObservedStreamType::FetchHeader:
+      mlogType = MOQTStreamType::FETCH_HEADER;
+      break;
+  }
+  logStreamTypeSet(
+      streamID,
+      mlogType,
+      dir == Direction::Sent ? Owner::LOCAL : Owner::REMOTE);
+}
+
+void MLogger::onDatagramObject(
+    Direction dir,
+    TrackAlias trackAlias,
+    const ObjectHeader& header,
+    const Payload& payload) {
+  if (dir == Direction::Sent) {
+    logObjectDatagramCreated(trackAlias, header, payload);
+  } else {
+    logObjectDatagramParsed(trackAlias, header, payload);
+  }
+}
+
+void MLogger::onSubgroupHeader(
+    Direction dir,
+    uint64_t streamID,
+    TrackAlias trackAlias,
+    uint64_t groupID,
+    uint64_t subgroupID,
+    uint8_t publisherPriority,
+    const SubgroupOptions& options) {
+  if (dir == Direction::Sent) {
+    logSubgroupHeaderCreated(
+        streamID,
+        trackAlias,
+        groupID,
+        subgroupID,
+        publisherPriority,
+        options.subgroupIDFormat,
+        options.hasExtensions,
+        options.hasEndOfGroup);
+  } else {
+    logSubgroupHeaderParsed(
+        streamID,
+        trackAlias,
+        groupID,
+        subgroupID,
+        publisherPriority,
+        options);
+  }
+}
+
+void MLogger::onSubgroupObject(
+    Direction dir,
+    uint64_t streamID,
+    TrackAlias trackAlias,
+    const ObjectHeader& header,
+    const Payload& payload) {
+  if (dir == Direction::Sent) {
+    logSubgroupObjectCreated(
+        streamID, trackAlias, header, clonePayload(payload));
+  } else {
+    logSubgroupObjectParsed(
+        streamID, trackAlias, header, clonePayload(payload));
+  }
+}
+
+void MLogger::onFetchHeader(
+    Direction dir,
+    uint64_t streamID,
+    uint64_t requestID) {
+  if (dir == Direction::Sent) {
+    logFetchHeaderCreated(streamID, requestID);
+  } else {
+    logFetchHeaderParsed(streamID, requestID);
+  }
+}
+
+void MLogger::onFetchObject(
+    Direction dir,
+    uint64_t streamID,
+    const ObjectHeader& header,
+    const Payload& payload) {
+  if (dir == Direction::Sent) {
+    logFetchObjectCreated(streamID, header, clonePayload(payload));
+  } else {
+    logFetchObjectParsed(streamID, header, clonePayload(payload));
+  }
+}
+
 } // namespace moxygen

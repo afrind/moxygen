@@ -13,6 +13,7 @@
 #include "moxygen/MoQTypes.h"
 #include "moxygen/mlog/MLogEvents.h"
 #include "moxygen/mlog/MLogTypes.h"
+#include "moxygen/stats/MoQSessionObserver.h"
 
 namespace moxygen {
 
@@ -23,10 +24,91 @@ const std::string kDefaultLoggerFilePath = "./mlog.txt";
 // Abstract base class for MoQ logging.
 // Subclasses implement outputLogs() to emit logs to a specific backend
 // (e.g., FileMLogger for file output, ScubaMLogger for Scuba).
-class MLogger {
+//
+// MLogger is a MoQSessionObserver: MoQSession notifies it through the generic
+// onXXX observer methods, and the onXXX overrides below translate into the
+// qlog MOQT* schema via the existing logXXX methods. The logXXX methods stay
+// public and unchanged so out-of-tree callers and tests keep working, and so
+// this reparenting is behaviour-neutral.
+class MLogger : public MoQSessionObserver {
  public:
   explicit MLogger(VantagePoint vantagePoint) : vantagePoint_(vantagePoint) {}
-  virtual ~MLogger() = default;
+  ~MLogger() override = default;
+
+  // mlog is the one observer that wants everything, including the per-object
+  // data plane.
+  uint32_t interests() const override {
+    return kControl | kSubscription | kObject;
+  }
+
+  // ---- MoQSessionObserver overrides -------------------------------------
+  // Each of these is a thin adapter onto the corresponding logXXX below.
+
+  void onSessionStart(const SessionContext& ctx) override;
+
+  void onClientSetup(Direction, const ClientSetup&, uint64_t) override;
+  void onServerSetup(Direction, const ServerSetup&, uint64_t) override;
+
+  void onSubscribe(Direction, const SubscribeRequest&) override;
+  void onSubscribeOk(Direction, const SubscribeOk&) override;
+  void onSubscribeError(Direction, const SubscribeError&) override;
+  void onRequestUpdate(Direction, const RequestUpdate&) override;
+  void onUnsubscribe(Direction, const Unsubscribe&) override;
+
+  void onFetch(Direction, const Fetch&) override;
+  void onFetchOk(Direction, const FetchOk&) override;
+  void onFetchError(Direction, const FetchError&) override;
+  void onFetchCancel(Direction, const FetchCancel&) override;
+
+  void onPublish(Direction, const PublishRequest&) override;
+  void onPublishOk(Direction, const PublishOk&) override;
+  void onPublishError(Direction, const PublishError&) override;
+  void onPublishDone(Direction, const PublishDone&) override;
+
+  void onPublishNamespace(Direction, const PublishNamespace&) override;
+  void onPublishNamespaceOk(Direction, const PublishNamespaceOk&) override;
+  void onPublishNamespaceError(Direction, const PublishNamespaceError&) override;
+  void onPublishNamespaceDone(Direction, const PublishNamespaceDone&) override;
+  void onPublishNamespaceCancel(Direction, const PublishNamespaceCancel&)
+      override;
+
+  void onSubscribeNamespace(Direction, const SubscribeNamespace&) override;
+  void onSubscribeNamespaceOk(Direction, const SubscribeNamespaceOk&) override;
+  void onSubscribeNamespaceError(Direction, const SubscribeNamespaceError&)
+      override;
+  void onUnsubscribeNamespace(Direction, const UnsubscribeNamespace&) override;
+
+  void onTrackStatus(Direction, const TrackStatus&) override;
+  void onTrackStatusOk(Direction, const TrackStatusOk&) override;
+  void onTrackStatusError(Direction, const TrackStatusError&) override;
+
+  void onGoaway(Direction, const Goaway&) override;
+  void onMaxRequestID(Direction, uint64_t) override;
+  void onRequestsBlocked(Direction, uint64_t) override;
+
+  void onStreamTypeSet(Direction, uint64_t, ObservedStreamType) override;
+  void onDatagramObject(
+      Direction,
+      TrackAlias,
+      const ObjectHeader&,
+      const Payload&) override;
+  void onSubgroupHeader(
+      Direction,
+      uint64_t,
+      TrackAlias,
+      uint64_t,
+      uint64_t,
+      uint8_t,
+      const SubgroupOptions&) override;
+  void onSubgroupObject(
+      Direction,
+      uint64_t,
+      TrackAlias,
+      const ObjectHeader&,
+      const Payload&) override;
+  void onFetchHeader(Direction, uint64_t, uint64_t) override;
+  void onFetchObject(Direction, uint64_t, const ObjectHeader&, const Payload&)
+      override;
 
   MOQTSetupMessage createSetupControlMessage(
       const std::string& setupType,
