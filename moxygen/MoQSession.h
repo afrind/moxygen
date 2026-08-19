@@ -356,7 +356,7 @@ class MoQSession : public Subscriber,
    */
   void setSessionContext(MoQSessionObserver::SessionContext ctx) {
     sessionContext_ = std::move(ctx);
-    MOQ_OBSERVE(observers_, kControl, onSessionStart(sessionContext_));
+    MOQ_OBSERVE_CONTROL(observers_, onSessionStart(sessionContext_));
   }
 
   // Installs the stats callback as an observer. Kept so existing callers and
@@ -381,30 +381,26 @@ class MoQSession : public Subscriber,
   }
 
   void onSubscriptionStreamOpenedByPeer() {
-    MOQ_OBSERVE(
+    MOQ_OBSERVE_SUBSCRIPTION(
         observers_,
-        kSubscription,
         onSubscriptionStreamOpened(MoQSessionObserver::Direction::Received));
   }
 
   void onSubscriptionStreamClosedByPeer() {
-    MOQ_OBSERVE(
+    MOQ_OBSERVE_SUBSCRIPTION(
         observers_,
-        kSubscription,
         onSubscriptionStreamClosed(MoQSessionObserver::Direction::Received));
   }
 
   void onSubscriptionStreamOpened() {
-    MOQ_OBSERVE(
+    MOQ_OBSERVE_SUBSCRIPTION(
         observers_,
-        kSubscription,
         onSubscriptionStreamOpened(MoQSessionObserver::Direction::Sent));
   }
 
   void onSubscriptionStreamClosed() {
-    MOQ_OBSERVE(
+    MOQ_OBSERVE_SUBSCRIPTION(
         observers_,
-        kSubscription,
         onSubscriptionStreamClosed(MoQSessionObserver::Direction::Sent));
   }
 

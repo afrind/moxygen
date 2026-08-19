@@ -414,5 +414,18 @@ inline const MoQSessionObserverList* observerList(
     }                                                              \
   } while (0)
 
+/*
+ * Tier-specific spellings, which are what call sites should use. Naming the
+ * tier in the macro rather than passing it keeps `grep MOQ_OBSERVE_OBJECT`
+ * an exact census of the hot path.
+ *
+ * Note these do not make the tier safe, only shorter: the tier still has to
+ * agree with the method being called, and a mismatch routes the event to the
+ * wrong observers without complaint.
+ */
+#define MOQ_OBSERVE_CONTROL(list, call) MOQ_OBSERVE(list, kControl, call)
+#define MOQ_OBSERVE_SUBSCRIPTION(list, call) \
+  MOQ_OBSERVE(list, kSubscription, call)
+#define MOQ_OBSERVE_OBJECT(list, call) MOQ_OBSERVE(list, kObject, call)
 
 } // namespace moxygen

@@ -126,25 +126,24 @@ void notifyRequestError(
         MoQSessionObserver::Direction::Received) {
   switch (frameType) {
     case FrameType::SUBSCRIBE_ERROR:
-      MOQ_OBSERVE(observers, kControl, onSubscribeError(dir, error));
+      MOQ_OBSERVE_CONTROL(observers, onSubscribeError(dir, error));
       break;
     case FrameType::PUBLISH_ERROR:
-      MOQ_OBSERVE(
+      MOQ_OBSERVE_CONTROL(
           observers,
-          kControl,
           onPublishError(dir, static_cast<const PublishError&>(error)));
       break;
     case FrameType::FETCH_ERROR:
-      MOQ_OBSERVE(observers, kControl, onFetchError(dir, error));
+      MOQ_OBSERVE_CONTROL(observers, onFetchError(dir, error));
       break;
     case FrameType::PUBLISH_NAMESPACE_ERROR:
-      MOQ_OBSERVE(observers, kControl, onPublishNamespaceError(dir, error));
+      MOQ_OBSERVE_CONTROL(observers, onPublishNamespaceError(dir, error));
       break;
     case FrameType::SUBSCRIBE_NAMESPACE_ERROR:
-      MOQ_OBSERVE(observers, kControl, onSubscribeNamespaceError(dir, error));
+      MOQ_OBSERVE_CONTROL(observers, onSubscribeNamespaceError(dir, error));
       break;
     case FrameType::TRACK_STATUS_ERROR:
-      MOQ_OBSERVE(observers, kControl, onTrackStatusError(dir, error));
+      MOQ_OBSERVE_CONTROL(observers, onTrackStatusError(dir, error));
       break;
     default:
       // Unknown or unsupported error type
@@ -318,9 +317,8 @@ class StreamPublisherImpl
                              now - pendingDelivery.enqueuedAt)
                              .count();
       if (publisher_) {
-        MOQ_OBSERVE(
+        MOQ_OBSERVE_SUBSCRIPTION(
             publisher_->observers(),
-            kSubscription,
             onObjectAckLatency(std::chrono::microseconds(latencyUsec)));
       }
 
@@ -580,9 +578,8 @@ StreamPublisherImpl::StreamPublisherImpl(
   // Set the priority in the header
   header_.priority = sgPriority;
   const auto& observers = publisher_->observers();
-  MOQ_OBSERVE(
+  MOQ_OBSERVE_OBJECT(
       observers,
-      kObject,
       onStreamTypeSet(
           MoQSessionObserver::Direction::Sent,
           writeHandle->getID(),
@@ -593,9 +590,8 @@ StreamPublisherImpl::StreamPublisherImpl(
   options.hasEndOfGroup = endOfGroup;
   options.priorityPresent = sgPriority.has_value();
   options.beginsWithFirstObject = beginsWithFirstObject;
-  MOQ_OBSERVE(
+  MOQ_OBSERVE_OBJECT(
       observers,
-      kObject,
       onSubgroupHeader(
           MoQSessionObserver::Direction::Sent,
           writeHandle->getID(),
@@ -626,16 +622,14 @@ void StreamPublisherImpl::setWriteHandle(
   writeHandle_ = writeHandle;
   if (streamType_ == StreamType::FETCH_HEADER) {
     const auto& observers = publisher_->observers();
-    MOQ_OBSERVE(
+    MOQ_OBSERVE_OBJECT(
         observers,
-        kObject,
         onStreamTypeSet(
             MoQSessionObserver::Direction::Sent,
             writeHandle_->getID(),
             MoQSessionObserver::ObservedStreamType::FetchHeader));
-    MOQ_OBSERVE(
+    MOQ_OBSERVE_OBJECT(
         observers,
-        kObject,
         onFetchHeader(
             MoQSessionObserver::Direction::Sent,
             writeHandle_->getID(),
@@ -851,9 +845,8 @@ folly::Expected<folly::Unit, MoQPublishError> StreamPublisherImpl::objectImpl(
     publisher_->countGroup(header_.group);
 
     if (streamType_ != StreamType::FETCH_HEADER) {
-      MOQ_OBSERVE(
+      MOQ_OBSERVE_OBJECT(
           publisher_->observers(),
-          kObject,
           onSubgroupObject(
               MoQSessionObserver::Direction::Sent,
               writeHandle_->getID(),
@@ -861,9 +854,8 @@ folly::Expected<folly::Unit, MoQPublishError> StreamPublisherImpl::objectImpl(
               header_,
               payload));
     } else {
-      MOQ_OBSERVE(
+      MOQ_OBSERVE_OBJECT(
           publisher_->observers(),
-          kObject,
           onFetchObject(
               MoQSessionObserver::Direction::Sent,
               writeHandle_->getID(),
@@ -1039,9 +1031,8 @@ void StreamPublisherImpl::reset(ResetStreamErrorCode error) {
     XLOG(WARN) << "Stream header pending on subgroup=" << header_;
   }
   if (publisher_) {
-    MOQ_OBSERVE(
+    MOQ_OBSERVE_SUBSCRIPTION(
         publisher_->observers(),
-        kSubscription,
         onSubgroupReset(MoQSessionObserver::Direction::Sent, error));
   }
   // Cancel all delivery timeout timers for this stream since it's being reset
@@ -1898,9 +1889,8 @@ MoQSession::TrackPublisherImpl::datagram(
   countObject(header.length.value_or(
       payload ? payload->computeChainDataLength() : 0));
   countGroup(header.group);
-  MOQ_OBSERVE(
+  MOQ_OBSERVE_OBJECT(
       observers(),
-      kObject,
       onDatagramObject(
           MoQSessionObserver::Direction::Sent, *trackAlias_, header, payload));
 
@@ -2108,9 +2098,8 @@ class MoQSession::SubscribeTrackReceiveState
   }
 
   void onSubgroup() {
-    MOQ_OBSERVE(
+    MOQ_OBSERVE_OBJECT(
         observers_,
-        kObject,
         onStreamTypeSet(
             MoQSessionObserver::Direction::Received,
             currentStreamId_,
@@ -2181,10 +2170,8 @@ class MoQSession::SubscribeTrackReceiveState
         info.role = MoQSessionObserver::Role::Subscriber;
         MoQSessionObserver::SubscriptionCounters counters;
         counters.endReason = pendingPublishDone_->statusCode;
-        MOQ_OBSERVE(
-            session_->observers_,
-            kSubscription,
-            onSubscriptionEnd(info, counters));
+        MOQ_OBSERVE_SUBSCRIPTION(
+            session_->observers_, onSubscriptionEnd(info, counters));
         auto token = cancelSource_.getToken();
         auto cb = std::exchange(callback_, nullptr);
         cb->publishDone(std::move(*pendingPublishDone_));
@@ -2322,16 +2309,14 @@ class MoQSession::FetchTrackReceiveState
   }
 
   void onFetchHeader(RequestID requestID) {
-    MOQ_OBSERVE(
+    MOQ_OBSERVE_OBJECT(
         observers_,
-        kObject,
         onStreamTypeSet(
             MoQSessionObserver::Direction::Received,
             currentStreamId_,
             MoQSessionObserver::ObservedStreamType::FetchHeader));
-    MOQ_OBSERVE(
+    MOQ_OBSERVE_OBJECT(
         observers_,
-        kObject,
         onFetchHeader(
             MoQSessionObserver::Direction::Received,
             currentStreamId_,
@@ -2548,10 +2533,8 @@ void MoQSession::cleanup() {
     // still waiting. Reporting only on success keeps this exactly once and
     // stops teardown inventing failures for completed requests.
     if (!res.hasError()) {
-      MOQ_OBSERVE(
-          observers_,
-          kControl,
-          onRequestFailedLocally(frameType, sessionClosed));
+      MOQ_OBSERVE_CONTROL(
+          observers_, onRequestFailedLocally(frameType, sessionClosed));
     }
   }
   pendingRequests_.clear();
@@ -2591,9 +2574,8 @@ quic::PriorityQueue::Priority MoQSession::controlPriority() const {
 void MoQSession::startControlWriteLoop(
     proxygen::WebTransport::StreamWriteHandle* writeHandle) {
   writeHandle->setPriority(controlPriority());
-  MOQ_OBSERVE(
+  MOQ_OBSERVE_OBJECT(
       observers_,
-      kObject,
       onStreamTypeSet(
           MoQSessionObserver::Direction::Sent,
           writeHandle->getID(),
@@ -2680,10 +2662,8 @@ void MoQSession::goaway(Goaway goaway) {
       scheduleGoawayTimeout(goaway.timeout);
     }
     controlWriteEvent_.signal();
-    MOQ_OBSERVE(
-        observers_,
-        kControl,
-        onGoaway(MoQSessionObserver::Direction::Sent, goaway));
+    MOQ_OBSERVE_CONTROL(
+        observers_, onGoaway(MoQSessionObserver::Direction::Sent, goaway));
     drain();
   }
 }
@@ -2862,17 +2842,15 @@ folly::Expected<folly::Unit, quic::TransportErrorCode> MoQSession::sendSetup(
   // through one place and a setup whose serialization failed is not reported
   // as sent.
   if (isClient) {
-    MOQ_OBSERVE(
+    MOQ_OBSERVE_CONTROL(
         observers_,
-        kControl,
         onClientSetup(
             MoQSessionObserver::Direction::Sent,
             setup,
             setupSerializationVersion));
   } else {
-    MOQ_OBSERVE(
+    MOQ_OBSERVE_CONTROL(
         observers_,
-        kControl,
         onServerSetup(
             MoQSessionObserver::Direction::Sent,
             setup,
@@ -2935,9 +2913,8 @@ void MoQSession::onServerSetup(Setup serverSetup) {
   XCHECK(dir_ == MoQControlCodec::Direction::CLIENT);
   XLOG(DBG1) << __func__ << " sess=" << this;
 
-  MOQ_OBSERVE(
+  MOQ_OBSERVE_CONTROL(
       observers_,
-      kControl,
       onServerSetup(
           MoQSessionObserver::Direction::Received,
           serverSetup,
@@ -2976,9 +2953,8 @@ void MoQSession::onClientSetup(Setup clientSetup) {
   XCHECK(dir_ == MoQControlCodec::Direction::SERVER);
   XLOG(DBG1) << __func__ << " sess=" << this;
 
-  MOQ_OBSERVE(
+  MOQ_OBSERVE_CONTROL(
       observers_,
-      kControl,
       onClientSetup(
           MoQSessionObserver::Direction::Received,
           clientSetup,
@@ -3315,8 +3291,8 @@ void MoQSession::failPendingRequestOnEarlyClose(
     // The peer closed the request stream instead of replying, so no error
     // frame will arrive. Reported only when the error actually reached a
     // waiting requester, so this stays exactly once per request.
-    MOQ_OBSERVE(
-        observers_, kControl, onRequestFailedLocally(frameType, earlyClose));
+    MOQ_OBSERVE_CONTROL(
+        observers_, onRequestFailedLocally(frameType, earlyClose));
   }
 }
 
@@ -3568,9 +3544,8 @@ class ObjectStreamCallback : public MoQObjectStreamCodec::ObjectCallback {
     } else {
       return MoQCodec::ParseResult::ERROR_TERMINATE;
     }
-    MOQ_OBSERVE(
+    MOQ_OBSERVE_OBJECT(
         session_->observers(),
-        kObject,
         onSubgroupHeader(
             MoQSessionObserver::Direction::Received,
             currentStreamId_,
@@ -3626,9 +3601,8 @@ class ObjectStreamCallback : public MoQObjectStreamCodec::ObjectCallback {
       obj.extensions = extensions;
       obj.forwardingPreferenceIsDatagram = forwardingPreferenceIsDatagram;
       if (objectComplete && subscribeState_) {
-        MOQ_OBSERVE(
+        MOQ_OBSERVE_OBJECT(
             session_->observers(),
-            kObject,
             onSubgroupObject(
                 MoQSessionObserver::Direction::Received,
                 currentStreamId_,
@@ -3636,9 +3610,8 @@ class ObjectStreamCallback : public MoQObjectStreamCodec::ObjectCallback {
                 obj,
                 initialPayload));
       } else if (objectComplete && fetchState_) {
-        MOQ_OBSERVE(
+        MOQ_OBSERVE_OBJECT(
             session_->observers(),
-            kObject,
             onFetchObject(
                 MoQSessionObserver::Direction::Received,
                 currentStreamId_,
@@ -3696,9 +3669,8 @@ class ObjectStreamCallback : public MoQObjectStreamCodec::ObjectCallback {
 
     if (objectComplete) {
       if (subscribeState_) {
-        MOQ_OBSERVE(
+        MOQ_OBSERVE_OBJECT(
             session_->observers(),
-            kObject,
             onSubgroupObject(
                 MoQSessionObserver::Direction::Received,
                 currentStreamId_,
@@ -3706,9 +3678,8 @@ class ObjectStreamCallback : public MoQObjectStreamCodec::ObjectCallback {
                 currentObj_,
                 payload));
       } else if (fetchState_) {
-        MOQ_OBSERVE(
+        MOQ_OBSERVE_OBJECT(
             session_->observers(),
-            kObject,
             onFetchObject(
                 MoQSessionObserver::Direction::Received,
                 currentStreamId_,
@@ -4024,9 +3995,8 @@ folly::coro::Task<void> MoQSession::dataStreamReadLoop(
           XLOG(ERR) << __func__ << " terminating for unknown "
                     << "stream id=" << id << " sess=" << this;
         } else {
-          MOQ_OBSERVE(
+          MOQ_OBSERVE_SUBSCRIPTION(
               observers_,
-              kSubscription,
               onSubgroupReset(
                   MoQSessionObserver::Direction::Received, errorCode));
         }
@@ -4108,9 +4078,8 @@ void MoQSession::onSubscribeImpl(
   XLOG(DBG1) << __func__ << " ftn=" << subscribeRequest.fullTrackName
              << " sess=" << this;
   const auto requestID = subscribeRequest.requestID;
-  MOQ_OBSERVE(
+  MOQ_OBSERVE_CONTROL(
       observers_,
-      kControl,
       onSubscribe(MoQSessionObserver::Direction::Received, subscribeRequest));
   if (closeSessionIfRequestIDInvalid(requestID, false, true)) {
     return;
@@ -4301,9 +4270,8 @@ void MoQSession::onRequestUpdate(RequestUpdate requestUpdate) {
              << " sess=" << this;
   // Received messages are reported before validation, so an observer sees the
   // requests this session rejects as well as the ones it accepts.
-  MOQ_OBSERVE(
+  MOQ_OBSERVE_CONTROL(
       observers_,
-      kControl,
       onRequestUpdate(MoQSessionObserver::Direction::Received, requestUpdate));
 
   auto existingRequestID = requestUpdate.existingRequestID;
@@ -4398,9 +4366,8 @@ void MoQSession::handleFetchRequestUpdate(
 void MoQSession::onUnsubscribe(Unsubscribe unsubscribe) {
   XLOG(DBG1) << __func__ << " id=" << unsubscribe.requestID << " sess=" << this;
 
-  MOQ_OBSERVE(
+  MOQ_OBSERVE_CONTROL(
       observers_,
-      kControl,
       onUnsubscribe(MoQSessionObserver::Direction::Received, unsubscribe));
 
   if (closeSessionIfRequestIDInvalid(
@@ -4438,9 +4405,8 @@ void MoQSession::onUnsubscribe(Unsubscribe unsubscribe) {
 void MoQSession::onPublishOk(PublishOk publishOk) {
   XLOG(DBG1) << __func__ << " reqID=" << publishOk.requestID
              << " sess=" << this;
-  MOQ_OBSERVE(
+  MOQ_OBSERVE_CONTROL(
       observers_,
-      kControl,
       onPublishOk(MoQSessionObserver::Direction::Received, publishOk));
   auto pubIt = pendingRequests_.find(publishOk.requestID);
   if (pubIt == pendingRequests_.end()) {
@@ -4596,9 +4562,8 @@ void MoQSession::onRequestError(RequestError error, FrameType frameType) {
 void MoQSession::onSubscribeOk(SubscribeOk subOk) {
   XLOG(DBG1) << __func__ << " id=" << subOk.requestID << " sess=" << this;
 
-  MOQ_OBSERVE(
+  MOQ_OBSERVE_CONTROL(
       observers_,
-      kControl,
       onSubscribeOk(MoQSessionObserver::Direction::Received, subOk));
 
   auto it = pendingRequests_.find(subOk.requestID);
@@ -4763,10 +4728,8 @@ void MoQSession::onPublishImpl(
     std::shared_ptr<ReplyContext> replyContext,
     std::shared_ptr<BidiStreamControl> control) {
   XLOG(DBG1) << __func__ << " reqID=" << publish.requestID << " sess=" << this;
-  MOQ_OBSERVE(
-      observers_,
-      kControl,
-      onPublish(MoQSessionObserver::Direction::Received, publish));
+  MOQ_OBSERVE_CONTROL(
+      observers_, onPublish(MoQSessionObserver::Direction::Received, publish));
   if (closeSessionIfRequestIDInvalid(publish.requestID, false, true)) {
     return;
   }
@@ -4898,9 +4861,8 @@ void MoQSession::onPublishDone(PublishDone publishDone) {
              << " code=" << folly::to_underlying(publishDone.statusCode)
              << " reason=" << publishDone.reasonPhrase;
 
-  MOQ_OBSERVE(
+  MOQ_OBSERVE_CONTROL(
       observers_,
-      kControl,
       onPublishDone(MoQSessionObserver::Direction::Received, publishDone));
 
   // Handle regular subscription PUBLISH_DONE
@@ -4942,11 +4904,11 @@ void MoQSession::removeSubscriptionState(TrackAlias alias, RequestID id) {
 void MoQSession::onMaxRequestID(MaxRequestID maxRequestID) {
   XLOG(DBG1) << __func__ << " sess=" << this;
 
-  MOQ_OBSERVE(
+  MOQ_OBSERVE_CONTROL(
       observers_,
-      kControl,
       onMaxRequestID(
-          MoQSessionObserver::Direction::Received, maxRequestID.requestID.value));
+          MoQSessionObserver::Direction::Received,
+          maxRequestID.requestID.value));
 
   if (maxRequestID.requestID.value > peerMaxRequestID_) {
     XLOG(DBG1) << fmt::format(
@@ -4969,9 +4931,8 @@ void MoQSession::onRequestsBlocked(RequestsBlocked requestsBlocked) {
   // Increment the maxRequestID_ by the number of pending closed subscribes
   // and send a new MaxRequestID.
 
-  MOQ_OBSERVE(
+  MOQ_OBSERVE_CONTROL(
       observers_,
-      kControl,
       onRequestsBlocked(
           MoQSessionObserver::Direction::Received,
           requestsBlocked.maxRequestID.value));
@@ -4997,8 +4958,8 @@ void MoQSession::onFetchImpl(
   XLOG(DBG1) << __func__ << " (" << logStr << ") sess=" << this;
   const auto requestID = fetch.requestID;
 
-  MOQ_OBSERVE(
-      observers_, kControl, onFetch(MoQSessionObserver::Direction::Received, fetch));
+  MOQ_OBSERVE_CONTROL(
+      observers_, onFetch(MoQSessionObserver::Direction::Received, fetch));
 
   if (closeSessionIfRequestIDInvalid(requestID, false, true)) {
     return;
@@ -5140,9 +5101,8 @@ folly::coro::Task<void> MoQSession::handleFetch(
 
 void MoQSession::onFetchCancel(FetchCancel fetchCancel) {
   XLOG(DBG1) << __func__ << " id=" << fetchCancel.requestID << " sess=" << this;
-  MOQ_OBSERVE(
+  MOQ_OBSERVE_CONTROL(
       observers_,
-      kControl,
       onFetchCancel(MoQSessionObserver::Direction::Received, fetchCancel));
   if (closeSessionIfRequestIDInvalid(fetchCancel.requestID, false, false)) {
     return;
@@ -5172,10 +5132,8 @@ void MoQSession::onFetchOk(FetchOk fetchOk) {
   XLOG(DBG1) << __func__ << " id=" << fetchOk.requestID << " sess=" << this;
   auto fetchIt = fetches_.find(fetchOk.requestID);
 
-  MOQ_OBSERVE(
-      observers_,
-      kControl,
-      onFetchOk(MoQSessionObserver::Direction::Received, fetchOk));
+  MOQ_OBSERVE_CONTROL(
+      observers_, onFetchOk(MoQSessionObserver::Direction::Received, fetchOk));
 
   if (fetchIt == fetches_.end()) {
     XLOG(ERR) << "No matching subscribe ID=" << fetchOk.requestID
@@ -5210,9 +5168,8 @@ void MoQSession::onTrackStatusImpl(
     std::shared_ptr<ReplyContext> replyContext) {
   XLOG(DBG1) << __func__ << " ftn=" << trackStatus.fullTrackName
              << " sess=" << this;
-  MOQ_OBSERVE(
+  MOQ_OBSERVE_CONTROL(
       observers_,
-      kControl,
       onTrackStatus(MoQSessionObserver::Direction::Received, trackStatus));
   if (closeSessionIfRequestIDInvalid(trackStatus.requestID, false, true)) {
     return;
@@ -5289,9 +5246,8 @@ void MoQSession::trackStatusOk(
     XLOG(ERR) << "trackStatusOk failed sess=" << this;
   } else {
     replyContext.flushFinal();
-    MOQ_OBSERVE(
+    MOQ_OBSERVE_CONTROL(
         observers_,
-        kControl,
         onTrackStatusOk(MoQSessionObserver::Direction::Sent, trackStatusOk));
   }
 }
@@ -5306,9 +5262,8 @@ void MoQSession::trackStatusError(
     XLOG(ERR) << "trackStatusError failed sess=" << this;
   } else {
     replyContext.flushFinal();
-    MOQ_OBSERVE(
+    MOQ_OBSERVE_CONTROL(
         observers_,
-        kControl,
         onTrackStatusError(
             MoQSessionObserver::Direction::Sent, trackStatusError));
   }
@@ -5465,9 +5420,8 @@ folly::coro::Task<MoQSession::TrackStatusResult> MoQSession::trackStatus(
   if (control) {
     control->writeFin();
   }
-  MOQ_OBSERVE(
+  MOQ_OBSERVE_CONTROL(
       observers_,
-      kControl,
       onTrackStatus(MoQSessionObserver::Direction::Sent, trackStatus));
   auto contract = folly::coro::makePromiseContract<
       folly::Expected<TrackStatusOk, TrackStatusError>>();
@@ -5485,9 +5439,8 @@ void MoQSession::onTrackStatusOk(TrackStatusOk trackStatusOk) {
   auto reqID = trackStatusOk.requestID;
   auto trackStatusIt = pendingRequests_.find(reqID);
 
-  MOQ_OBSERVE(
+  MOQ_OBSERVE_CONTROL(
       observers_,
-      kControl,
       onTrackStatusOk(MoQSessionObserver::Direction::Received, trackStatusOk));
   if (trackStatusIt == pendingRequests_.end()) {
     XLOG(ERR) << __func__
@@ -5518,9 +5471,8 @@ void MoQSession::onTrackStatusError(TrackStatusError trackStatusError) {
   // reported by notifyRequestError). The peer-close synthesis path calls
   // handleTrackStatusError directly, because a request the peer abandoned
   // without replying did not produce a received frame to report.
-  MOQ_OBSERVE(
+  MOQ_OBSERVE_CONTROL(
       observers_,
-      kControl,
       onTrackStatusError(
           MoQSessionObserver::Direction::Received, trackStatusError));
   handleTrackStatusError(std::move(trackStatusError));
@@ -5558,10 +5510,8 @@ void MoQSession::handleTrackStatusError(TrackStatusError trackStatusError) {
 void MoQSession::onGoaway(Goaway goaway) {
   XLOG(DBG1) << __func__ << " sess=" << this;
 
-  MOQ_OBSERVE(
-      observers_,
-      kControl,
-      onGoaway(MoQSessionObserver::Direction::Received, goaway));
+  MOQ_OBSERVE_CONTROL(
+      observers_, onGoaway(MoQSessionObserver::Direction::Received, goaway));
   if (receivedGoaway_) {
     XLOG(ERR) << "Received multiple GOAWAYs sess=" << this;
     close(SessionCloseErrorCode::PROTOCOL_VIOLATION);
@@ -5657,7 +5607,7 @@ Subscriber::PublishResult MoQSession::publish(
     auto duration = (std::chrono::steady_clock::now() - publishStartTime);
     auto durationMsec =
         std::chrono::duration_cast<std::chrono::milliseconds>(duration);
-    MOQ_OBSERVE(observers_, kControl, onPublishLatency(durationMsec));
+    MOQ_OBSERVE_CONTROL(observers_, onPublishLatency(durationMsec));
   };
 
   aliasifyAuthTokens(pub.params);
@@ -5709,8 +5659,8 @@ Subscriber::PublishResult MoQSession::publish(
             std::nullopt,
             std::move(sendError.webTransportError)});
   }
-  MOQ_OBSERVE(
-      observers_, kControl, onPublish(MoQSessionObserver::Direction::Sent, pub));
+  MOQ_OBSERVE_CONTROL(
+      observers_, onPublish(MoQSessionObserver::Direction::Sent, pub));
 
   auto trackPublisher = std::make_shared<TrackPublisherImpl>(
       this,
@@ -5784,14 +5734,11 @@ void MoQSession::publishOk(const PublishOk& pubOk, ReplyContext& replyContext) {
     XLOG(ERR) << "writePublishOk failed sess=" << this;
     return;
   }
-  MOQ_OBSERVE(
-      observers_,
-      kControl,
-      onPublishOk(MoQSessionObserver::Direction::Sent, pubOk));
+  MOQ_OBSERVE_CONTROL(
+      observers_, onPublishOk(MoQSessionObserver::Direction::Sent, pubOk));
   // Accepting a PUBLISH makes this endpoint a subscriber for that track.
-  MOQ_OBSERVE(
+  MOQ_OBSERVE_SUBSCRIPTION(
       observers_,
-      kSubscription,
       onSubscriptionBegin(subscriberSubscriptionInfo(pubOk.requestID)));
   replyContext.flush();
 }
@@ -5844,16 +5791,15 @@ folly::coro::Task<Publisher::SubscribeResult> MoQSession::subscribe(
     auto duration = (std::chrono::steady_clock::now() - subscribeStartTime);
     auto durationMsec =
         std::chrono::duration_cast<std::chrono::milliseconds>(duration);
-    MOQ_OBSERVE(observers_, kControl, onSubscribeLatency(durationMsec));
+    MOQ_OBSERVE_CONTROL(observers_, onSubscribeLatency(durationMsec));
   };
   if (draining_ || closed_) {
     SubscribeError subscribeError = {
         std::numeric_limits<uint64_t>::max(),
         SubscribeErrorCode::INTERNAL_ERROR,
         "draining/closed session"};
-    MOQ_OBSERVE(
+    MOQ_OBSERVE_CONTROL(
         observers_,
-        kControl,
         onRequestFailedLocally(FrameType::SUBSCRIBE_ERROR, subscribeError));
     co_return folly::makeUnexpected(subscribeError);
   }
@@ -5862,9 +5808,8 @@ folly::coro::Task<Publisher::SubscribeResult> MoQSession::subscribe(
         peekNextRequestID(),
         SubscribeErrorCode::GOING_AWAY,
         "Session received GOAWAY"};
-    MOQ_OBSERVE(
+    MOQ_OBSERVE_CONTROL(
         observers_,
-        kControl,
         onRequestFailedLocally(FrameType::SUBSCRIBE_ERROR, subscribeError));
     co_return folly::makeUnexpected(subscribeError);
   }
@@ -5879,9 +5824,8 @@ folly::coro::Task<Publisher::SubscribeResult> MoQSession::subscribe(
     XLOG(ERR) << "writeSubscribeRequest failed sess=" << this;
     SubscribeError subscribeError = {
         reqID, SubscribeErrorCode::INTERNAL_ERROR, "local write failed"};
-    MOQ_OBSERVE(
+    MOQ_OBSERVE_CONTROL(
         observers_,
-        kControl,
         onRequestFailedLocally(FrameType::SUBSCRIBE_ERROR, subscribeError));
     co_return folly::makeUnexpected(subscribeError);
   }
@@ -5909,18 +5853,15 @@ folly::coro::Task<Publisher::SubscribeResult> MoQSession::subscribe(
         reqID,
         SubscribeErrorCode::INTERNAL_ERROR,
         std::move(sendResult.error().reasonPhrase)};
-    MOQ_OBSERVE(
+    MOQ_OBSERVE_CONTROL(
         observers_,
-        kControl,
         onRequestFailedLocally(FrameType::SUBSCRIBE_ERROR, subscribeError));
     co_return folly::makeUnexpected(subscribeError);
   }
   // The request is on the wire now, so this is the first point at which a
   // response can ever match it.
-  MOQ_OBSERVE(
-      observers_,
-      kControl,
-      onSubscribe(MoQSessionObserver::Direction::Sent, sub));
+  MOQ_OBSERVE_CONTROL(
+      observers_, onSubscribe(MoQSessionObserver::Direction::Sent, sub));
   auto control = std::move(sendResult.value());
   auto trackReceiveState = std::make_shared<SubscribeTrackReceiveState>(
       fullTrackName, reqID, callback, this, trackAlias, observers_);
@@ -5933,9 +5874,8 @@ folly::coro::Task<Publisher::SubscribeResult> MoQSession::subscribe(
   if (subscribeResultTry.hasException()) {
     // likely cancellation
     XLOG(ERR) << "subscribeFuture exception=" << subscribeResultTry.exception();
-    MOQ_OBSERVE(
+    MOQ_OBSERVE_CONTROL(
         observers_,
-        kControl,
         onRequestFailedLocally(
             FrameType::SUBSCRIBE,
             SubscribeError{
@@ -5953,10 +5893,8 @@ folly::coro::Task<Publisher::SubscribeResult> MoQSession::subscribe(
     // here, so that it fires exactly once whether or not anyone is awaiting.
     co_return folly::makeUnexpected(subscribeResult.error());
   } else {
-    MOQ_OBSERVE(
-        observers_,
-        kSubscription,
-        onSubscriptionBegin(subscriberSubscriptionInfo(reqID)));
+    MOQ_OBSERVE_SUBSCRIPTION(
+        observers_, onSubscriptionBegin(subscriberSubscriptionInfo(reqID)));
     co_return std::make_shared<ReceiverSubscriptionHandle>(
         std::move(subscribeResult.value()),
         trackAlias,
@@ -5977,10 +5915,8 @@ void MoQSession::sendSubscribeOk(const SubscribeOk& subOk, ReplyContext& ctx) {
   // Collapsing them onto one notification means picking a point; after the
   // successful write is the defensible one, since an observer should not see
   // a message that never went out.
-  MOQ_OBSERVE(
-      observers_,
-      kControl,
-      onSubscribeOk(MoQSessionObserver::Direction::Sent, subOk));
+  MOQ_OBSERVE_CONTROL(
+      observers_, onSubscribeOk(MoQSessionObserver::Direction::Sent, subOk));
 
   ctx.flush();
 }
@@ -6040,9 +5976,8 @@ void MoQSession::unsubscribe(
     info.fullTrackName = trackIt->second->fullTrackName();
     info.trackAlias = trackAliasIt->second;
     info.role = MoQSessionObserver::Role::Subscriber;
-    MOQ_OBSERVE(
+    MOQ_OBSERVE_SUBSCRIPTION(
         observers_,
-        kSubscription,
         onSubscriptionEnd(info, MoQSessionObserver::SubscriptionCounters{}));
   }
   trackIt->second->cancel();
@@ -6061,9 +5996,8 @@ void MoQSession::unsubscribe(
     controlWriteEvent_.signal();
   }
 
-  MOQ_OBSERVE(
+  MOQ_OBSERVE_CONTROL(
       observers_,
-      kControl,
       onUnsubscribe(MoQSessionObserver::Direction::Sent, unsubscribe));
 
   checkForCloseOnDrain();
@@ -6083,7 +6017,7 @@ void MoQSession::notifySessionEnd() {
   if (closeResult_) {
     error = closeResult_->error;
   }
-  MOQ_OBSERVE(observers_, kControl, onSessionEnd(error));
+  MOQ_OBSERVE_CONTROL(observers_, onSessionEnd(error));
 }
 
 MoQSessionObserver::SubscriptionInfo MoQSession::subscriberSubscriptionInfo(
@@ -6117,18 +6051,15 @@ MoQSessionObserver::SubscriptionInfo MoQSession::publisherSubscriptionInfo(
 
 void MoQSession::beginSubscriptionStat(PublisherImpl& pubTrack) {
   if (pubTrack.markEstablished()) {
-    MOQ_OBSERVE(
-        observers_,
-        kSubscription,
-        onSubscriptionBegin(publisherSubscriptionInfo(pubTrack)));
+    MOQ_OBSERVE_SUBSCRIPTION(
+        observers_, onSubscriptionBegin(publisherSubscriptionInfo(pubTrack)));
   }
 }
 
 void MoQSession::endSubscriptionStat(PublisherImpl& pubTrack) {
   if (pubTrack.markDone()) {
-    MOQ_OBSERVE(
+    MOQ_OBSERVE_SUBSCRIPTION(
         observers_,
-        kSubscription,
         onSubscriptionEnd(
             publisherSubscriptionInfo(pubTrack), pubTrack.counters()));
   }
@@ -6160,10 +6091,8 @@ void MoQSession::sendPublishDone(const PublishDone& pubDone) {
     return;
   }
 
-  MOQ_OBSERVE(
-      observers_,
-      kControl,
-      onPublishDone(MoQSessionObserver::Direction::Sent, pubDone));
+  MOQ_OBSERVE_CONTROL(
+      observers_, onPublishDone(MoQSessionObserver::Direction::Sent, pubDone));
   ctx->flushFinal();
   retireRequestID(/*signalWriteLoop=*/false);
 }
@@ -6271,9 +6200,8 @@ void MoQSession::sendMaxRequestID(bool signalWriteLoop) {
     controlWriteEvent_.signal();
   }
 
-  MOQ_OBSERVE(
+  MOQ_OBSERVE_CONTROL(
       observers_,
-      kControl,
       onMaxRequestID(MoQSessionObserver::Direction::Sent, maxRequestID_));
 }
 
@@ -6342,9 +6270,8 @@ void MoQSession::requestUpdate(
   }
 
   // Sent messages are reported only once the frame has actually been written.
-  MOQ_OBSERVE(
+  MOQ_OBSERVE_CONTROL(
       observers_,
-      kControl,
       onRequestUpdate(MoQSessionObserver::Direction::Sent, reqUpdate));
 }
 
@@ -6389,7 +6316,7 @@ folly::coro::Task<Publisher::FetchResult> MoQSession::fetch(
     auto duration = (std::chrono::steady_clock::now() - fetchStartTime);
     auto durationMsec =
         std::chrono::duration_cast<std::chrono::milliseconds>(duration);
-    MOQ_OBSERVE(observers_, kControl, onFetchLatency(durationMsec));
+    MOQ_OBSERVE_CONTROL(observers_, onFetchLatency(durationMsec));
   };
   auto g =
       folly::makeGuard([func = __func__] { XLOG(DBG1) << "exit " << func; });
@@ -6398,10 +6325,8 @@ folly::coro::Task<Publisher::FetchResult> MoQSession::fetch(
         std::numeric_limits<uint64_t>::max(),
         FetchErrorCode::INTERNAL_ERROR,
         "draining/closed session"};
-    MOQ_OBSERVE(
-        observers_,
-        kControl,
-        onRequestFailedLocally(FrameType::FETCH_ERROR, fetchError));
+    MOQ_OBSERVE_CONTROL(
+        observers_, onRequestFailedLocally(FrameType::FETCH_ERROR, fetchError));
     co_return folly::makeUnexpected(fetchError);
   }
   if (shouldFailNewLocalRequestDueToGoaway()) {
@@ -6409,10 +6334,8 @@ folly::coro::Task<Publisher::FetchResult> MoQSession::fetch(
         peekNextRequestID(),
         FetchErrorCode::GOING_AWAY,
         "Session received GOAWAY"};
-    MOQ_OBSERVE(
-        observers_,
-        kControl,
-        onRequestFailedLocally(FrameType::FETCH_ERROR, fetchError));
+    MOQ_OBSERVE_CONTROL(
+        observers_, onRequestFailedLocally(FrameType::FETCH_ERROR, fetchError));
     co_return folly::makeUnexpected(fetchError);
   }
 
@@ -6424,11 +6347,9 @@ folly::coro::Task<Publisher::FetchResult> MoQSession::fetch(
     // May populate joining->joiningRequestID when std::nullopt is passed.
     auto stateResult = resolveJoiningFetch(reqID, *joining, fullTrackName);
     if (stateResult.hasError()) {
-      MOQ_OBSERVE(
+      MOQ_OBSERVE_CONTROL(
           observers_,
-          kControl,
-          onRequestFailedLocally(
-              FrameType::FETCH_ERROR, stateResult.error()));
+          onRequestFailedLocally(FrameType::FETCH_ERROR, stateResult.error()));
       co_return folly::makeUnexpected(stateResult.error());
     }
   }
@@ -6458,15 +6379,13 @@ folly::coro::Task<Publisher::FetchResult> MoQSession::fetch(
         reqID,
         FetchErrorCode::INTERNAL_ERROR,
         std::move(sendResult.error().reasonPhrase)};
-    MOQ_OBSERVE(
-        observers_,
-        kControl,
-        onRequestFailedLocally(FrameType::FETCH_ERROR, fetchError));
+    MOQ_OBSERVE_CONTROL(
+        observers_, onRequestFailedLocally(FrameType::FETCH_ERROR, fetchError));
     co_return folly::makeUnexpected(fetchError);
   }
   // On the wire now, so a response can match it from here on.
-  MOQ_OBSERVE(
-      observers_, kControl, onFetch(MoQSessionObserver::Direction::Sent, fetch));
+  MOQ_OBSERVE_CONTROL(
+      observers_, onFetch(MoQSessionObserver::Direction::Sent, fetch));
   auto control = std::move(sendResult.value());
   auto trackReceiveState = std::make_shared<FetchTrackReceiveState>(
       fullTrackName, reqID, std::move(consumer), fetch.groupOrder, observers_);
@@ -6497,10 +6416,8 @@ void MoQSession::fetchOk(const FetchOk& fetchOk, ReplyContext& replyContext) {
     XLOG(ERR) << "writeFetchOk failed sess=" << this;
     return;
   }
-  MOQ_OBSERVE(
-      observers_,
-      kControl,
-      onFetchOk(MoQSessionObserver::Direction::Sent, fetchOk));
+  MOQ_OBSERVE_CONTROL(
+      observers_, onFetchOk(MoQSessionObserver::Direction::Sent, fetchOk));
   // Bidi stream stays open after FETCH_OK so the subscriber can send
   // REQUEST_UPDATE or signal cancellation via FIN/RST/STOP_SENDING.
   replyContext.flush();
@@ -6554,10 +6471,8 @@ void MoQSession::fetchCancel(
   // Reported after the cancel is signalled, on either path. Previously this
   // was logged at the top of the function, so mlog recorded a FETCH_CANCEL
   // even when the request ID was unknown and nothing was signalled at all.
-  MOQ_OBSERVE(
-      observers_,
-      kControl,
-      onFetchCancel(MoQSessionObserver::Direction::Sent, fetchCan));
+  MOQ_OBSERVE_CONTROL(
+      observers_, onFetchCancel(MoQSessionObserver::Direction::Sent, fetchCan));
 }
 
 folly::coro::Task<MoQSession::JoinResult> MoQSession::join(
@@ -6682,9 +6597,8 @@ folly::coro::Task<void> MoQSession::handlePreSetupUniStream(
     }
     peerControlStreamReceived_ = true;
 
-    MOQ_OBSERVE(
+    MOQ_OBSERVE_OBJECT(
         observers_,
-        kObject,
         onStreamTypeSet(
             MoQSessionObserver::Direction::Received,
             readHandle->getID(),
@@ -6719,9 +6633,8 @@ void MoQSession::handleClientSetup(
     bh.writeHandle->resetStream(/*error=*/0);
     bh.readHandle->stopSending(/*error=*/0);
   } else {
-    MOQ_OBSERVE(
+    MOQ_OBSERVE_OBJECT(
         observers_,
-        kObject,
         onStreamTypeSet(
             MoQSessionObserver::Direction::Received,
             bh.readHandle->getID(),
@@ -6997,9 +6910,8 @@ void MoQSession::onDatagram(std::unique_ptr<folly::IOBuf> datagram) noexcept {
         payload.reset();
       }
     }
-    MOQ_OBSERVE(
+    MOQ_OBSERVE_OBJECT(
         observers_,
-        kObject,
         onDatagramObject(
             MoQSessionObserver::Direction::Received,
             objHeader.trackAlias,
@@ -7106,7 +7018,7 @@ void MoQSession::initializeNegotiatedVersion(uint64_t negotiatedVersion) {
   // this is the point where the session context is complete: the transport
   // half was supplied by the client before this session existed.
   sessionContext_.negotiatedVersion = negotiatedVersion;
-  MOQ_OBSERVE(observers_, kControl, onSessionStart(sessionContext_));
+  MOQ_OBSERVE_CONTROL(observers_, onSessionStart(sessionContext_));
 }
 
 /*static*/
@@ -7328,9 +7240,8 @@ void MoQSession::onRequestOk(RequestOk requestOk, FrameType frameType) {
 
 void MoQSession::onPublishNamespaceDone(
     PublishNamespaceDone publishNamespaceDone) {
-  MOQ_OBSERVE(
+  MOQ_OBSERVE_CONTROL(
       observers_,
-      kControl,
       onPublishNamespaceDone(
           MoQSessionObserver::Direction::Received, publishNamespaceDone));
 
@@ -7343,9 +7254,8 @@ void MoQSession::onPublishNamespaceCancel(
     PublishNamespaceCancel publishNamespaceCancel) {
   XLOG(DBG1) << __func__ << " ns=" << publishNamespaceCancel.trackNamespace
              << " - ignored by simple client, sess=" << this;
-  MOQ_OBSERVE(
+  MOQ_OBSERVE_CONTROL(
       observers_,
-      kControl,
       onPublishNamespaceCancel(
           MoQSessionObserver::Direction::Received, publishNamespaceCancel));
 }
@@ -7407,9 +7317,8 @@ void MoQSession::onUnsubscribeNamespace(
                << " - ignored by simple client, sess=" << this;
   }
 
-  MOQ_OBSERVE(
+  MOQ_OBSERVE_CONTROL(
       observers_,
-      kControl,
       onUnsubscribeNamespace(
           MoQSessionObserver::Direction::Received, unsubscribeNamespace));
 }
@@ -7428,9 +7337,8 @@ void MoQSession::publishNamespaceError(
     XLOG(ERR) << "writePublishNamespaceError failed sess=" << this;
     return;
   }
-  MOQ_OBSERVE(
+  MOQ_OBSERVE_CONTROL(
       observers_,
-      kControl,
       onPublishNamespaceError(
           MoQSessionObserver::Direction::Sent, publishNamespaceError));
   replyContext.flushFinal();
@@ -7446,9 +7354,8 @@ void MoQSession::subscribeNamespaceError(
     XLOG(ERR) << "writeSubscribeNamespaceError failed sess=" << this;
     return;
   }
-  MOQ_OBSERVE(
+  MOQ_OBSERVE_CONTROL(
       observers_,
-      kControl,
       onSubscribeNamespaceError(
           MoQSessionObserver::Direction::Sent, subscribeNamespaceError));
 }
@@ -7486,9 +7393,8 @@ void MoQSession::subscribeTracksError(
     XLOG(ERR) << "writeSubscribeTracksError failed sess=" << this;
     return;
   }
-  MOQ_OBSERVE(
+  MOQ_OBSERVE_CONTROL(
       observers_,
-      kControl,
       onSubscribeTracksError(
           MoQSessionObserver::Direction::Sent, subscribeTracksError));
 }

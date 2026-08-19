@@ -34,7 +34,7 @@ TEST(MoQSessionObserverTest, EmptyListIsInertAndCheap) {
 
   // Notifying an empty list must not crash or invoke anything.
   SubscribeOk ok;
-  MOQ_OBSERVE(list, kControl, onSubscribeOk(Direction::Sent, ok));
+  MOQ_OBSERVE_CONTROL(list, onSubscribeOk(Direction::Sent, ok));
 }
 
 TEST(MoQSessionObserverTest, AddNullObserverIsIgnored) {
@@ -90,16 +90,15 @@ TEST(MoQSessionObserverTest, InterestsMaskGatesTheObjectTier) {
   Payload payload;
   // Only the tracer may be notified, even though both are registered.
   EXPECT_CALL(*tracer, onSubgroupObject(Direction::Sent, 4, _, _, _)).Times(1);
-  MOQ_OBSERVE(
+  MOQ_OBSERVE_OBJECT(
       list,
-      kObject,
       onSubgroupObject(Direction::Sent, 4, TrackAlias(9), header, payload));
 
   // And symmetrically, a control event must not reach the object-only tracer.
   SubscribeOk ok;
   ok.requestID = RequestID(3);
   EXPECT_CALL(*quiet, onSubscribeOk(Direction::Received, _)).Times(1);
-  MOQ_OBSERVE(list, kControl, onSubscribeOk(Direction::Received, ok));
+  MOQ_OBSERVE_CONTROL(list, onSubscribeOk(Direction::Received, ok));
 }
 
 TEST(MoQSessionObserverTest, ObserversAreNotifiedInRegistrationOrder) {
@@ -114,7 +113,7 @@ TEST(MoQSessionObserverTest, ObserversAreNotifiedInRegistrationOrder) {
   EXPECT_CALL(*second, onGoaway(Direction::Sent, _));
 
   Goaway goaway;
-  MOQ_OBSERVE(list, kControl, onGoaway(Direction::Sent, goaway));
+  MOQ_OBSERVE_CONTROL(list, onGoaway(Direction::Sent, goaway));
 }
 
 TEST(MoQSessionObserverTest, DirectionIsForwardedVerbatim) {
@@ -126,8 +125,8 @@ TEST(MoQSessionObserverTest, DirectionIsForwardedVerbatim) {
   EXPECT_CALL(*observer, onSubscribe(Direction::Received, _)).Times(1);
 
   SubscribeRequest req;
-  MOQ_OBSERVE(list, kControl, onSubscribe(Direction::Sent, req));
-  MOQ_OBSERVE(list, kControl, onSubscribe(Direction::Received, req));
+  MOQ_OBSERVE_CONTROL(list, onSubscribe(Direction::Sent, req));
+  MOQ_OBSERVE_CONTROL(list, onSubscribe(Direction::Received, req));
 }
 
 TEST(MoQSessionObserverTest, SubscriptionCountersArriveAtEnd) {
@@ -163,18 +162,18 @@ TEST(MoQSessionObserverTest, SubscriptionCountersArriveAtEnd) {
         EXPECT_EQ(*c.endReason, PublishDoneStatusCode::SUBSCRIPTION_ENDED);
       }));
 
-  MOQ_OBSERVE(list, kSubscription, onSubscriptionBegin(info));
-  MOQ_OBSERVE(list, kSubscription, onSubscriptionEnd(info, counters));
+  MOQ_OBSERVE_SUBSCRIPTION(list, onSubscriptionBegin(info));
+  MOQ_OBSERVE_SUBSCRIPTION(list, onSubscriptionEnd(info, counters));
 }
 
 TEST(MoQSessionObserverTest, NullListPointerIsANoOp) {
   std::shared_ptr<MoQSessionObserverList> list;
   SubscribeOk ok;
   // Helper objects can outlive/predate observer attachment; this must be safe.
-  MOQ_OBSERVE(list, kControl, onSubscribeOk(Direction::Sent, ok));
+  MOQ_OBSERVE_CONTROL(list, onSubscribeOk(Direction::Sent, ok));
 
   const MoQSessionObserverList* raw = nullptr;
-  MOQ_OBSERVE(raw, kControl, onSubscribeOk(Direction::Sent, ok));
+  MOQ_OBSERVE_CONTROL(raw, onSubscribeOk(Direction::Sent, ok));
 }
 
 TEST(MoQSessionObserverTest, SharedPointerAndReferenceFormsBothWork) {
@@ -183,8 +182,8 @@ TEST(MoQSessionObserverTest, SharedPointerAndReferenceFormsBothWork) {
   list->add(observer);
 
   EXPECT_CALL(*observer, onMaxRequestID(Direction::Sent, 17u)).Times(2);
-  MOQ_OBSERVE(list, kControl, onMaxRequestID(Direction::Sent, 17));
-  MOQ_OBSERVE(*list, kControl, onMaxRequestID(Direction::Sent, 17));
+  MOQ_OBSERVE_CONTROL(list, onMaxRequestID(Direction::Sent, 17));
+  MOQ_OBSERVE_CONTROL(*list, onMaxRequestID(Direction::Sent, 17));
 }
 
 TEST(MoQSessionObserverTest, DefaultObserverWantsNothing) {
@@ -201,5 +200,5 @@ TEST(MoQSessionObserverTest, DefaultObserverWantsNothing) {
 
   // Registered but uninterested: nothing is dispatched to it.
   SubscribeOk ok;
-  MOQ_OBSERVE(list, kControl, onSubscribeOk(Direction::Sent, ok));
+  MOQ_OBSERVE_CONTROL(list, onSubscribeOk(Direction::Sent, ok));
 }
