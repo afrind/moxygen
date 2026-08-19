@@ -146,8 +146,16 @@ class MoQRelaySession::SubscribeNamespaceHandle
       if (control_) {
         // Draft 16+: the spec accepts either FIN or RESET_STREAM as the
         // cancel signal; RST matches SUBSCRIBE / FETCH / SUBSCRIBE_TRACKS.
-        MOQ_SUBSCRIBER_STATS(
-            session_->subscriberStatsCallback_, onUnsubscribeNamespace);
+        // No UNSUBSCRIBE_NAMESPACE frame goes out on this path -- the RST is
+        // the cancel signal -- so describe it with the request ID the reset
+        // refers to.
+        UnsubscribeNamespace cancelled;
+        cancelled.requestID = subscribeNamespaceOk_->requestID;
+        MOQ_OBSERVE(
+            session_->observers_,
+            kControl,
+            onUnsubscribeNamespace(
+                MoQSessionObserver::Direction::Sent, cancelled));
         control_->cancel(ResetStreamErrorCode::CANCELLED);
       } else {
         // Draft <=15: Send UnsubscribeNamespace on the control stream
@@ -650,10 +658,10 @@ MoQRelaySession::sendRequestUpdateOnBidi(
             "writeRequestUpdate failed"});
   }
 
-  if (logger_) {
-    logger_->logSubscribeUpdate(reqUpdate);
-  }
-  MOQ_SUBSCRIBER_STATS(subscriberStatsCallback_, onRequestUpdate);
+  MOQ_OBSERVE(
+      observers_,
+      kControl,
+      onRequestUpdate(MoQSessionObserver::Direction::Sent, reqUpdate));
 
   // Register the pending state before writing so the REQUEST_OK / REQUEST_ERROR
   // response can never race ahead of the promise. onRequestOk /
@@ -845,10 +853,8 @@ MoQRelaySession::publishNamespace(
         (std::chrono::steady_clock::now() - publishNamespaceStartTime);
     auto durationMsec =
         std::chrono::duration_cast<std::chrono::milliseconds>(duration);
-    MOQ_PUBLISHER_STATS(
-        publisherStatsCallback_,
-        recordPublishNamespaceLatency,
-        durationMsec.count());
+    MOQ_OBSERVE(
+        observers_, kControl, onPublishNamespaceLatency(durationMsec));
   };
   const auto& trackNamespace = ann.trackNamespace;
   if (shouldFailNewLocalRequestDueToGoaway()) {
@@ -902,7 +908,7 @@ MoQRelaySession::publishNamespace(
     // count.
     co_return folly::makeUnexpected(publishNamespaceResult.error());
   } else {
-    MOQ_PUBLISHER_STATS(publisherStatsCallback_, onPublishNamespaceSuccess);
+    // Reported where PUBLISH_NAMESPACE_OK is parsed; see the error branch.
     co_return std::make_shared<PublisherPublishNamespaceHandle>(
         std::static_pointer_cast<MoQRelaySession>(shared_from_this()),
         trackNamespace,
@@ -985,14 +991,11 @@ void MoQRelaySession::onRequestOk(RequestOk requestOk, FrameType frameType) {
 
 void MoQRelaySession::onPublishNamespaceCancel(
     PublishNamespaceCancel publishNamespaceCancel) {
-  MOQ_PUBLISHER_STATS(publisherStatsCallback_, onPublishNamespaceCancel);
-
-  if (logger_) {
-    logger_->logPublishNamespaceCancel(
-        publishNamespaceCancel,
-        MOQTByteStringType::STRING_VALUE,
-        ControlMessageType::PARSED);
-  }
+  MOQ_OBSERVE(
+      observers_,
+      kControl,
+      onPublishNamespaceCancel(
+          MoQSessionObserver::Direction::Received, publishNamespaceCancel));
 
   std::shared_ptr<Subscriber::PublishNamespaceCallback> cb;
 
@@ -1036,11 +1039,10 @@ void MoQRelaySession::onPublishNamespaceCancel(
 void MoQRelaySession::publishNamespaceDone(
     const PublishNamespaceDone& unann,
     std::shared_ptr<ReplyContext> replyCtx) {
-  MOQ_PUBLISHER_STATS(publisherStatsCallback_, onPublishNamespaceDone);
-
-  if (logger_) {
-    logger_->logPublishNamespaceDone(unann);
-  }
+  MOQ_OBSERVE(
+      observers_,
+      kControl,
+      onPublishNamespaceDone(MoQSessionObserver::Direction::Sent, unann));
 
   // Lambda helper to fail a pending publishNamespace and erase it
   auto failPendingPublishNamespace = [this](auto pendingIt, RequestID reqId) {
@@ -1232,24 +1234,26 @@ void MoQRelaySession::publishNamespaceOk(
     ReplyContext& replyContext) {
   XLOG(DBG1) << __func__ << " reqID=" << annOk.requestID << " sess=" << this;
 
-  if (logger_) {
-    logger_->logPublishNamespaceOk(annOk);
-  }
-
-  MOQ_SUBSCRIBER_STATS(subscriberStatsCallback_, onPublishNamespaceSuccess);
   auto res =
       moqFrameWriter_.writePublishNamespaceOk(replyContext.writeBuf(), annOk);
   if (!res) {
     XLOG(ERR) << "writePublishNamespaceOk failed sess=" << this;
     return;
   }
+  MOQ_OBSERVE(
+      observers_,
+      kControl,
+      onPublishNamespaceOk(MoQSessionObserver::Direction::Sent, annOk));
   replyContext.flush();
 }
 
 void MoQRelaySession::publishNamespaceCancel(
     const PublishNamespaceCancel& annCan,
     std::shared_ptr<ReplyContext> replyContext) {
-  MOQ_SUBSCRIBER_STATS(subscriberStatsCallback_, onPublishNamespaceCancel);
+  MOQ_OBSERVE(
+      observers_,
+      kControl,
+      onPublishNamespaceCancel(MoQSessionObserver::Direction::Sent, annCan));
   if (useUniControlStreams(*getNegotiatedVersion())) {
     // Draft 18+: PUBLISH_NAMESPACE_CANCEL was removed from the wire. Cancel
     // by RSTing our read half of the PUBLISH_NAMESPACE bidi stream.
@@ -1277,7 +1281,10 @@ void MoQRelaySession::publishNamespaceCancel(
 }
 
 void MoQRelaySession::onPublishNamespaceDone(PublishNamespaceDone unAnn) {
-  MOQ_SUBSCRIBER_STATS(subscriberStatsCallback_, onPublishNamespaceDone);
+  MOQ_OBSERVE(
+      observers_,
+      kControl,
+      onPublishNamespaceDone(MoQSessionObserver::Direction::Received, unAnn));
 
   // Set up request context so publishNamespaceDone() can identify this
   // session. This is needed because MoQRelay::publishNamespaceDone() uses
@@ -1453,7 +1460,8 @@ MoQRelaySession::subscribeNamespace(
     // publishNamespace() above.
     co_return folly::makeUnexpected(subAnnResult.error());
   } else {
-    MOQ_SUBSCRIBER_STATS(subscriberStatsCallback_, onSubscribeNamespaceSuccess);
+    // Reported where SUBSCRIBE_NAMESPACE_OK is parsed, so it fires once
+    // whether or not a coroutine is still awaiting.
     co_return std::make_shared<SubscribeNamespaceHandle>(
         std::static_pointer_cast<MoQRelaySession>(shared_from_this()),
         trackNamespace,
@@ -1474,7 +1482,6 @@ void MoQRelaySession::unsubscribeNamespace(
                << " sess=" << this;
   }
 
-  MOQ_SUBSCRIBER_STATS(subscriberStatsCallback_, onUnsubscribeNamespace);
   auto res =
       moqFrameWriter_.writeUnsubscribeNamespace(controlWriteBuf_, unsubAnn);
   if (!res) {
@@ -1482,9 +1489,10 @@ void MoQRelaySession::unsubscribeNamespace(
     return;
   }
 
-  if (logger_) {
-    logger_->logUnsubscribeNamespace(unsubAnn);
-  }
+  MOQ_OBSERVE(
+      observers_,
+      kControl,
+      onUnsubscribeNamespace(MoQSessionObserver::Direction::Sent, unsubAnn));
 
   controlWriteEvent_.signal();
 }
@@ -1624,23 +1632,22 @@ void MoQRelaySession::subscribeNamespaceOk(
     const SubscribeNamespaceOk& saOk,
     std::shared_ptr<SubNSReply>&& subNsReply) {
   XLOG(DBG1) << __func__ << " id=" << saOk.requestID << " sess=" << this;
-  MOQ_PUBLISHER_STATS(publisherStatsCallback_, onSubscribeNamespaceSuccess);
   auto res = subNsReply->ok(saOk);
   if (!res) {
     XLOG(ERR) << "writeSubscribeNamespaceOk failed sess=" << this;
     return;
   }
-  if (logger_) {
-    logger_->logSubscribeNamespaceOk(saOk);
-  }
+  MOQ_OBSERVE(
+      observers_,
+      kControl,
+      onSubscribeNamespaceOk(MoQSessionObserver::Direction::Sent, saOk));
 }
 
 void MoQRelaySession::onUnsubscribeNamespace(UnsubscribeNamespace unsub) {
-  if (logger_) {
-    logger_->logUnsubscribeNamespace(
-        unsub, MOQTByteStringType::STRING_VALUE, ControlMessageType::PARSED);
-  }
-  MOQ_PUBLISHER_STATS(publisherStatsCallback_, onUnsubscribeNamespace);
+  MOQ_OBSERVE(
+      observers_,
+      kControl,
+      onUnsubscribeNamespace(MoQSessionObserver::Direction::Received, unsub));
   if (!publishHandler_) {
     XLOG(DBG1) << __func__ << "No publisher callback set";
     return;
@@ -1828,7 +1835,8 @@ MoQRelaySession::subscribeTracks(
     }
     co_return folly::makeUnexpected(subTracksResult.error());
   }
-  MOQ_SUBSCRIBER_STATS(subscriberStatsCallback_, onSubscribeTracksSuccess);
+  // Reported where the REQUEST_OK is parsed, in
+  // handleSubscribeTracksOkFromRequestOk.
   co_return std::make_shared<SubscribeTracksHandle>(
       std::static_pointer_cast<MoQRelaySession>(shared_from_this()),
       std::move(subTracksResult.value()),
@@ -1916,11 +1924,15 @@ void MoQRelaySession::subscribeTracksOk(
     const RequestOk& subTracksOk,
     std::shared_ptr<SubscribeTracksReply>&& subTracksReply) {
   XLOG(DBG1) << __func__ << " id=" << subTracksOk.requestID << " sess=" << this;
-  MOQ_PUBLISHER_STATS(publisherStatsCallback_, onSubscribeTracksSuccess);
   auto res = subTracksReply->ok(subTracksOk);
   if (!res) {
     XLOG(ERR) << "writeSubscribeTracksOk failed sess=" << this;
+    return;
   }
+  MOQ_OBSERVE(
+      observers_,
+      kControl,
+      onSubscribeTracksOk(MoQSessionObserver::Direction::Sent, subTracksOk));
 }
 
 void MoQRelaySession::onSubscribeTracksStreamClosed(RequestID requestID) {
@@ -1951,9 +1963,10 @@ void MoQRelaySession::handlePublishNamespaceOkFromRequestOk(
   XLOG(DBG1) << __func__ << " reqID=" << requestOk.requestID
              << " sess=" << this;
 
-  if (logger_) {
-    logger_->logPublishNamespaceOk(requestOk, ControlMessageType::PARSED);
-  }
+  MOQ_OBSERVE(
+      observers_,
+      kControl,
+      onPublishNamespaceOk(MoQSessionObserver::Direction::Received, requestOk));
 
   auto* publishNamespacePtr =
       MoQRelayPendingRequestState::tryGetPublishNamespace(reqIt->second.get());
@@ -1980,9 +1993,11 @@ void MoQRelaySession::handleSubscribeNamespaceOkFromRequestOk(
   XLOG(DBG1) << __func__ << " reqID=" << requestOk.requestID
              << " sess=" << this;
 
-  if (logger_) {
-    logger_->logSubscribeNamespaceOk(requestOk, ControlMessageType::PARSED);
-  }
+  MOQ_OBSERVE(
+      observers_,
+      kControl,
+      onSubscribeNamespaceOk(
+          MoQSessionObserver::Direction::Received, requestOk));
 
   auto* subscribeNamespacePtr =
       MoQRelayPendingRequestState::tryGetSubscribeNamespace(
@@ -2010,6 +2025,11 @@ void MoQRelaySession::handleSubscribeTracksOkFromRequestOk(
     close(SessionCloseErrorCode::PROTOCOL_VIOLATION);
     return;
   }
+  MOQ_OBSERVE(
+      observers_,
+      kControl,
+      onSubscribeTracksOk(
+          MoQSessionObserver::Direction::Received, requestOk));
   subscribeTracksPtr->setValue(requestOk);
 }
 
