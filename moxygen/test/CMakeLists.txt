@@ -109,6 +109,7 @@ moxygen_add_test(TARGET MoQSessionObserverTests
   SOURCES
     MoQSessionObserverTest.cpp
   DEPENDS
+    Folly::folly_coro_task
     moxygen_moq_framer
     moxygen_stats_moq_stats
     testmain
