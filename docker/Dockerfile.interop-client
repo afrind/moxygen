@@ -43,20 +43,31 @@
   # Set up working directory
   WORKDIR /app
 
-  # Copy the rest of the project files
-  COPY . .
+  # build/ holds the manifests and the pinned dependency revs, so the layers
+  # below it are invalidated only by the daily rev bump, not by every push.
+  COPY build/ ./build/
 
   # Run the build script using getdeps.py (already running as root)
   # First install system dependencies to reduce compilation
   RUN ./build/fbcode_builder/getdeps.py install-system-deps --recursive moxygen
 
-  RUN ./build/fbcode_builder/getdeps.py build --allow-system-packages --verbose moxygen 2>&1 || \
+  # proxygen is moxygen's entire dependency closure. --no-tests is required:
+  # it makes proxygen hash the same here as it does as a dep of the moxygen
+  # build below, which is what lets that build reuse this layer.
+  RUN ./build/fbcode_builder/getdeps.py build --allow-system-packages --no-tests proxygen
+
+  # Copy the rest of the project files
+  COPY . .
+
+  # --src-dir=. is load-bearing: without it getdeps clones moxygen from GitHub
+  # and builds that instead of the tree copied above.
+  RUN ./build/fbcode_builder/getdeps.py build --allow-system-packages --verbose --src-dir=. moxygen 2>&1 || \
       (echo "=== Build failed, showing logs ===" && \
        find /tmp -path '*/extracted' -prune -o -name "*.log" -type f -exec echo "=== {} ===" \; -exec tail -200 {} \; 2>/dev/null; \
        exit 1)
 
   # Stage the binary and getdeps-built shared libs for the runtime image
-  RUN INST_DIR=$(./build/fbcode_builder/getdeps.py show-inst-dir moxygen) && \
+  RUN INST_DIR=$(./build/fbcode_builder/getdeps.py show-inst-dir --src-dir=. moxygen) && \
       GETDEPS_INSTALLED=$(./build/fbcode_builder/getdeps.py show-scratch-dir)/installed && \
       mkdir -p /staging/bin /staging/lib && \
       cp $INST_DIR/bin/moq_interop_client /staging/bin/ && \

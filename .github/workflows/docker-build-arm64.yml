@@ -8,6 +8,8 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository_owner }}/moqrelay
+  # Skip build-push-action's per-run .dockerbuild artifact upload.
+  DOCKER_BUILD_RECORD_UPLOAD: 'false'
 
 jobs:
   build-arm64:
@@ -22,17 +24,31 @@ jobs:
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Log in to registry
         if: github.event_name != 'pull_request'
         run: |
-          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u $ --password-stdin
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
 
+      # Separate cache ref from amd64: same image name, incompatible layers.
+      # ignore-error keeps a failed cache export from failing a good build.
+      # provenance must stay off: load selects the docker exporter, which
+      # cannot export attestations, and buildx errors rather than skipping.
       - name: Build arm64 image
-        run: |
-          docker build . -f docker/Dockerfile \
-            --platform linux/arm64 \
-            -t ghcr.io/${{ env.IMAGE_NAME }}:latest-arm64 \
-            -t ghcr.io/${{ env.IMAGE_NAME }}:${{ github.sha }}-arm64
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/arm64
+          load: true
+          provenance: false
+          tags: |
+            ghcr.io/${{ env.IMAGE_NAME }}:latest-arm64
+            ghcr.io/${{ env.IMAGE_NAME }}:${{ github.sha }}-arm64
+          cache-from: type=registry,ref=ghcr.io/${{ env.IMAGE_NAME }}:buildcache-arm64
+          cache-to: type=registry,ref=ghcr.io/${{ env.IMAGE_NAME }}:buildcache-arm64,mode=max,ignore-error=true
 
       - name: Smoke test arm64 image
         run: |

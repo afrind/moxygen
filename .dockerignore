@@ -1,6 +1,8 @@
 _build/
 .git/
 .github/
+.claude/
+.vscode/
 CMakeCache.txt
 CMakeFiles/
 Testing/

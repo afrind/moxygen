@@ -10,6 +10,8 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository_owner }}/moqrelay
+  # Skip build-push-action's per-run .dockerbuild artifact upload.
+  DOCKER_BUILD_RECORD_UPLOAD: 'false'
 
 jobs:
   build-amd64:
@@ -21,16 +23,33 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Log in to registry
         if: github.event_name != 'pull_request'
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
 
+      # The layer cache lives in ghcr rather than the Actions cache, which is
+      # already at its 10 GiB repo quota. mode=max is required to cache the
+      # builder stage; mode=min would only cover the small runtime image.
+      # ignore-error keeps a failed cache export from failing a good build.
+      # provenance must stay off: load selects the docker exporter, which
+      # cannot export attestations, and buildx errors rather than skipping.
       - name: Build amd64 image
-        run: |
-          docker build --progress=plain . -f docker/Dockerfile \
-            -t ghcr.io/${{ env.IMAGE_NAME }}:latest-amd64 \
-            -t ghcr.io/${{ env.IMAGE_NAME }}:${{ github.sha }}-amd64
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64
+          load: true
+          provenance: false
+          tags: |
+            ghcr.io/${{ env.IMAGE_NAME }}:latest-amd64
+            ghcr.io/${{ env.IMAGE_NAME }}:${{ github.sha }}-amd64
+          cache-from: type=registry,ref=ghcr.io/${{ env.IMAGE_NAME }}:buildcache-amd64
+          cache-to: type=registry,ref=ghcr.io/${{ env.IMAGE_NAME }}:buildcache-amd64,mode=max,ignore-error=true
 
       - name: Smoke test amd64 image
         run: |
