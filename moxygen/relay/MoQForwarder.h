@@ -161,8 +161,8 @@ class MoQForwarder : public TrackConsumer {
 
    private:
     // Updates shouldForward and keeps forwardingSubscribers_ in sync,
-    // firing forwardChanged when the count crosses zero.  Shared by
-    // onPublishOk and requestUpdate.
+    // firing forwardChanged when the count crosses zero or after a refusal.
+    // Shared by onPublishOk and requestUpdate.
     void updateForwardState(bool newForward);
   };
 
@@ -328,6 +328,9 @@ class MoQForwarder : public TrackConsumer {
 
   void addForwardingSubscriber();
 
+  // Fires forwardChanged(true) after a refusal without a count change.
+  void renewForwarding();
+
   void removeForwardingSubscriber();
 
   uint64_t numForwardingSubscribers() const {
@@ -399,6 +402,9 @@ class MoQForwarder : public TrackConsumer {
   std::optional<uint64_t> outstandingNewGroupRequest_{};
   std::shared_ptr<Callback> callback_;
   uint64_t forwardingSubscribers_{0};
+  // True from refusing a subgroup to the publisher until the next
+  // forwardChanged(true).
+  bool refusedUpstream_{false};
   bool draining_{false};
 };
 
