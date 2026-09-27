@@ -179,8 +179,8 @@ class MoQForwarder : public TrackConsumer {
     return subscribers_.empty();
   }
 
-  std::shared_ptr<Subscriber> getSubscriber(MoQSession* session) const {
-    auto it = subscribers_.find(static_cast<const void*>(session));
+  std::shared_ptr<Subscriber> getSubscriber(SessionId sessionId) const {
+    auto it = subscribers_.find(sessionId);
     return it != subscribers_.end() ? it->second : nullptr;
   }
 
@@ -193,6 +193,15 @@ class MoQForwarder : public TrackConsumer {
       SessionId sessionId,
       bool forward);
 
+  // A passive subscriber receives objects but does not count toward
+  // forwardChanged or onEmpty. A subscriber without a session takes its id
+  // from MoQSession::makeSessionId().
+  std::shared_ptr<MoQForwarder::Subscriber> addSubscriber(
+      SessionId sessionId,
+      bool forward,
+      std::shared_ptr<TrackConsumer> consumer,
+      bool passive = false);
+
   folly::Expected<SubscribeRange, FetchError> resolveJoiningFetch(
       SessionId sessionId,
       const JoiningFetch& joining) const;
@@ -201,13 +210,6 @@ class MoQForwarder : public TrackConsumer {
   // open subgroups. Calls removeSubscriber() if no subgroups are open.
   void drainSubscriber(
       SessionId sessionId,
-      PublishDone pubDone,
-      const std::string& callsite);
-
-  // Same as drainSubscriber but looks up by mapKey rather than session pointer.
-  // Use this for channel subscribers (keyed by executor, session is null).
-  void drainSubscriberByKey(
-      const void* mapKey,
       PublishDone pubDone,
       const std::string& callsite);
 
@@ -442,13 +444,6 @@ class MoQForwarder : public TrackConsumer {
   // Helper that removes a subscriber given an iterator (avoids lookup)
   void removeSubscriberIt(
       SubscriberMap::iterator subIt,
-      std::optional<PublishDone> pubDone,
-      const std::string& callsite);
-
-  // Helper that looks up by mapKey and removes (used internally where a
-  // Subscriber reference is available but no session pointer)
-  void removeSubscriberByKey(
-      const void* key,
       std::optional<PublishDone> pubDone,
       const std::string& callsite);
 

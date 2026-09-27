@@ -174,6 +174,10 @@ class MoQSession : public Subscriber,
     return id_;
   }
 
+  // Unique within the process, so a forwarder subscriber that is not a session
+  // can use one as its key.
+  static SessionId makeSessionId();
+
   void setServerMaxTokenCacheSizeGuess(size_t size);
 
   class ServerSetupCallback {
@@ -853,8 +857,6 @@ class MoQSession : public Subscriber,
  private:
   static const folly::RequestToken& sessionRequestToken();
 
-  static SessionId makeSessionId();
-
   const SessionId id_{makeSessionId()};
 
   folly::coro::Task<void> controlWriteLoop(
@@ -1458,6 +1460,11 @@ class MoQSession : public Subscriber,
 
   // Private implementation methods
   void initializeNegotiatedVersion(uint64_t negotiatedVersion);
+  // Records one half of the setup exchange. Once both halves are in, computes
+  // the negotiated extensions and pushes them to the framers, which is why
+  // this runs before any frame that an extension could alter is sent or
+  // parsed.
+  void onSetupParams(SetupParameters params, bool local);
   void pruneBufferedSubgroups(TrackAlias alias);
   void scheduleGoawayTimeout(uint64_t timeoutMs);
   void cancelGoawayTimeout();
