@@ -25,16 +25,21 @@ INSTANTIATE_TEST_SUITE_P(
     testing::ValuesIn(getSupportedVersionParams()));
 
 // Both halves of the setup exchange are retained on both endpoints, which is
-// what extension negotiation runs on.
+// what extension negotiation runs on. Draft 18+ does not send MAX_REQUEST_ID,
+// so the peer copy only carries it on earlier drafts.
 TEST_P(OpenMOQSetupTest, SetupParamsRetainedOnBothEndpoints) {
   folly::coro::blockingWait(setupMoQSession(), getExecutor());
+  const bool peerHasMaxRequestID =
+      !useBidiRequestStreams(getServerSelectedVersion());
   for (auto* session : {clientSession_.get(), serverSession_.get()}) {
     ASSERT_TRUE(session->getLocalSetupParams().has_value());
     ASSERT_TRUE(session->getPeerSetupParams().has_value());
     EXPECT_TRUE(session->getLocalSetupParams()->hasParam(
         folly::to_underlying(SetupKey::MAX_REQUEST_ID)));
-    EXPECT_TRUE(session->getPeerSetupParams()->hasParam(
-        folly::to_underlying(SetupKey::MAX_REQUEST_ID)));
+    EXPECT_EQ(
+        session->getPeerSetupParams()->hasParam(
+            folly::to_underlying(SetupKey::MAX_REQUEST_ID)),
+        peerHasMaxRequestID);
   }
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
 }
