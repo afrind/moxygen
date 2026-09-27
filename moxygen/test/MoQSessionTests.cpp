@@ -1618,6 +1618,18 @@ CO_TEST_P_X(MoQSessionTest, DatagramBeforeSetup) {
   EXPECT_TRUE(clientWt_->isSessionClosed());
   co_return;
 }
+CO_TEST_P_X(Draft18Test, PeerRequestIDAtEndOfSpaceClosesSession) {
+  co_await setupMoQSession();
+
+  auto subscribeRequest = getSubscribe(kTestTrackName);
+  subscribeRequest.requestID =
+      RequestID(std::numeric_limits<uint64_t>::max() - 1);
+  static_cast<MoQControlCodec::ControlCallback&>(*serverSession_)
+      .onSubscribe(subscribeRequest);
+
+  EXPECT_TRUE(serverWt_->isSessionClosed());
+}
+
 CO_TEST_P_X(Draft18Test, PaddingDatagramIsDiscarded) {
   co_await setupMoQSession();
   MoQFrameWriter writer;
@@ -1662,6 +1674,27 @@ CO_TEST_P_X(MoQSessionTest, EmptyUnidirectionalStream) {
 
   co_await folly::coro::sleep(std::chrono::milliseconds(50));
   clientSession_->close(SessionCloseErrorCode::NO_ERROR);
+}
+
+// cleanup() erases the pubTracks_ entry before retiring the publisher, so the
+// PUBLISH_DONE it used to send could only miss its own lookup and never reached
+// the wire. The stat has to stay silent with it.
+CO_TEST_P_X(MoQSessionTest, SessionCloseRetiresPublisherWithoutPublishDone) {
+  co_await setupMoQSession();
+  expectSubscribe([](auto sub, auto pub) -> TaskSubscribeResult {
+    EXPECT_FALSE(pub->beginSubgroup(0, 0, 0).hasError());
+    co_return makeSubscribeOkResult(sub, AbsoluteLocation{0, 0});
+  });
+  auto res = co_await clientSession_->subscribe(
+      getSubscribe(kTestTrackName), subscribeCallback_);
+  EXPECT_FALSE(res.hasError());
+
+  EXPECT_CALL(*serverPublisherStatsCallback_, onPublishDone(_)).Times(0);
+  EXPECT_CALL(*subscribeCallback_, publishDone(_))
+      .WillOnce(testing::Return(folly::unit));
+
+  serverSession_->close(SessionCloseErrorCode::NO_ERROR);
+  co_await rescheduleN(2);
 }
 
 // === Uni Control Stream tests (draft-18-meta-00) ===

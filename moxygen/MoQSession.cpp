@@ -1475,6 +1475,13 @@ class MoQSession::TrackPublisherImpl : public MoQSession::PublisherImpl,
     }
   }
 
+  void sessionClosed(ResetStreamErrorCode code) override {
+    // Clear session_ last: each subgroup reports onSubscriptionStreamClosed.
+    resetAllSubgroups(code);
+    subscriptionHandle_.reset();
+    setSession(nullptr);
+  }
+
   void resetForGoaway(ResetStreamErrorCode code) override {
     if (!subscriptionHandle_) {
       resetAllSubgroups(code);
@@ -1632,6 +1639,15 @@ class MoQSession::FetchPublisherImpl : public MoQSession::PublisherImpl {
     reset(error);
   }
 
+  void sessionClosed(ResetStreamErrorCode code) override {
+    // Clear streamPublisher_ first so onStreamComplete skips fetchComplete.
+    // Clear session_ last: the reset reports onSubgroupReset.
+    if (auto streamPublisher = std::exchange(streamPublisher_, nullptr)) {
+      streamPublisher->reset(code);
+    }
+    setSession(nullptr);
+  }
+
   void resetForGoaway(ResetStreamErrorCode code) override {
     // Reset the request (bidi) stream first; reset() below resets the data
     // stream and drives fetchComplete -> pubTracks_.erase + retireRequestID.
@@ -1649,6 +1665,10 @@ class MoQSession::FetchPublisherImpl : public MoQSession::PublisherImpl {
 
   void onStreamComplete(const ObjectHeader&) override {
     cancelGoawayResetTimer();
+    if (!streamPublisher_) {
+      // sessionClosed() cleared streamPublisher_ and retired this publisher.
+      return;
+    }
     streamPublisher_.reset();
     PublisherImpl::fetchComplete();
   }
@@ -2591,20 +2611,13 @@ void MoQSession::cleanup() {
   }
   while (!pubTracks_.empty()) {
     auto it = pubTracks_.begin();
-    auto requestID = it->first;
     auto pubTrack = std::move(it->second);
     pubTracks_.erase(it);
     if (const auto& control = pubTrack->bidiControl()) {
       control->disarmOnPeerTermination();
     }
     endSubscriptionStat(*pubTrack);
-    pubTrack->terminatePublish(
-        PublishDone(
-            {requestID,
-             PublishDoneStatusCode::SESSION_CLOSED,
-             0,
-             "Session Closed"}),
-        ResetStreamErrorCode::SESSION_CLOSED);
+    pubTrack->sessionClosed(ResetStreamErrorCode::SESSION_CLOSED);
   }
   for (auto it = subTracks_.begin(); it != subTracks_.end();) {
     auto sub = it->second;
@@ -3098,6 +3111,11 @@ void MoQSession::initLocalMaxRequestID(uint64_t fromParam) {
 
 void MoQSession::initPeerMaxRequestID(const Parameters& peerParams) {
   if (negotiatedVersion_ && useBidiRequestStreams(*negotiatedVersion_)) {
+    if (getMaxRequestIDIfPresent(peerParams) != 0) {
+      XLOG(WARN) << "Ignoring MAX_REQUEST_ID setup param, removed in draft "
+                 << getDraftMajorVersion(*negotiatedVersion_)
+                 << " sess=" << this;
+    }
     peerMaxRequestID_ = std::numeric_limits<uint64_t>::max();
   } else {
     peerMaxRequestID_ = getMaxRequestIDIfPresent(peerParams);
@@ -6393,14 +6411,14 @@ void MoQSession::endSubscriptionStat(PublisherImpl& pubTrack) {
 
 void MoQSession::sendPublishDone(const PublishDone& pubDone) {
   XLOG(DBG1) << __func__ << " sess=" << this;
-  MOQ_PUBLISHER_STATS(
-      publisherStatsCallback_, onPublishDone, pubDone.statusCode);
   auto it = pubTracks_.find(pubDone.requestID);
   if (it == pubTracks_.end()) {
     XLOG(ERR) << "publishDone for invalid id=" << pubDone.requestID
               << " sess=" << this;
     return;
   }
+  MOQ_PUBLISHER_STATS(
+      publisherStatsCallback_, onPublishDone, pubDone.statusCode);
   auto pubTrack = it->second;
   pubTrack->cancelGoawayResetTimer();
   endSubscriptionStat(*pubTrack);
@@ -6860,8 +6878,8 @@ folly::coro::Task<MoQSession::JoinResult> MoQSession::join(
     std::shared_ptr<FetchConsumer> fetchCallback,
     FetchType fetchType) {
   Fetch fetchReq(
-      0,              // will be picked by fetch()
-      nextRequestID_, // this will be the ID for subscribe()
+      0,            // will be picked by fetch()
+      std::nullopt, // resolved by FullTrackName match in resolveJoiningFetch
       joiningStart,
       fetchType,
       fetchPri,
@@ -7366,6 +7384,15 @@ bool MoQSession::closeSessionIfRequestIDInvalid(
       nextExpectedPeerRequestID_ += getRequestIDMultiplier();
     } // in draft 16+, request IDs can come out of order
     if (getDraftMajorVersion(*getNegotiatedVersion()) >= 18) {
+      // Draft 18 dropped MAX_REQUEST_ID, so nothing else keeps the cutoff
+      // from wrapping.
+      if (requestID.value >
+          std::numeric_limits<uint64_t>::max() - getRequestIDMultiplier()) {
+        XLOG(ERR) << "requestID exhausts the ID space: " << requestID
+                  << " sess=" << this;
+        close(SessionCloseErrorCode::INVALID_REQUEST_ID);
+        return true;
+      }
       nextPeerRequestIDForGoaway_ = std::max(
           nextPeerRequestIDForGoaway_,
           requestID.value + getRequestIDMultiplier());
