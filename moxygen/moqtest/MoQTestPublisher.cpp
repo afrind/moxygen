@@ -6,6 +6,7 @@
 
 #include "moxygen/moqtest/MoQTestPublisher.h"
 #include <folly/ScopeGuard.h>
+#include <folly/coro/CurrentExecutor.h>
 #include <folly/coro/Sleep.h>
 #include <folly/logging/xlog.h>
 #include <vector>
@@ -14,6 +15,10 @@
 namespace moxygen {
 
 const std::string kDefaultPublishDoneReason = "Testing";
+
+// A FETCH runs flat out, so it shares the executor on a count rather than by
+// waiting on anything.
+constexpr uint32_t kFetchObjectsPerYield = 32;
 
 folly::coro::Task<MoQTestFetchHandle::RequestUpdateResult>
 MoQTestFetchHandle::requestUpdate(RequestUpdate update) {
@@ -29,8 +34,32 @@ void MoQTestFetchHandle::fetchCancel() {
   cancelSource_->requestCancellation();
 }
 
-folly::coro::Task<void> MoQTestPublisher::delay(uint64_t ms) {
-  co_await folly::coro::sleep(std::chrono::milliseconds(ms), &timekeeper_);
+MoQTestPublisher::ObjectPacer MoQTestPublisher::makePacer(
+    const MoQTestParameters& params) {
+  return ObjectPacer(
+      std::chrono::milliseconds(params.objectFrequency), &timekeeper_);
+}
+
+folly::coro::Task<void> MoQTestPublisher::ObjectPacer::awaitNextObject() {
+  // Frequency zero means "as fast as the consumer will take them".  Guards the
+  // division below as much as it yields.
+  if (period_ == std::chrono::nanoseconds::zero()) {
+    co_await folly::coro::co_reschedule_on_current_executor;
+    co_return;
+  }
+  nextObject_ += period_;
+  auto now = std::chrono::steady_clock::now();
+  if (nextObject_ <= now) {
+    // Re-anchor to the last deadline that passed, not the next one: a hiccup
+    // must not shift the objects after it off the grid.
+    nextObject_ += period_ * ((now - nextObject_) / period_);
+    co_await folly::coro::co_reschedule_on_current_executor;
+    co_return;
+  }
+  // ceil, so a sleep never lands ahead of the deadline it holds.
+  co_await folly::coro::sleep(
+      std::chrono::ceil<folly::HighResDuration>(nextObject_ - now),
+      timekeeper_);
 }
 
 void MoQTestPublisher::cancelAll() {
@@ -43,9 +72,9 @@ void MoQTestPublisher::cancelAll() {
   }
   // Move before cancelling: cancel() can resume a waiting publish inline, and
   // that coroutine erases its own entry on the way out.
-  auto pending = std::move(pendingUnpauses_);
-  pendingUnpauses_.clear();
-  for (auto& p : pending) {
+  auto published = std::move(publishedTracks_);
+  publishedTracks_.clear();
+  for (auto& p : published) {
     p->cancel();
   }
   auto fetches = std::move(activeFetches_);
@@ -220,9 +249,9 @@ folly::coro::Task<folly::coro::Task<void>> MoQTestPublisher::startPublishTrack(
   // Only the first unpause is honored. If the peer pauses again mid-track we
   // keep generating and the forwarder drops the objects, which for a test
   // publisher is simpler than parking and re-arming.
-  auto unpauseCb = std::make_shared<PendingUnpause>();
-  forwarder->setCallback(unpauseCb);
-  pendingUnpauses_.push_back(unpauseCb);
+  auto published = std::make_shared<PublishedTrack>();
+  forwarder->setCallback(published);
+  publishedTracks_.push_back(published);
 
   auto subscriber =
       forwarder->addSubscriber(session->sessionId(), /*forward=*/false);
@@ -258,20 +287,24 @@ folly::coro::Task<folly::coro::Task<void>> MoQTestPublisher::startPublishTrack(
   subscriber->onPublishOk(pubResult.value().value());
 
   co_return streamPublishedTrack(
-      std::move(unpauseCb), std::move(forwarder), params, requestID);
+      std::move(published), std::move(forwarder), params, requestID);
 }
 
 folly::coro::Task<void> MoQTestPublisher::streamPublishedTrack(
-    std::shared_ptr<PendingUnpause> unpauseCb,
+    std::shared_ptr<PublishedTrack> published,
     std::shared_ptr<MoQForwarder> forwarder,
     MoQTestParameters params,
     RequestID requestID) {
   // Drop the registration however this track ends, so a long-lived publisher
   // doesn't accumulate one fulfilled entry per publish.
   auto unregister = folly::makeGuard(
-      [this, unpauseCb] { std::erase(pendingUnpauses_, unpauseCb); });
-  co_await unpauseCb->unpaused.getFuture();
-  co_await sendTrackData(params, requestID, std::move(forwarder));
+      [this, published] { std::erase(publishedTracks_, published); });
+  co_await published->unpaused.getFuture();
+  auto token = folly::cancellation_token_merge(
+      co_await folly::coro::co_current_cancellation_token,
+      published->cancelSource.getToken());
+  co_await folly::coro::co_withCancellation(
+      std::move(token), sendTrackData(params, requestID, std::move(forwarder)));
 }
 
 folly::coro::Task<void> MoQTestPublisher::publishTrack(
@@ -289,6 +322,7 @@ folly::coro::Task<void> MoQTestPublisher::sendOneSubgroupPerGroup(
     std::shared_ptr<TrackConsumer> callback) {
   // Iterate through Groups
   auto token = co_await folly::coro::co_current_cancellation_token;
+  auto pacer = makePacer(params);
   const auto subgroupOptions =
       subgroupOptionsFor(params, 0, includeTimestampExtension_);
   for (uint64_t groupNum = params.startGroup;
@@ -330,8 +364,7 @@ folly::coro::Task<void> MoQTestPublisher::sendOneSubgroupPerGroup(
         subConsumer->endOfGroup(objectId);
       }
 
-      // Set Delay Based on Object Frequency
-      co_await delay(params.objectFrequency);
+      co_await pacer.awaitNextObject();
     }
 
     // If SubGroup Hasn't Been Ended Already
@@ -346,6 +379,7 @@ folly::coro::Task<void> MoQTestPublisher::sendOneSubgroupPerObject(
     std::shared_ptr<TrackConsumer> callback) {
   // Iterate through Objects
   auto token = co_await folly::coro::co_current_cancellation_token;
+  auto pacer = makePacer(params);
   for (uint64_t groupNum = params.startGroup;
        groupNum <= params.lastGroupInTrack;
        groupNum += params.groupIncrement) {
@@ -387,8 +421,7 @@ folly::coro::Task<void> MoQTestPublisher::sendOneSubgroupPerObject(
         subConsumer->endOfGroup(objectId);
       }
 
-      // Set Delay Based on Object Frequency
-      co_await delay(params.objectFrequency);
+      co_await pacer.awaitNextObject();
     }
   }
   co_return;
@@ -399,6 +432,7 @@ folly::coro::Task<void> MoQTestPublisher::sendTwoSubgroupsPerGroup(
     std::shared_ptr<TrackConsumer> callback) {
   // Iterate through Objects
   auto token = co_await folly::coro::co_current_cancellation_token;
+  auto pacer = makePacer(params);
   // Odd number of objects in track means end on subgroupZero
   for (uint64_t groupNum = params.startGroup;
        groupNum <= params.lastGroupInTrack;
@@ -476,8 +510,7 @@ folly::coro::Task<void> MoQTestPublisher::sendTwoSubgroupsPerGroup(
         }
       }
 
-      // Set Delay Based on Object Frequency
-      co_await delay(params.objectFrequency);
+      co_await pacer.awaitNextObject();
     }
 
     // If SubGroup Hasn't Been Ended Already
@@ -498,6 +531,7 @@ folly::coro::Task<void> MoQTestPublisher::sendDatagram(
     MoQTestParameters params,
     std::shared_ptr<TrackConsumer> callback) {
   auto token = co_await folly::coro::co_current_cancellation_token;
+  auto pacer = makePacer(params);
   const auto lastObject = lastObjectInGroup(params);
   // Iterate through Objects
   for (uint64_t groupNum = params.startGroup;
@@ -559,8 +593,7 @@ folly::coro::Task<void> MoQTestPublisher::sendDatagram(
         co_return;
       }
 
-      // Set Delay Based on Object Frequency
-      co_await delay(params.objectFrequency);
+      co_await pacer.awaitNextObject();
     }
   }
 
@@ -645,11 +678,6 @@ folly::coro::Task<MoQSession::FetchResult> MoQTestPublisher::fetch(
     XLOG(INFO) << "Serving " << window.first << ".." << window.last;
   }
 
-  // A backfill paced at the live rate would never catch the subscription up.
-  if (isJoining) {
-    params.objectFrequency = 0;
-  }
-
   auto cancelSource = std::make_shared<folly::CancellationSource>();
   activeFetches_.push_back(cancelSource);
 
@@ -705,6 +733,9 @@ folly::coro::Task<void> MoQTestPublisher::fetchObjects(
     std::shared_ptr<FetchConsumer> callback,
     MoQTestFetchWindow window) {
   auto token = co_await folly::coro::co_current_cancellation_token;
+  // Object frequency describes how a live track is produced; a FETCH serves what
+  // already exists, so it does not pace at all.
+  uint32_t objectsSent = 0;
   // A datagram track fetches back through here because its objects have no
   // subgroup.  From draft 16 the flag tells the framer to omit the subgroup
   // field entirely; on draft 15 there is no flag and subgroup 0 is written.
@@ -764,8 +795,9 @@ folly::coro::Task<void> MoQTestPublisher::fetchObjects(
         co_await std::move(ready.value());
       }
 
-      // Set Delay Based on Object Frequency
-      co_await delay(params.objectFrequency);
+      if (++objectsSent % kFetchObjectsPerYield == 0) {
+        co_await folly::coro::co_reschedule_on_current_executor;
+      }
     }
   }
 
