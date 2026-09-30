@@ -50,9 +50,8 @@ folly::coro::Task<void> MoQTestPublisher::ObjectPacer::awaitNextObject() {
   nextObject_ += period_;
   auto now = std::chrono::steady_clock::now();
   if (nextObject_ <= now) {
-    // Re-anchor to the last deadline that passed, not the next one: a hiccup
-    // must not shift the objects after it off the grid.
-    nextObject_ += period_ * ((now - nextObject_) / period_);
+    // Behind: send without sleeping until caught up, so a hiccup delays
+    // objects rather than dropping them.
     co_await folly::coro::co_reschedule_on_current_executor;
     co_return;
   }
@@ -733,8 +732,8 @@ folly::coro::Task<void> MoQTestPublisher::fetchObjects(
     std::shared_ptr<FetchConsumer> callback,
     MoQTestFetchWindow window) {
   auto token = co_await folly::coro::co_current_cancellation_token;
-  // Object frequency describes how a live track is produced; a FETCH serves what
-  // already exists, so it does not pace at all.
+  // Object frequency describes how a live track is produced; a FETCH serves
+  // what already exists, so it does not pace at all.
   uint32_t objectsSent = 0;
   // A datagram track fetches back through here because its objects have no
   // subgroup.  From draft 16 the flag tells the framer to omit the subgroup

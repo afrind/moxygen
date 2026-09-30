@@ -2592,6 +2592,9 @@ MoQSession::MoQSession(
 
 MoQSession::~MoQSession() {
   cleanup();
+  // An owner may release the session without close(). Loops that exec_ has
+  // not started yet check this token before they touch the session.
+  cancellationSource_.requestCancellation();
   if (logger_) {
     logger_->outputLogs();
   }
@@ -3419,11 +3422,12 @@ folly::coro::Task<void> MoQSession::controlReadLoop(
     std::shared_ptr<BidiStreamControl> control,
     std::unique_ptr<MoQControlCodec::ControlCallback> senderCallback) {
   XLOG(DBG1) << __func__ << " sess=" << this;
+  // The session may be gone by the time exec_ starts this loop.
+  co_await folly::coro::co_safe_point;
   const auto negotiatedVersion = negotiatedVersion_;
   auto g = folly::makeGuard([func = __func__, this] {
     XLOG(DBG1) << "exit " << func << " sess=" << this;
   });
-  co_await folly::coro::co_safe_point;
   auto* controlCodec = codec ? codec.get() : controlCodec_.get();
   auto streamId = readHandle.id();
   controlCodec->setStreamId(streamId);
@@ -6194,7 +6198,7 @@ folly::coro::Task<Publisher::SubscribeResult> MoQSession::subscribe(
   };
   if (draining_ || closed_) {
     SubscribeError subscribeError = {
-        std::numeric_limits<uint64_t>::max(),
+        failedLocalRequestID(),
         SubscribeErrorCode::INTERNAL_ERROR,
         "draining/closed session"};
     MOQ_SUBSCRIBER_STATS(
@@ -6712,7 +6716,7 @@ folly::coro::Task<Publisher::FetchResult> MoQSession::fetch(
       folly::makeGuard([func = __func__] { XLOG(DBG1) << "exit " << func; });
   if (draining_ || closed_) {
     FetchError fetchError = {
-        std::numeric_limits<uint64_t>::max(),
+        failedLocalRequestID(),
         FetchErrorCode::INTERNAL_ERROR,
         "draining/closed session"};
     MOQ_SUBSCRIBER_STATS(
