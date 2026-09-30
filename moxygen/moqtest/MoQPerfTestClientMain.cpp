@@ -57,6 +57,12 @@ DEFINE_uint32(
     object_interval_ms,
     33,
     "Interval between objects in milliseconds");
+DEFINE_string(
+    metrics_out,
+    "",
+    "If set, write Prometheus .prom metrics (including the end-to-end latency "
+    "histogram) to this path once per second, for a node_exporter textfile "
+    "collector to scrape");
 
 // Shared stats structure for cross-thread aggregation
 struct SharedStats {
