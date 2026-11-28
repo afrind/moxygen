@@ -198,8 +198,10 @@ folly::coro::Task<bool> CatalogReader::subscribe(RequestID requestID) {
   if (!acquisition->opened) {
     acquisition->opened = true;
     if (mode_ == Mode::ImmutableSnapshot) {
+      // GCC 11 double-destroys temporaries in a full-expression with co_await.
+      auto executor = co_await folly::coro::co_current_executor;
       folly::coro::co_withExecutor(
-          co_await folly::coro::co_current_executor,
+          std::move(executor),
           folly::coro::co_withCancellation(
               acquisition->cancelled.getToken(),
               fetchSnapshot(

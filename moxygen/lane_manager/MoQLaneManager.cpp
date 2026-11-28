@@ -824,9 +824,9 @@ folly::coro::Task<Publisher::SubscribeResult> MoQLaneManager::subscribe(
         info = &ready.lanes.front();
         lane = info->trackName;
       }
-      auto subscribed =
-          co_await set->laneSubs.at(FullTrackName{broadcast_, lane})
-              ->subscribe();
+      // GCC 11 double-destroys temporaries built inside a co_await operand.
+      auto laneSub = set->laneSubs.at(FullTrackName{broadcast_, lane});
+      auto subscribed = co_await laneSub->subscribe();
       if (!isCurrent(*set) || set->closed || set->failed) {
         co_return makeSubscribeError(
             request.requestID, RequestErrorCode::INTERNAL_ERROR, "ended");
